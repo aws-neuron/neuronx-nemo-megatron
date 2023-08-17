@@ -17,7 +17,10 @@
 import itertools
 
 import torch
-from torch._six import inf
+if torch.__version__.startswith('2'):
+    from torch import inf
+else:
+    from torch._six import inf
 
 from nemo.collections.nlp.modules.common.megatron.module import param_is_not_shared
 

@@ -164,6 +164,26 @@ class FusedRMSNormFunction(torch.autograd.Function):
         )
         return grad_input, None, None
 
+class FusedRMSNormFunctionXLA(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input, normalized_shape, eps):
+        global fused_layer_norm_cuda
+        ctx.normalized_shape = normalized_shape
+        ctx.eps = eps
+        input_ = input.contiguous()
+        output, invvar = fused_layer_norm_cuda.rms_forward(input_, ctx.normalized_shape, ctx.eps)
+        ctx.save_for_backward(input_, invvar)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        input_, invvar = ctx.saved_tensors
+        grad_input = None
+        grad_input = fused_layer_norm_cuda.rms_backward(
+            grad_output.contiguous(), invvar, input_, ctx.normalized_shape, ctx.eps
+        )
+        return grad_input, None, None
+
 
 def fused_layer_norm_affine(input, weight, bias, normalized_shape, eps=1e-6):
     args = _cast_if_autocast_enabled(input, weight, bias, normalized_shape, eps)
@@ -194,6 +214,10 @@ def fused_rms_norm(input, normalized_shape, eps=1e-6):
     with torch.cuda.amp.autocast(enabled=False):
         return FusedRMSNormFunction.apply(*args)
 
+def fused_rms_norm_xla(input, normalized_shape, eps=1e-6):
+    args = _cast_if_autocast_enabled(input, normalized_shape, eps)
+    with torch.cuda.amp.autocast(enabled=False):
+        return FusedRMSNormFunctionXLA.apply(*args)
 
 def mixed_dtype_fused_rms_norm_affine(input, weight, normalized_shape, eps=1e-6):
     args = _cast_if_autocast_enabled(input, weight, normalized_shape, eps)
@@ -297,6 +321,40 @@ class FusedLayerNorm(torch.nn.Module):
         return "{normalized_shape}, eps={eps}, " "elementwise_affine={elementwise_affine}".format(**self.__dict__)
 
 
+class FusedRMSNormXLA(torch.nn.Module):
+    r"""Overwrite FusedLayerNorm for XLA
+    """
+
+    def __init__(self, normalized_shape, eps=1e-5, elementwise_affine=True):
+        super().__init__()
+
+        if isinstance(normalized_shape, numbers.Integral):
+            normalized_shape = (normalized_shape,)
+        self.normalized_shape = torch.Size(normalized_shape)
+        self.eps = eps
+        self.elementwise_affine = elementwise_affine
+        if self.elementwise_affine:
+            self.weight = Parameter(torch.Tensor(*normalized_shape))
+        else:
+            self.register_parameter("weight", None)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        if self.elementwise_affine:
+            init.ones_(self.weight)
+
+    def forward(self, input):
+        if not input.is_cuda:
+            return manual_rms_norm(input, self.normalized_shape, self.weight, self.eps)
+
+        if self.elementwise_affine:
+            return fused_rms_norm_affine(input, self.weight, self.normalized_shape, self.eps)
+        else:
+            return fused_rms_norm_xla(input, self.normalized_shape, self.eps)
+
+    def extra_repr(self):
+        return "{normalized_shape}, eps={eps}, " "elementwise_affine={elementwise_affine}".format(**self.__dict__)
+    
 class FusedRMSNorm(torch.nn.Module):
     r"""Applies RMS Normalization over a mini-batch of inputs
 

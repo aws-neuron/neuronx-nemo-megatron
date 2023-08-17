@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import random
+import os
 
 import numpy as np
 import torch
@@ -208,13 +209,13 @@ def fake_initialize_model_parallel(
     model_parallel_size = tensor_model_parallel_size * pipeline_model_parallel_size
 
     assert (
-        tensor_model_parallel_size in [1, 8 ,32]
-    ), f'tensor_model_parallel_size: {tensor_model_parallel_size} must be 1, 8, or 32.'
-
-    assert (
         world_size % tensor_model_parallel_size * pipeline_model_parallel_size == 0
     ), f'world_size: {world_size} must be divisible by tensor_model_parallel_size: {tensor_model_parallel_size} times pipeline_model_parallel_size {pipeline_model_parallel_size}'
     data_parallel_size = world_size // (tensor_model_parallel_size * pipeline_model_parallel_size)
+
+    assert (
+        tensor_model_parallel_size in [1, 8 ,32]
+    ), f'tensor_model_parallel_size: {tensor_model_parallel_size} must be 1, 8, or 32.'
 
     if pipeline_model_parallel_size > 1:
         if tensor_model_parallel_size == 1:

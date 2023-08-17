@@ -35,7 +35,6 @@ except (ImportError, ModuleNotFoundError):
     # fake missing classes with None attributes
     AttnMaskType = ApexGuardDefaults()
 
-
 def post_language_model_processing(
     lm_output,
     labels,
@@ -47,7 +46,24 @@ def post_language_model_processing(
     return_logits=False,
     sequence_parallel=False,
     gradient_accumulation_fusion=False,
+    share_embeddings_and_output_weights=True,
 ):
+    if share_embeddings_and_output_weights==False:
+        lm_output = lm_output.transpose(0, 1).contiguous()
+        # Output.
+        if labels is None:
+            return lm_output
+        else:
+            logits = None
+            if return_logits:
+                logits = output.clone()
+            if fp16_lm_cross_entropy:
+                assert lm_output.dtype == torch.half
+                loss = tensor_parallel.vocab_parallel_cross_entropy(lm_output, labels)
+            else:
+                loss = tensor_parallel.vocab_parallel_cross_entropy(lm_output.float(), labels)
+
+            return loss, logits
     if get_key_value:
         lm_output, presents = lm_output
 
@@ -65,6 +81,10 @@ def post_language_model_processing(
         gradient_accumulation_fusion=gradient_accumulation_fusion,
         async_tensor_model_parallel_allreduce=async_tensor_model_parallel_allreduce,
     )
+    logits = None
+    if return_logits:
+        # Logits are [batch x seq_length x vocab_size]
+        logits = output.clone()
 
     if get_key_value:
         output = [output, presents]
@@ -84,11 +104,7 @@ def post_language_model_processing(
 
         # [s b] -> [b, s]
         loss = loss.transpose(0, 1).contiguous()
-
-        if return_logits:
-            return loss, output
-        else:
-            return loss
+        return loss, logits
 
 
 class GPTModel(MegatronModule):
@@ -151,6 +167,7 @@ class GPTModel(MegatronModule):
         reduce_amax=True,
         use_emha=False,
         multi_query_attention=False,
+        save_logits=False,
     ):
 
         super(GPTModel, self).__init__(share_token_embeddings=share_embeddings_and_output_weights)
@@ -162,6 +179,7 @@ class GPTModel(MegatronModule):
         self.sequence_parallel = sequence_parallel
         self.gradient_accumulation_fusion = gradient_accumulation_fusion
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
+        self.save_logits = save_logits
 
         if kv_channels is None:
             assert (
@@ -272,7 +290,6 @@ class GPTModel(MegatronModule):
             inference_max_sequence_len=inference_max_sequence_len,
             checkpoint_activations_all_layers=checkpoint_activations_all_layers,
         )
-
         if self.post_process:
             return post_language_model_processing(
                 lm_output,
@@ -284,9 +301,10 @@ class GPTModel(MegatronModule):
                 self.parallel_output,
                 forward_method_parallel_output,
                 self.fp16_lm_cross_entropy,
-                return_logits=encoder_input is not None,
+                return_logits=self.save_logits,
                 sequence_parallel=self.sequence_parallel,
                 gradient_accumulation_fusion=self.gradient_accumulation_fusion,
+                share_embeddings_and_output_weights=self.share_embeddings_and_output_weights
             )
         else:
             return lm_output

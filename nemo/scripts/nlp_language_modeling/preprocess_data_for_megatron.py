@@ -80,6 +80,21 @@ python scripts/nlp_language_modeling/preprocess_data_for_megatron.py \
     --chunk_size=64 \
     --workers=64 
 ```
+
+
+```python
+python nemo/scripts/nlp_language_modeling/preprocess_data_for_megatron.py \
+    --input=/root/scripts/data/llamav2/arxiv/arxiv_1caed86f-5625-4941-bdc1-cc57e4fec1cd.jsonl \
+    --json-keys=text \
+    --tokenizer-library=huggingface \
+    --tokenizer-type=/root/scripts/data/llama7b-hf \
+    --dataset-impl=mmap \
+    --output-prefix=/root/scripts/data/llamav2/arxiv_hf/arxiv \
+    --append-eod \
+    --need-pad-id \
+    --workers=128
+```
+
 """
 
 import argparse

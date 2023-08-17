@@ -17,6 +17,8 @@ from typing import Any, List, Optional, Union
 
 import numpy as np
 import torch
+import time
+import math
 from omegaconf.dictconfig import DictConfig
 from pytorch_lightning.trainer.trainer import Trainer
 
@@ -27,7 +29,7 @@ from nemo.collections.nlp.data.language_modeling.megatron.megatron_batch_sampler
 )
 from nemo.collections.nlp.models.language_modeling.megatron.gpt_model import GPTModel
 from nemo.collections.nlp.models.language_modeling.megatron_base_model import MegatronBaseModel
-from nemo.collections.nlp.modules.common.megatron.module import Float16Module
+from nemo.collections.nlp.modules.common.megatron.module import Float16Module, param_is_not_shared
 from nemo.collections.nlp.modules.common.megatron.utils import (
     average_losses_across_data_parallel_group,
     get_all_params_for_weight_decay_optimization,
@@ -50,6 +52,7 @@ from nemo.collections.nlp.parts.utils_funcs import get_last_rank
 from nemo.core.classes.common import PretrainedModelInfo
 from nemo.utils import logging
 from transformers.utils import is_torch_tpu_available
+import queue
 
 try:
     from apex.transformer import parallel_state
@@ -61,6 +64,8 @@ try:
         _forward_backward_pipelining_with_interleaving,
     )
     from apex.transformer.pipeline_parallel.schedules.fwd_bwd_no_pipelining import forward_backward_no_pipelining
+    from apex.transformer.tensor_parallel.layers import param_is_not_tensor_parallel_duplicate
+    from apex.transformer.pipeline_parallel.utils import get_num_microbatches
 
     HAVE_APEX = True
 except (ImportError, ModuleNotFoundError):
@@ -81,6 +86,33 @@ try:
 except (ImportError, ModuleNotFoundError):
     HAVE_XLA = False
 
+
+class Throughput:
+    def __init__(self, moving_avg_window_size):
+        self.seqs_per_iteration = None #batch_size * world_size * grad_accum_usteps
+        self.moving_avg_window_size = moving_avg_window_size
+        self.moving_avg_window = queue.Queue()
+        self.window_time = 0
+        self.start_time = time.time()
+        self.throughput_peak = 0
+        self.throughput_sum = 0
+        self.throughputs = []
+
+    def set_seqs_per_iteration(self, batch_size, world_size, grad_accum_usteps):
+        self.seqs_per_iteration = batch_size * world_size * grad_accum_usteps
+
+    def get_throughput(self):
+        step_time = time.time() - self.start_time
+        self.start_time += step_time
+        self.window_time += step_time
+        self.moving_avg_window.put(step_time)
+        window_size = self.moving_avg_window.qsize()
+        if window_size > self.moving_avg_window_size:
+            self.window_time -= self.moving_avg_window.get()
+            window_size -= 1
+        throughput = window_size * self.seqs_per_iteration / self.window_time
+        self.throughputs.append(throughput)
+        return throughput
 
 class MegatronGPTModel(MegatronBaseModel, TextGeneration):
     """
@@ -116,7 +148,14 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
 
         # configuration used for inference
         self._inference_config = None
+
+        self.wrap_with_zero = cfg.get('wrap_with_zero', False)
+        self.log_parameter_norm = cfg.get('log_parameter_norm', False)
+        self.log_gradient_norm = cfg.get('log_gradient_norm', False)
+        self.save_logits = cfg.get('save_logits', False)
+        self.save_logits_interval = cfg.get('save_logits_interval', 0)
     
+        self.throughput = Throughput(100) 
     def _build_model(self):
         # build_model returns a list of modules which are used for interleaved pipeline parallelism
         self.model = build_model(
@@ -130,7 +169,9 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
             self.model = self.model[0]
 
         if self.megatron_amp_o2:
-
+            #We use XLA_USE_DOWNCAST=1 to downcast the model weights constructed in fp32
+            #Not doing explicit model casting below
+            return 
             if not self.with_distributed_adam:
                 # Pre-allocate the model on GPU to have master parameters allocated on the same device with matching data type
                 if isinstance(self.model, list):
@@ -190,6 +231,11 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
             bias_activation_fusion=self.cfg.get('bias_activation_fusion', True),
             bias_dropout_add_fusion=self.cfg.get('bias_dropout_add_fusion', True),
             share_embeddings_and_output_weights=self.cfg.get('share_embeddings_and_output_weights', True),
+            position_embedding_type=self.cfg.get('position_embedding_type', 'learned_absolute'),
+            rotary_percentage=self.cfg.get('rotary_percentage', 1.0),
+            activation=self.cfg.get('activation', 'gelu'),
+            bias=self.cfg.get('has_bias', True),
+            transformer_block_type=self.cfg.get('transformer_block_type','pre_ln'),
             masked_softmax_fusion=self.cfg.get('masked_softmax_fusion', True),
             gradient_accumulation_fusion=self.cfg.get('gradient_accumulation_fusion', False),
             persist_layer_norm=self.cfg.get('persist_layer_norm', False),
@@ -203,6 +249,7 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
             fp8_amax_history_len=self.cfg.get('fp8_amax_history_len', 1),
             fp8_amax_compute_algo=self.cfg.get('fp8_amax_compute_algo', 'most_recent'),
             use_emha=self.cfg.get('use_emha', False),
+            save_logits=self.cfg.get('save_logits', False),
         )
 
         return model
@@ -277,6 +324,8 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
             Microbatches are then moved to GPU during the pipeline.
             The list of microbatches is then piped through the pipeline using Apex fwd/bwd functions.
         """
+        # Log start time of the training loop 
+        start_time = time.time()
 
         # we zero grads here because we also call backward in the apex fwd/bwd functions
         self._optimizer.zero_grad()
@@ -297,17 +346,14 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
                 custom_sync_context_handler = lambda: self._optimizer.no_sync(greedy_grad_copy=False)
             custom_grad_sync_func = self.reduce_overlap_gradients
         else:
-            if self.megatron_amp_o2 and not self.cfg.get('sequence_parallel', False):
-                custom_sync_context_handler = self._optimizer.no_sync
-            else:
-                # TODO: enable async grad all reduce for O1/autocast mixed precision training
-                custom_sync_context_handler = None
+            #XLA doesn;t need an async context handler 
+            custom_sync_context_handler = None
 
         # run forward and backwards passes for an entire global batch
         # we do this inside training_step to support pipeline parallelism
         fwd_bwd_function = self._get_fwd_bwd_function()
 
-        losses_reduced_per_micro_batch = fwd_bwd_function(
+        losses_per_micro_batch = fwd_bwd_function(
             forward_step_func=self.get_forward_output_and_loss_func(),
             batch=batch_for_pipeline,
             model=self.model,
@@ -326,9 +372,9 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
 
         xm.mark_step()
         # only the last stages of the pipeline return losses
-        if losses_reduced_per_micro_batch:
+        if losses_per_micro_batch:
             # average loss across micro batches
-            loss_tensors_list = [loss_reduced['avg'] for loss_reduced in losses_reduced_per_micro_batch]
+            loss_tensors_list = [average_losses_across_data_parallel_group([loss['mb_loss']]) for loss in losses_per_micro_batch]
             loss_tensor = torch.concat(loss_tensors_list)
             loss_mean = loss_tensor.mean()
         else:
@@ -342,29 +388,32 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
         if self.cfg.get('tensor_model_parallel_size', 1) > 1 and self.cfg.get('sequence_parallel', False):
             self.allreduce_sequence_parallel_gradients()
 
-        if self.with_distributed_adam:
+        xm.mark_step()
+
+        if self.with_distributed_adam or self.wrap_with_zero:
             # gradients are reduced internally in distributed optimizer
             pass
         elif self.megatron_amp_o2:
             # when using pipeline parallelism grads must be all-reduced after the pipeline (not asynchronously)
-            if self.cfg.get('pipeline_model_parallel_size', 1) > 1 or self.cfg.get('sequence_parallel', False):
-                # main grads are stored in the MainParamsOptimizer wrapper
-                self._optimizer.allreduce_main_grads()
+            self.allreduce_gradients()
         else:
             # async grad allreduce is not currently implemented for O1/autocasting mixed precision training
             # so we all-reduce gradients after the pipeline
             self.allreduce_gradients()  # @sangkug we think this is causing memory to blow up (hurts perf)
+
+        xm.mark_step()
 
         if self.cfg.get('pipeline_model_parallel_size', 1) > 1 and self.cfg.get('share_embeddings_and_output_weights', True):
             # when using pipeline parallelism the first and last stage must keep embeddings in sync
             self.allreduce_first_last_embeddings()
 
         xm.mark_step()
-
         ## logging
         # we can only log on one rank if it is rank zero so we broadcast from last rank
         # we can avoid this broadcast by updating the PTL log function to accept specific ranks
         torch.distributed.all_reduce(loss_mean, group=parallel_state.get_pipeline_model_parallel_group())
+
+        xm.mark_step()
 
         if self.cfg.precision == 16:
             loss_scale = self.trainer.precision_plugin.scaler._scale
@@ -376,14 +425,146 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
         lr = self._optimizer.param_groups[0]['lr']
         # TODO: make sure compute_consumed_samples works for pipeline parallelism
         consumed_samples = self.compute_consumed_samples(self.trainer.global_step - self.init_global_step)
-        def _log_metrics(log_fn, loss_mean, lr, global_step, consumed_samples):
+        
+        elapsed_time = time.time() - start_time
+        if self.throughput.seqs_per_iteration is None:          
+            self.throughput.set_seqs_per_iteration(self.cfg.get('micro_batch_size'), parallel_state.get_data_parallel_world_size(), get_num_microbatches())
+        throughput = self.throughput.get_throughput()   
+        throughput_peak = self.throughput.throughput_peak
+        if throughput > throughput_peak:
+            self.throughput.throughput_peak = throughput
+        self.throughput.throughput_sum += throughput
+        param_norm = None
+        grad_norm = None
+        if self.log_parameter_norm:
+            param_norm = self.calculate_parameter_norm(self.parameters())
+        if self.log_gradient_norm:
+            grad_norm = self.calculate_gradient_norm(self.parameters())
+        def _log_metrics(log_fn, loss_mean, lr, global_step, consumed_samples, grad_norm, param_norm, throughput, throughput_peak):
             log_fn('reduced_train_loss', loss_mean.cpu(), prog_bar=True, rank_zero_only=True)
             log_fn('lr', lr, rank_zero_only=True)
+            if grad_norm:
+                log_fn('gradient_norm', grad_norm.detach().cpu(), prog_bar=True, rank_zero_only=True)
+            if param_norm:
+                log_fn('parameter_norm', param_norm.detach().cpu(), prog_bar=True, rank_zero_only=True)
             log_fn('global_step', global_step, prog_bar=True, rank_zero_only=True)
             log_fn('consumed_samples', consumed_samples, prog_bar=True, rank_zero_only=True)
-        xm.add_step_closure(_log_metrics, (self.log, loss_mean.detach(), lr, float(self.trainer.global_step), float(consumed_samples),))
+            log_fn('iteration_time', elapsed_time, prog_bar=True, rank_zero_only=True)
+            log_fn('throughput', throughput, prog_bar=False, rank_zero_only=True)
+            log_fn('throughput_peak', throughput_peak, prog_bar=False, rank_zero_only=True)
+        xm.add_step_closure(_log_metrics, (self.log, loss_mean.detach(), lr, float(self.trainer.global_step), float(consumed_samples), grad_norm, param_norm, throughput, throughput_peak))
 
         return loss_mean
+
+    def calculate_gradient_norm(self, parameters, norm_type=2):
+        """Calculate gradient norms across model parallel ranks
+        Arguments:
+            parameters (Iterable[Tensor] or Tensor): an iterable of Tensors or a
+                single Tensor that will have gradients normalized
+            norm_type (float or int): type of the used p-norm. Can be ``'math.inf'`` for
+                infinity norm.
+        Returns:
+            Total norm of the gradients (viewed as a single vector).
+        """
+        if isinstance(parameters, torch.Tensor):
+            parameters = [parameters]
+
+        # Filter parameters based on:
+        #   - grad should not be none
+        #   - parameter should not be shared
+        #   - should not be a replica due to tensor model parallelism
+        grads_for_norm = []
+        for param in parameters:
+            grad_not_none = param.grad is not None
+            is_not_shared = param_is_not_shared(param)
+            is_not_tp_duplicate = param_is_not_tensor_parallel_duplicate(param)
+            if grad_not_none and is_not_shared and is_not_tp_duplicate:
+                grads_for_norm.append(param.grad.detach())
+
+        if not grads_for_norm:
+            raise ValueError(f"No grads found on {xm.get_ordinal()}")
+
+        # Norm parameters.
+        norm_type = float(norm_type)
+        total_norm = torch.tensor([float(0.0)], device=xm.xla_device())
+
+        # Calculate norm.
+        if norm_type == math.inf:
+            total_norm = max(grad.abs().max() for grad in grads_for_norm)
+            total_norm = torch.tensor([float(total_norm)], device=xm.xla_device())
+            # Take max across all model-parallel TPUs.
+            torch.distributed.all_reduce(
+                total_norm, op=torch.distributed.ReduceOp.MAX, group=parallel_state.get_tensor_model_parallel_group()
+            )
+            torch.distributed.all_reduce(
+                total_norm, op=torch.distributed.ReduceOp.MAX, group=parallel_state.get_pipeline_model_parallel_group()
+            )
+            total_norm = total_norm[0]
+        else:
+            for grad in grads_for_norm:
+                grad_norm = torch.norm(grad, norm_type)
+                total_norm += grad_norm ** norm_type
+
+            # Sum across all model-parallel TPUs.
+            torch.distributed.all_reduce(
+                total_norm, op=torch.distributed.ReduceOp.SUM, group=parallel_state.get_tensor_model_parallel_group()
+            )
+            torch.distributed.all_reduce(
+                total_norm, op=torch.distributed.ReduceOp.SUM, group=parallel_state.get_pipeline_model_parallel_group()
+            )
+            total_norm = torch.pow(total_norm, 1.0 / norm_type)
+        return total_norm
+
+    def calculate_parameter_norm(self, parameters, norm_type=2):
+        """Calculate parameter norms across model parallel ranks
+        Arguments:
+            parameters (Iterable[Tensor] or Tensor): an iterable of Tensors or a
+                single Tensor
+            norm_type (float or int): type of the used p-norm. Can be ``'math.inf'`` for
+                infinity norm.
+            Total norm of the parameters (viewed as a single vector).
+        """
+        if isinstance(parameters, torch.Tensor):
+            parameters = [parameters]
+        # Norm parameters.
+        norm_type = float(norm_type)
+        total_norm = torch.tensor([float(0.0)], device=xm.xla_device())
+        params_to_norm = []
+
+        # Filter parameters based on:
+        #   - parameter should not be shared
+        #   - should not be a replica due to tensor model parallelism
+        for param in parameters:
+            is_not_shared = param_is_not_shared(param)
+            is_not_tp_duplicate = param_is_not_tensor_parallel_duplicate(param)
+            if is_not_shared and is_not_tp_duplicate:
+                params_to_norm.append(param)
+
+        # Calculate norm.
+        if norm_type == math.inf:
+            total_norm = max(torch.abs(param) for param in params_to_norm)
+            total_norm = torch.tensor([float(total_norm)], device=xm.xla_device())
+            # Take max across all model-parallel TPUs.
+            torch.distributed.all_reduce(
+                total_norm, op=torch.distributed.ReduceOp.MAX, group=parallel_state.get_tensor_model_parallel_group()
+            )
+            torch.distributed.all_reduce(
+                total_norm, op=torch.distributed.ReduceOp.MAX, group=parallel_state.get_pipeline_model_parallel_group()
+            )
+            total_norm = total_norm[0]
+        else:
+            for param in params_to_norm:
+                param_norm = torch.norm(param, norm_type)
+                total_norm += param_norm**norm_type
+            # Sum across all model-parallel TPUs.
+            torch.distributed.all_reduce(
+                total_norm, op=torch.distributed.ReduceOp.SUM, group=parallel_state.get_tensor_model_parallel_group()
+            )
+            torch.distributed.all_reduce(
+                total_norm, op=torch.distributed.ReduceOp.SUM, group=parallel_state.get_pipeline_model_parallel_group()
+            )
+            total_norm = torch.pow(total_norm, 1.0 / norm_type)
+        return total_norm
 
     def backward(self, *args, **kwargs):
         """ LightningModule hook to do backward.
@@ -407,10 +588,8 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
             else:
                 sequence_parallel_param = getattr(param, 'sequence_parallel_enabled', False)
             if sequence_parallel_param:
-                if self.megatron_amp_o2:
-                    grad = param.main_grad
-                else:
-                    grad = param.grad
+                #megatron_amp_o2 also uses model gradients 
+                grad = param.grad
                 grads.append(grad.data)
 
     def allreduce_sequence_parallel_gradients(self):
@@ -454,14 +633,12 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
                     module = self.model
             if module.share_token_embeddings:
                 word_embeddings_weight = module.word_embeddings_weight()
-                if self.megatron_amp_o2:
-                    # O2 recipe stores a "main" copy of weights and grads
-                    grad = word_embeddings_weight.main_grad
-                else:
-                    grad = word_embeddings_weight.grad
+
+                #megatron_amp_o2 also uses model gradients
+                grad = word_embeddings_weight.grad
                 torch.distributed.all_reduce(grad, group=parallel_state.get_embedding_group())
 
-    def get_forward_output_and_loss_func(self, validation_step=False):
+    def get_forward_output_and_loss_func(self, validation_step=False, all_reduce_losses=False):
         def fwd_output_and_loss_func(batch, model, checkpoint_activations_all_layers=None):
             if parallel_state.get_pipeline_model_parallel_world_size() == 1:
                 # batch = [x.cuda(non_blocking=True) for x in batch]
@@ -489,14 +666,32 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
             attention_mask = batch[3][0:1]
             if is_torch_tpu_available():
                 attention_mask = None
-
-            output_tensor = model(
-                tokens,
-                position_ids,
-                attention_mask,
-                labels,
-                checkpoint_activations_all_layers=checkpoint_activations_all_layers,
-            )
+            logits = None
+            if parallel_state.is_pipeline_last_stage():
+                # Only the last PP stage has the logits
+                output_tensor, logits = model(
+                    tokens,
+                    position_ids,
+                    attention_mask,
+                    labels,
+                    checkpoint_activations_all_layers=checkpoint_activations_all_layers,
+                )
+            else:
+                output_tensor = model(
+                    tokens,
+                    position_ids,
+                    attention_mask,
+                    labels,
+                    checkpoint_activations_all_layers=checkpoint_activations_all_layers,
+                )
+            if self.save_logits:
+                def save_logits(logits):
+                    # Save logits on tensor parallel rank zero, data parallel rank zero and last pipeline parallel stage
+                    if parallel_state.get_tensor_model_parallel_rank() == 0 and parallel_state.is_pipeline_last_stage()\
+                            and parallel_state.get_data_parallel_rank() == 0:
+                        if self.trainer.global_step % self.save_logits_interval == 0:
+                            np.save(f"logits-{self.trainer.global_step}.npy", logits.detach().cpu().numpy())
+                xm.add_step_closure(save_logits, (logits,))
 
             def loss_func(output_tensor):
                 loss_for_mb = self.loss_func(loss_mask, output_tensor)
@@ -515,8 +710,11 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
                     )
                     return loss_for_mb, {'loss_sum_and_mb_size': loss_sum_and_mb_size_all_gpu.detach()}
                 else:
-                    reduced_loss = average_losses_across_data_parallel_group([loss_for_mb])
-                    return loss_for_mb, {'avg': reduced_loss.detach()}
+                    if all_reduce_losses:
+                        reduced_loss = average_losses_across_data_parallel_group([loss_for_mb])
+                        return loss_for_mb, {'avg': reduced_loss.detach()}
+                    else:
+                        return loss_for_mb, {'mb_loss': loss_for_mb.detach()}
 
             return output_tensor, loss_func
 
@@ -569,7 +767,7 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
         # we do this inside validation_step to support pipeline parallelism
         fwd_bwd_function = self._get_fwd_bwd_function()
 
-        losses_reduced_per_micro_batch = fwd_bwd_function(
+        losses_per_micro_batch = fwd_bwd_function(
             forward_step_func=self.get_forward_output_and_loss_func(validation_step=True),
             batch=batch_for_pipeline,
             model=self.model,
@@ -581,16 +779,16 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
         )
 
         # only the last stage of the pipeline returns losses
-        if losses_reduced_per_micro_batch:
+        if losses_per_micro_batch:
             if self.cfg.data.get('validation_drop_last', True):
                 # average loss across micro batches
-                loss_tensors_list = [loss_reduced['avg'] for loss_reduced in losses_reduced_per_micro_batch]
+                loss_tensors_list = [average_losses_across_data_parallel_group([loss['mb_loss']]) for loss in losses_per_micro_batch]
                 return torch.concat(loss_tensors_list).mean()
             else:
                 # Get the total loss since micro batches sizes are not uniform
                 loss_sum_tensors_list = [
                     loss_sum['loss_sum_and_mb_size']
-                    for loss_sum in losses_reduced_per_micro_batch
+                    for loss_sum in losses_per_micro_batch
                     if loss_sum['loss_sum_and_mb_size'][1] > 0
                 ]
                 loss_sum = (

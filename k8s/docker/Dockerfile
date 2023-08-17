@@ -1,0 +1,122 @@
+FROM public.ecr.aws/lts/ubuntu:20.04_stable
+ARG PIP="python3.8 -m pip"
+ARG DEBIAN_FRONTEND=noninteractive
+
+# Neuron repos
+ARG APT_REPO=https://apt.repos.neuron.amazonaws.com
+ARG PIP_REPO=https://pip.repos.neuron.amazonaws.com
+
+# Python won’t try to write .pyc or .pyo files on the import of source modules
+# Force stdin, stdout and stderr to be totally unbuffered. Good for logging
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONIOENCODING=UTF-8
+ENV LANG=C.UTF-8
+ENV LC_ALL=C.UTF-8
+ENV LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:/opt/aws/neuron/lib"
+ENV LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:/opt/amazon/efa/lib"
+ENV LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:/opt/amazon/efa/lib64"
+ENV LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:/opt/amazon/openmpi/lib64"
+ENV LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:/usr/local/lib"
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+    build-essential \
+    ca-certificates \
+    cmake \
+    curl \
+    git \
+    jq \
+    software-properties-common \
+    wget \
+    unzip \
+    vim \
+    zlib1g-dev \
+    openssl \
+    libssl-dev \
+    libsqlite3-dev \
+    libgdbm-dev \
+    libc6-dev \
+    libbz2-dev \
+    tk-dev \
+    libffi-dev \
+    libcap-dev \
+    gnupg2 \
+    gpg-agent \
+    pciutils \
+    python3.8-full \
+    python3.8-dev \
+    cython3 \
+    inetutils-ping \
+    google-perftools \
+    ffmpeg \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+# EFA Installer - required - installs libfabric (but no EFA driver) inside the container
+RUN apt-get update \
+    && cd $HOME \
+    && curl -O https://efa-installer.amazonaws.com/aws-efa-installer-latest.tar.gz \
+    && wget https://efa-installer.amazonaws.com/aws-efa-installer.key && gpg --import aws-efa-installer.key \
+    && cat aws-efa-installer.key | gpg --fingerprint \
+    && wget https://efa-installer.amazonaws.com/aws-efa-installer-latest.tar.gz.sig && gpg --verify ./aws-efa-installer-latest.tar.gz.sig \
+    && tar -xf aws-efa-installer-latest.tar.gz \
+    && cd aws-efa-installer \
+    && ./efa_installer.sh -y -g -d --skip-kmod --skip-limit-conf --no-verify \
+    && rm -fr /root/aws-efa-installer* \
+    && cd $HOME \
+    && rm -rf /var/lib/apt/lists/* \
+    && rm -rf /tmp/tmp* \
+    && apt-get clean
+
+# Neuron system packages (minus driver)
+RUN echo "deb $APT_REPO focal main" > /etc/apt/sources.list.d/neuron.list \
+    && wget -qO - $APT_REPO/GPG-PUB-KEY-AMAZON-AWS-NEURON.PUB | apt-key add - \
+    && apt-get update \
+    && apt-get install -y aws-neuronx-tools aws-neuronx-collectives aws-neuronx-runtime-lib \
+    && rm -rf /var/lib/apt/lists/* \
+    && rm -rf /tmp/tmp* \
+    && apt-get clean
+
+WORKDIR /
+RUN curl https://bootstrap.pypa.io/get-pip.py -o get-pip.py && python3.8 get-pip.py && python3.8 -m pip install --upgrade pip
+RUN mkdir -p /etc/pki/tls/certs && cp /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt
+
+# PyTorch Neuron packages (2.12)
+RUN ${PIP} config set global.extra-index-url $PIP_REPO \
+    && ${PIP} install --force-reinstall torch-neuronx==1.13.1.* neuronx-cc==2.8.* \
+    && ${PIP} install --no-cache-dir -U python-etcd \
+    && rm -fr /root/.cache/
+
+# Install packages and configure SSH for MPI operator in k8s
+RUN apt-get update && apt-get install -y openmpi-bin openssh-server \
+    && mkdir -p /var/run/sshd \
+    && echo "    UserKnownHostsFile /dev/null" >> /etc/ssh/ssh_config \
+    && echo "    StrictHostKeyChecking no" >> /etc/ssh/ssh_config \
+    && sed -i 's/#\(StrictModes \).*/\1no/g' /etc/ssh/sshd_config \
+    && rm -rf /var/lib/apt/lists/* \
+    && rm -rf /tmp/tmp* \
+    && apt-get clean
+
+# Add Neuron tools to path
+RUN echo "export PATH=/opt/aws/neuron/bin:\$PATH" >> /root/.bashrc \
+    && echo "export TERM=screen" >> /root/.bashrc
+
+# Install Nemo, Apex, and related packages
+COPY ./build/ /nemo_packages
+RUN cd /nemo_packages && ${PIP} install \
+    nemo_toolkit-1.14.0-py3-none-any.whl['all'] \
+    apex-0.1-py3-none-any.whl \
+    torch==1.13.* protobuf==3.20.3 \
+    && rm -fr /root/.cache/
+
+# Add Nemo and allreduce examples
+COPY ./nemo/examples/ /nemo_examples
+RUN cd /usr/local/lib/python3.8/dist-packages/nemo/collections/nlp/data/language_modeling/megatron/ && make -C .
+COPY ./k8s/docker/allreduce* /nemo_examples/nlp/language_modeling
+
+# nodelist_helper.py is required for MPI runs on EKS
+COPY ./k8s/docker/nodelist_helper.py /
+WORKDIR /nemo_examples/nlp/language_modeling
+
+CMD ["/bin/bash"]

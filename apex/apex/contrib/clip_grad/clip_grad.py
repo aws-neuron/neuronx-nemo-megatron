@@ -1,5 +1,9 @@
 import torch
-from torch._six import inf
+
+if torch.__version__.startswith('2'):
+    from torch import inf
+else:
+    from torch._six import inf
 from typing import Union, Iterable
 
 _kernel_import_succeeded = False
