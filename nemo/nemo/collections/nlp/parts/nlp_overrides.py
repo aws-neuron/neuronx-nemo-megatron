@@ -26,17 +26,22 @@ import pytorch_lightning as pl
 import torch
 import torch.multiprocessing as mp
 from torch import Tensor
+from torch.nn import Module
+from torch.optim.optimizer import Optimizer
 from torchmetrics import Metric
 from lightning_lite.plugins import ClusterEnvironment, XLACheckpointIO
+from lightning_lite.plugins.environments import XLAEnvironment
 from lightning_lite.utilities.types import _PATH
 from lightning_lite.strategies.launchers.xla import _rank_teardown
 from lightning_utilities.core.apply_func import apply_to_collection, apply_to_collections
 from lightning_utilities.core.imports import RequirementCache
+from lightning_lite.accelerators.tpu import _XLA_AVAILABLE
 from omegaconf import OmegaConf
 from pytorch_lightning.profilers import Profiler
 from pytorch_lightning.overrides import LightningDistributedModule
 from pytorch_lightning.plugins import PLUGIN_INPUT
 from pytorch_lightning.plugins.io.checkpoint_plugin import CheckpointIO
+from pytorch_lightning.plugins.precision import PrecisionPlugin
 from pytorch_lightning.plugins.precision.native_amp import NativeMixedPrecisionPlugin
 from pytorch_lightning.strategies import DDPStrategy, TPUSpawnStrategy, Strategy
 from pytorch_lightning.strategies.launchers.xla import _XLALauncher
@@ -44,30 +49,24 @@ from pytorch_lightning.trainer.trainer import Trainer
 from pytorch_lightning.utilities.exceptions import MisconfigurationException
 from pytorch_lightning.utilities.fetching import DataFetcher
 from pytorch_lightning.loops.utilities import _block_parallel_sync_behavior
-from pytorch_lightning.trainer.states import RunningStage, TrainerFn
 from pytorch_lightning.utilities.argparse import _defaults_from_env_vars
 from pytorch_lightning.trainer.connectors.accelerator_connector import AcceleratorConnector, _LITERAL_WARN
 from pytorch_lightning.trainer.connectors.checkpoint_connector import CheckpointConnector
 
 from pytorch_lightning.trainer import call, setup
-from lightning_lite.utilities.types import _PATH
-from pytorch_lightning.accelerators import Accelerator, TPUAccelerator
-from pytorch_lightning.callbacks import Callback, Checkpoint, EarlyStopping, ProgressBarBase
-from pytorch_lightning.callbacks.prediction_writer import BasePredictionWriter
-from pytorch_lightning.core.datamodule import LightningDataModule
+from pytorch_lightning.accelerators import Accelerator
+from pytorch_lightning.callbacks import Callback, Checkpoint
 from pytorch_lightning.loggers import Logger
-from pytorch_lightning.loggers.tensorboard import TensorBoardLogger
-from pytorch_lightning.loops import Loop, PredictionLoop, TrainingEpochLoop, TrainingBatchLoop, OptimizerLoop
+from pytorch_lightning.loops import PredictionLoop, TrainingEpochLoop, TrainingBatchLoop, OptimizerLoop
 from pytorch_lightning.loops.dataloader.evaluation_loop import EvaluationLoop
 from pytorch_lightning.loops.fit_loop import FitLoop
-from pytorch_lightning.loops.utilities import _parse_loop_limits, _reset_progress
-from pytorch_lightning.trainer.states import RunningStage, TrainerFn, TrainerState, TrainerStatus
+from pytorch_lightning.trainer.states import TrainerFn, TrainerState
 from pytorch_lightning.trainer.connectors.data_connector import DataConnector
 from pytorch_lightning.trainer.connectors.logger_connector import LoggerConnector
-from pytorch_lightning.trainer.connectors.logger_connector.result import _OUT_DICT, _PBAR_DICT, _ResultCollection, _ResultMetric, _ResultMetricCollection
+from pytorch_lightning.trainer.connectors.logger_connector.result import _ResultCollection, _ResultMetric, _ResultMetricCollection
 from pytorch_lightning.trainer.connectors.signal_connector import SignalConnector
 from pytorch_lightning.trainer.connectors.callback_connector import CallbackConnector
-from pytorch_lightning.tuner.tuning import _TunerResult, Tuner
+from pytorch_lightning.tuner.tuning import Tuner
 
 from torch.distributed.algorithms.ddp_comm_hooks.debugging_hooks import noop_hook
 from torch.nn.parallel import DistributedDataParallel
@@ -77,6 +76,7 @@ from nemo.core.connectors.save_restore_connector import SaveRestoreConnector
 from nemo.core.optim import MainParamsOptimizerWrapper
 from nemo.utils import AppState, logging
 from nemo.utils.model_utils import inject_model_parallel_rank
+from nemo.utils.cast_utils import cast_all
 
 try:
     from apex.transformer import parallel_state
@@ -104,16 +104,23 @@ class _NLPXLALauncher(_XLALauncher):
             **rning AMI GPU PyTorch 1.13.1 (Ubuntu 20.04) 20230519
             kwargs: Optional keyword arguments to be passed to the given function.
         """
-        context = mp.get_context(self._start_method)
-        return_queue = context.SimpleQueue()
-        import torch_xla.distributed.xla_multiprocessing as xmp
     
-        xmp.spawn(
-            self._wrapping_function,
-            args=(trainer, function, args, kwargs, return_queue),
-            nprocs=self._strategy.num_processes,
-            start_method=self._start_method,
-        )
+        if not self._strategy.cluster_environment.creates_processes_externally:
+            context = mp.get_context(self._start_method)
+            return_queue = context.SimpleQueue()
+            import torch_xla.distributed.xla_multiprocessing as xmp
+            xmp.spawn(
+                    self._wrapping_function,
+                    args=(trainer, function, args, kwargs, return_queue),
+                    nprocs=self._strategy.num_processes,
+                    start_method=self._start_method,
+                    )
+        else:
+            process_idx = int(os.environ.get("LOCAL_RANK"))
+            self._strategy._local_rank = process_idx
+            results = function(*args, **kwargs)
+            _rank_teardown(process_idx)
+
         return None
     
     def _wrapping_function(
@@ -179,7 +186,6 @@ class NLPOptimizerLoop(OptimizerLoop):
             and self.trainer.fit_loop._should_accumulate()
         ):
             # For gradient accumulation
-    
             # -------------------
             # calculate loss (train step + train step end)
             # -------------------
@@ -330,7 +336,9 @@ class NLPAcceleratorConnector(AcceleratorConnector):
         """Lazily set missing attributes on the previously instantiated strategy."""
         self.strategy.accelerator = self.accelerator
         if self.precision_plugin:
-            self.strategy.precision_plugin = self.precision_plugin
+            #self.strategy.precision_plugin = self.precision_plugin
+            self.strategy.precision_plugin = PrecisionPlugin()
+
         if self.checkpoint_io:
             self.strategy.checkpoint_io = self.checkpoint_io
         if hasattr(self.strategy, "cluster_environment"):
@@ -565,27 +573,49 @@ class NLPDDPStrategy(TPUSpawnStrategy):
 
     def __init__(
         self,
+        accelerator: Optional["pl.accelerators.Accelerator"] = None,
         parallel_devices: Optional[List[torch.device]] = None,
-        cluster_environment: ClusterEnvironment = None,
+        cluster_environment: Optional[ClusterEnvironment] = None,
         checkpoint_io: Optional[CheckpointIO] = None,
+        precision_plugin: Optional[PrecisionPlugin] = None,
+        debug: bool = False,
         no_ddp_communication_hook: bool = False,
-        **kwargs: Union[Any, Dict[str, Any]],
+        megatron_amp_o2: bool=False,
+        **_: Any,
     ) -> None:
+        if not _XLA_AVAILABLE:
+            raise ModuleNotFoundError(str(_XLA_AVAILABLE))
         if not HAVE_APEX:
             raise ImportError(
                 "Apex was not found. Please see the NeMo README for installation instructions: https://github.com/NVIDIA/NeMo#megatron-gpt."
             )
-        super().__init__(parallel_devices, cluster_environment, checkpoint_io, **kwargs)
-
+        if cluster_environment is None:
+            cluster_environment=XLAEnvironment()
+        super(TPUSpawnStrategy, self).__init__(
+            accelerator=accelerator,
+            parallel_devices=parallel_devices,
+            cluster_environment=cluster_environment,
+            checkpoint_io=checkpoint_io,
+            precision_plugin=precision_plugin,
+            start_method="fork",
+        )
+        self._checkpoint_io: Optional[CheckpointIO]
+        self.debug = debug
+        self._launched = False
         self.no_ddp_communication_hook = no_ddp_communication_hook
+        self.megatron_amp_o2 = megatron_amp_o2
 
     def _configure_launcher(self) -> None:
         self._launcher = _NLPXLALauncher(self)
 
     def setup_distributed(self, global_rank: int = None, world_size: int = None) -> None:
         import torch.distributed as dist
-        import torch_xla.core.xla_model as xm
-        dist.init_process_group('xla', rank=xm.get_ordinal())
+        if self.cluster_environment.creates_processes_externally:
+            global_rank = int(os.environ.get("RANK"))
+        else:
+            import torch_xla.core.xla_model as xm
+            global_rank = xm.get_ordinal()
+        dist.init_process_group('xla', rank=global_rank)
         # call PTL init ddp
         super().setup_distributed()
 
@@ -716,11 +746,17 @@ class NLPDDPStrategy(TPUSpawnStrategy):
         master_only = app_state.data_parallel_rank == 0
         if master_only:
             ensure_directory_exists(filepath)
+        try:
+            save_bf16 = self.lightning_module.cfg.save_bf16
+        except:
+            save_bf16 = False
         if self.is_save_type_xser():
             xser.save({k: v for k, v in checkpoint.items() if k != "callbacks"}, filepath, (not master_only), global_master=True)
         else:
             for tp_rank in range(0, parallel_state.get_tensor_model_parallel_world_size()):
                 my_tp_rank = parallel_state.get_tensor_model_parallel_rank()
+                if save_bf16:
+                    checkpoint = cast_all(checkpoint, from_dtype=torch.float32, to_dtype=torch.bfloat16)
                 should_write_data = True if parallel_state.get_data_parallel_rank() == 0 and my_tp_rank == tp_rank else False
 
                 #Staggering save checkpoints
@@ -761,7 +797,7 @@ class NLPDDPStrategy(TPUSpawnStrategy):
         checkpoint_path = inject_model_parallel_rank(checkpoint_path)
         import torch_xla.utils.serialization as xser
         
-        if load_xser_mode:
+        if self.is_load_type_xser():
             return xser.load(checkpoint_path)
         return self.checkpoint_io.load_checkpoint(checkpoint_path)
 
@@ -808,6 +844,25 @@ class NLPDDPStrategy(TPUSpawnStrategy):
         assert self.accelerator is not None
         self.accelerator.teardown()
         self.checkpoint_io.teardown()
+
+    #def optimizer_step(
+    #        self,
+    #        optimizer: Optimizer,
+    #        opt_idx: int,
+    #        closure: Callable[[], Any],
+    #        model: Optional[Union["pl.LightningModule", Module]] = None,
+    #        **kwargs: Any,
+    #) -> Any:
+    #    if self.megatron_amp_o2:
+    #        # Mixed precision optimizer step
+    #        closure_result = closure()
+    #        optimizer.step(closure=closure)
+    #        return closure_result
+    #    else:
+    #        # Single optimizer step
+    #        # Gradient averaging will be handled manually - either by Zero1 or inside model train step
+    #        # Notes this overrides the optimizer step present in the XLA Precision Plugin by Lightning
+    #        return optimizer.step(closure=closure)
 
 
 class NLPSaveRestoreConnector(SaveRestoreConnector):

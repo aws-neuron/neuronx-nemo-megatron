@@ -20,13 +20,13 @@ from abc import abstractmethod
 from os import path
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Union
-
 import hydra
 import torch
 from omegaconf import DictConfig, OmegaConf, open_dict
 from pytorch_lightning import LightningModule, Trainer
 from pytorch_lightning.utilities import model_summary, rank_zero_only
-
+import torch_xla.core.xla_model as xm
+from torch_xla.distributed.zero_redundancy_optimizer import ZeroRedundancyOptimizer
 from nemo import package_info
 from nemo.core import optim
 from nemo.core.classes.common import Model
@@ -36,7 +36,6 @@ from nemo.utils import logging, model_utils
 from nemo.utils.app_state import AppState
 from nemo.utils.debug_hook import register_debug_hooks
 from nemo.utils.get_rank import get_rank, is_global_rank_zero
-
 __all__ = ['ModelPT']
 
 
@@ -438,6 +437,7 @@ class ModelPT(LightningModule, Model):
 
     def setup_optimization(
         self, optim_config: Optional[Union[DictConfig, Dict]] = None, optim_kwargs: Optional[Dict[str, Any]] = None,
+            wrap_with_zero=False
     ):
         """Prepares an optimizer from a string name and its optional config parameters.
 
@@ -454,6 +454,7 @@ class ModelPT(LightningModule, Model):
             optim_kwargs: A dictionary with additional kwargs for the
                 optimizer. Used for non-primitive types that are not
                 compatible with OmegaConf.
+                :param wrap_with_zero: Parameter to wrap optimizer with ZeroRedundancyOptimizer for Zero-1
 
         """
         # Setup the optimizer parameter groups (by default use all parameters that are trainable)
@@ -596,8 +597,19 @@ class ModelPT(LightningModule, Model):
                     raise e
 
         else:
-            optimizer = optim.get_optimizer(optimizer_name)
-            optimizer = optimizer(self._optimizer_param_groups, **optimizer_args)
+            if wrap_with_zero:
+                optimizer = ZeroRedundancyOptimizer(self._optimizer_param_groups,
+                                                    optim.AVAILABLE_OPTIMIZERS[optimizer_name],
+                                                    pin_layout=False,
+                                                    grad_clipping=self.trainer.gradient_clip_val is not None and self.trainer.gradient_clip_val != 0,
+                                                    max_norm=self.trainer.gradient_clip_val,
+                                                    sharding_groups=self.calculate_data_parallel_groups(),
+                                                    grad_norm_groups=self.calculate_model_parallel_groups(),
+                                                    **optimizer_args,
+                                                    )
+            else:
+                optimizer = optim.get_optimizer(optimizer_name)
+                optimizer = optimizer(self._optimizer_param_groups, **optimizer_args)
 
             logging.info("Optimizer config = %s", str(optimizer))
 
@@ -611,6 +623,62 @@ class ModelPT(LightningModule, Model):
         # Return the optimizer with/without scheduler
         # This return allows multiple optimizers or schedulers to be created
         return self._optimizer, self._scheduler
+
+    def calculate_data_parallel_groups(self):
+        """
+        Helper method for calculating data parallel groups for Zero-1 Optimizer Sharding
+        Example: World Size 32 with TP Degree 8 and PP Degree 1 returns [[0, 8, 16, 24], [1, 9, 17, 25],
+                                                                      [2, 10, 18, 26], [3, 11, 19, 27],
+                                                                      [4, 12, 20, 28], [5, 13, 21, 29],
+                                                                      [6, 14, 22, 30], [7, 15, 23, 31]]
+        :return: List of lists of data parallel groups
+        """
+        world_size = xm.xrt_world_size()
+        tensor_model_parallel_size = self.cfg.get('tensor_model_parallel_size', 1)
+        pipeline_model_parallel_size = self.cfg.get('pipeline_model_parallel_size', 1)
+        num_pipeline_model_parallel_groups = world_size // pipeline_model_parallel_size
+
+        # Build the data-parallel groups.
+        all_data_parallel_group_ranks = []
+        for i in range(pipeline_model_parallel_size):
+            start_rank = i * num_pipeline_model_parallel_groups
+            end_rank = (i + 1) * num_pipeline_model_parallel_groups
+            for j in range(tensor_model_parallel_size):
+                ranks = range(start_rank + j, end_rank, tensor_model_parallel_size)
+                all_data_parallel_group_ranks.append(list(ranks))
+        return all_data_parallel_group_ranks
+
+    def calculate_model_parallel_groups(self):
+        """
+        Helper method for calculating model parallel groups for Zero-1 Optimizer Sharding
+        Example: World Size 32 with TP Degree 8 and PP Degree 4 returns dp groups [[0], [1], [2], [3], [4], [5], [6], [7], [8],
+                                                                        [9], [10], [11], [12], [13], [14], [15], [16],
+                                                                        [17], [18], [19], [20], [21], [22], [23], [24],
+                                                                        [25], [26], [27], [28], [29], [30], [31]]
+        with model parallel groups returned as  [[0, 1, 2, 3, 4, 5, 6, 7, 8,
+                            9, 10, 11, 12, 13, 14, 15, 16,
+                            17, 18, 19, 20, 21, 22, 23, 24,
+                             25, 26, 27, 28, 29, 30, 31]]
+        :return: List of lists of model parallel groups
+        """
+        world_size = xm.xrt_world_size()
+        tensor_model_parallel_size = self.cfg.get('tensor_model_parallel_size', 1)
+        pipeline_model_parallel_size = self.cfg.get('pipeline_model_parallel_size', 1)
+        data_parallel_size = world_size // (
+                tensor_model_parallel_size * pipeline_model_parallel_size
+            )
+        all_data_parallel_group_ranks = self.calculate_data_parallel_groups()
+
+        # Build the data-parallel groups.
+        all_model_parallel_group_ranks = []
+        for i in range(data_parallel_size):
+            ranks = [
+                data_parallel_group_ranks[i]
+                for data_parallel_group_ranks in all_data_parallel_group_ranks
+            ]
+            all_model_parallel_group_ranks.append(list(ranks))
+        return all_model_parallel_group_ranks
+
 
     def setup_optimizer_param_groups(self):
         """

@@ -27,7 +27,7 @@ from nemo.collections.nlp.modules.common.megatron.utils import (
 )
 
 try:
-    from apex.transformer import tensor_parallel
+    from apex.transformer import parallel_state, tensor_parallel
     from apex.transformer.enums import AttnMaskType
 
     HAVE_APEX = True
@@ -491,6 +491,7 @@ class TransformerLanguageModel(MegatronModule):
         self.output_layer_init_method = output_layer_init_method
         self.position_embedding_type = position_embedding_type
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
+        self.sequence_parallel = sequence_parallel
 
         if kv_channels is None:
 
@@ -514,12 +515,14 @@ class TransformerLanguageModel(MegatronModule):
                 fp32_residual_connection=fp32_residual_connection,
             )
             self._embedding_key = 'embedding'
-        if position_embedding_type == 'rope':
-            rotary_dim = self.hidden_size // num_attention_heads if kv_channels is None else kv_channels
-            assert 0 < rotary_percentage <= 1
-            if rotary_percentage < 1:
-                rotary_dim = int(rotary_dim * rotary_percentage)
-            self.rotary_pos_emb = RotaryEmbedding(rotary_dim)
+        # Move Rope to core attention
+        # TODO: check perf penalty vs original Nemo implementation
+        # if position_embedding_type == 'rope':
+        #     rotary_dim = self.hidden_size // num_attention_heads if kv_channels is None else kv_channels
+        #     assert 0 < rotary_percentage <= 1
+        #     if rotary_percentage < 1:
+        #         rotary_dim = int(rotary_dim * rotary_percentage)
+        #     self.rotary_pos_emb = RotaryEmbedding(rotary_dim)
         # Transformer.
         self.encoder = ParallelTransformer(
             init_method=self.init_method,
@@ -570,6 +573,7 @@ class TransformerLanguageModel(MegatronModule):
             fp8_amax_compute_algo=fp8_amax_compute_algo,
             reduce_amax=reduce_amax,
             use_emha=use_emha,
+            position_embedding_type=self.position_embedding_type
         )
         self._encoder_key = 'encoder'
 
@@ -619,12 +623,21 @@ class TransformerLanguageModel(MegatronModule):
                 self._pooler_key = 'pooler'
 
             if not self.share_embeddings_and_output_weights:
+                no_async_tensor_model_parallel_allreduce = (
+                    parallel_state.get_tensor_model_parallel_world_size() == 1 or sequence_parallel
+                )
                 self.output_layer = tensor_parallel.ColumnParallelLinear(
                     self.hidden_size,
                     self.vocab_size,
                     bias=False,  # Setting bias to False always to keep it consistent with embedding tying that also does not have a bias.
                     init_method=self.init_method,
-                    use_cpu_initialization=use_cpu_initialization
+                    skip_bias_add=True,
+                    use_cpu_initialization=use_cpu_initialization,
+                    gather_output=False,
+                    sequence_parallel_enabled=sequence_parallel,
+                    no_async_tensor_model_parallel_allreduce=no_async_tensor_model_parallel_allreduce,
+                    gradient_accumulation_fusion=gradient_accumulation_fusion,
+                    transfer_with_static_ring=(not (activations_checkpoint_granularity=="selective")),
                 )
                 self._output_layer_key = 'output_layer'
 
@@ -666,16 +679,25 @@ class TransformerLanguageModel(MegatronModule):
         # encoder_input: [s, b, h]
 
         # enc_attn_mask: [1, 1, s, s]
-
-        if self.position_embedding_type == 'rope':
-            if inference_max_sequence_len is not None:
-                rotary_pos_emb = self.rotary_pos_emb(inference_max_sequence_len)
-            elif self.encoder.input_tensor is not None:
-                rotary_pos_emb = self.rotary_pos_emb(self.encoder.input_tensor.size(0))
-            else:
-                rotary_pos_emb = self.rotary_pos_emb(encoder_input.size(0))
-        else:
-            rotary_pos_emb = None
+        # Move rope to core attention
+        # if self.position_embedding_type == 'rope':
+        #     if inference_max_sequence_len is not None:
+        #         rotary_pos_emb = self.rotary_pos_emb(inference_max_sequence_len)
+        #     elif self.encoder.input_tensor is not None:
+        #         if self.sequence_parallel:
+        #             rotary_pos_emb = self.rotary_pos_emb(
+        #                 self.encoder.input_tensor.size(0) * parallel_state.get_tensor_model_parallel_world_size()
+        #             )
+        #         else:
+        #             rotary_pos_emb = self.rotary_pos_emb(self.encoder.input_tensor.size(0))
+        #     else:
+        #         if self.sequence_parallel:
+        #             rotary_pos_emb = self.rotary_pos_emb(
+        #                 encoder_input.size(0) * parallel_state.get_tensor_model_parallel_world_size()
+        #             )
+        #         else:
+        #             rotary_pos_emb = self.rotary_pos_emb(encoder_input.size(0))
+        rotary_pos_emb = None
         # encoder.
         if enc_hidden_states is None:
             encoder_output = self.encoder(
@@ -694,6 +716,8 @@ class TransformerLanguageModel(MegatronModule):
             encoder_output = enc_hidden_states.to(encoder_input.dtype)
 
         if self.post_process:
+            if not self.share_embeddings_and_output_weights:
+                encoder_output, _ = self.output_layer(encoder_output)
             if self.add_pooler:
                 pooled_output = self.pooler(encoder_output, pooling_sequence_index)
 

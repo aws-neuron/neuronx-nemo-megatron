@@ -513,6 +513,7 @@ class ColumnParallelLinear(torch.nn.Module):
         gradient_accumulation_fusion=False,
         accumulation_in_fp16: bool = False,
         sequence_parallel_enabled: bool = False,
+        transfer_with_static_ring: bool = True,
     ):
         super().__init__()
 
@@ -524,6 +525,7 @@ class ColumnParallelLinear(torch.nn.Module):
         world_size = get_tensor_model_parallel_world_size()
         self.output_size_per_partition = divide(output_size, world_size)
         self.skip_bias_add = skip_bias_add
+        self.transfer_with_static_ring = transfer_with_static_ring
 
         # Parameters.
         # Note: torch.nn.functional.linear performs XA^T + b and as a result
@@ -629,7 +631,7 @@ class ColumnParallelLinear(torch.nn.Module):
 
         output_parallel = self._forward_impl(
             input=input_parallel,
-            weight=TransferWithStaticRing.apply(self.weight),
+            weight=TransferWithStaticRing.apply(self.weight) if self.transfer_with_static_ring else self.weight,
             bias=bias,
             gradient_accumulation_fusion=self.gradient_accumulation_fusion,
             async_grad_allreduce=self.async_tensor_model_parallel_allreduce,
@@ -702,6 +704,7 @@ class RowParallelLinear(torch.nn.Module):
         gradient_accumulation_fusion=False,
         accumulation_in_fp16: bool = False,
         sequence_parallel_enabled: bool = False,
+        transfer_with_static_ring: bool = True,
     ):
         super().__init__()
 
@@ -715,6 +718,7 @@ class RowParallelLinear(torch.nn.Module):
         self.skip_bias_add = skip_bias_add
         self.gradient_accumulation_fusion = gradient_accumulation_fusion
         self.sequence_parallel_enabled = sequence_parallel_enabled
+        self.transfer_with_static_ring = transfer_with_static_ring
         if self.sequence_parallel_enabled and not self.input_is_parallel:
             raise RuntimeError("To enable `sequence_parallel_enabled`, `input_is_parallel` must be `True`")
 
@@ -795,7 +799,7 @@ class RowParallelLinear(torch.nn.Module):
         # Matrix multiply.
         output_parallel = self._forward_impl(
             input=input_parallel,
-            weight=TransferWithStaticRing.apply(self.weight),
+            weight=TransferWithStaticRing.apply(self.weight) if self.transfer_with_static_ring else self.weight,
             bias=None,
             gradient_accumulation_fusion=self.gradient_accumulation_fusion,
             async_grad_allreduce=False,
