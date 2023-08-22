@@ -71,12 +71,14 @@ export NEURON_COMPILE_CACHE_URL="$HOME/neuron_cache" # Place cache on shared sto
 export TRAIN_ITERS=300000
 export GBS=$((NTASKS*32))
 CREATE_TB_LOGGER=True
+CHECKPOINT_CALLBACK=True
 
 if [ "$COMPILE" = "1" ]; then
     echo "compiling only run"
     MAYBE_COMPILE="neuron_parallel_compile"
     TRAIN_ITERS=4
     CREATE_TB_LOGGER=False
+    CHECKPOINT_CALLBACK=False
 fi
 
 : ${SEQ_LENGTH:=2048}
@@ -86,6 +88,7 @@ fi
 : ${N_LAYERS:=32}
 : ${N_AH:=32}
 : ${UBS:=1}
+: ${ACT_CHKPNT_GRANULARITY:=selective}
 FFN_HS=$(($HS*4))
 echo "SEQ_LEN=$SEQ_LENGTH, HS=$HS, FFN_HS=$FFN_HS TP=$TP PP=$PP N_LAYERS=$N_LAYERS N_AH=$N_AH GBS=$GBS UBS=$UBS"
 
@@ -131,14 +134,14 @@ $MAYBE_COMPILE torchrun $DISTRIBUTED_ARGS megatron_gpt_pretraining.py  \
     model.optim.sched.constant_steps=80000 \
     model.optim.sched.min_lr=1.0e-5 \
     model.sequence_parallel=True  \
-    model.activations_checkpoint_granularity=selective \
+    model.activations_checkpoint_granularity=$ACT_CHKPNT_GRANULARITY \
     model.activations_checkpoint_method=uniform \
     model.activations_checkpoint_num_layers=1 \
     +model.save_xser=True \
     exp_manager.create_tensorboard_logger=$CREATE_TB_LOGGER \
     exp_manager.resume_if_exists=False \
     exp_manager.resume_ignore_no_checkpoint=False \
-    exp_manager.create_checkpoint_callback=True \
+    exp_manager.create_checkpoint_callback=$CHECKPOINT_CALLBACK \
     exp_manager.explicit_log_dir=$EXPLICIT_LOGDIR \
     +exp_manager.checkpoint_callback_params.train_time_interval=3600 \
     model.use_cpu_initialization=True   2>&1  | tee  $LOG_PATH/log
