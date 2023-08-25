@@ -279,22 +279,19 @@ class NLPCheckpointConnector(CheckpointConnector):
         pl_module = self.trainer.lightning_module
         assert pl_module is not None
     
-        if os.environ.get("BR_CHECKPOINT", None):
-            self._loaded_checkpoint["global_step"] = 0 ### NEURON: Remove this and add global_step to
-            self._loaded_checkpoint["epoch"] = 0 #### NEURON: Remove
+        global_step = self._loaded_checkpoint.get("global_step", 0)
+        epoch = self._loaded_checkpoint.get("epoch", 0)
         # set the `global_step` value for checkpoints before v1.6 without the progress tracking state.
         # it will be overwritten by the loop's state if it was also saved
         batch_loop = fit_loop.epoch_loop.batch_loop
         if pl_module.automatic_optimization:
-            batch_loop.optimizer_loop.optim_progress.optimizer.step.total.completed = self._loaded_checkpoint[
-                "global_step"
-            ]
+            batch_loop.optimizer_loop.optim_progress.optimizer.step.total.completed = global_step
         else:
-            batch_loop.manual_loop.optim_step_progress.total.completed = self._loaded_checkpoint["global_step"]
+            batch_loop.manual_loop.optim_step_progress.total.completed = global_step
     
         # set the `current_epoch` value for checkpoints before v1.6 without the progress tracking state.
         # it will be overwritten by the loop's state if it was also saved
-        fit_loop.epoch_progress.current.completed = self._loaded_checkpoint["epoch"]
+        fit_loop.epoch_progress.current.completed = epoch
     
         assert self.trainer.state.fn is not None
         state_dict = self._loaded_checkpoint.get("loops")
@@ -321,6 +318,28 @@ class NLPCheckpointConnector(CheckpointConnector):
                 f"You restored a checkpoint with current_epoch={self.trainer.current_epoch},"
                 f" but you have set Trainer(max_epochs={self.trainer.max_epochs})."
             )
+
+    def restore_optimizers_and_schedulers(self) -> None:
+        """Restores the optimizers and learning rate scheduler states from the pre-loaded checkpoint."""
+        if not self._loaded_checkpoint:
+            return
+        if self.trainer.strategy.lightning_restore_optimizer:
+            # validation
+            if "optimizer_states" not in self._loaded_checkpoint:
+                logging.warning(
+                "Trying to restore optimizer state but checkpoint contains only the model."
+                " This is probably due to `ModelCheckpoint.save_weights_only` being set to `True`."
+                )  
+                return
+            self.restore_optimizers()
+
+        if "lr_schedulers" not in self._loaded_checkpoint:
+            logging.warning(
+                "Trying to restore learning rate scheduler state but checkpoint contains only the model."
+                " This is probably due to `ModelCheckpoint.save_weights_only` being set to `True`."
+            )
+            return
+        self.restore_lr_schedulers()
 
 class NLPAcceleratorConnector(AcceleratorConnector):
     def _validate_precision_choice(self) -> None:
@@ -560,7 +579,6 @@ class NLPTrainer(Trainer):
                 if self.state.fn == TrainerFn.FITTING:
                     # restore callback states
                     self._checkpoint_connector.restore_callbacks()
-                self._checkpoint_connector._loaded_checkpoint = {}
             xm.rendezvous(f'load-chkpt-phase-{i}')
 
 class NLPDDPStrategy(TPUSpawnStrategy):

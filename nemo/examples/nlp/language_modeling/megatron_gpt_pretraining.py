@@ -89,19 +89,18 @@ def main(cfg) -> None:
     if cfg.get('cluster_type', None) == 'BCP':
         plugins.append(TorchElasticEnvironment())
 
-    trainer = NLPTrainer(plugins=plugins, strategy=strategy, num_sanity_val_steps=0, **cfg.trainer)
-
-    exp_manager(trainer, cfg.exp_manager)
-
     # update resume from checkpoint found by exp_manager
     if cfg.model.resume_from_checkpoint is not None:
         resume_from_checkpoint = cfg.model.resume_from_checkpoint
+        trainer = NLPTrainer(plugins=plugins, strategy=strategy, num_sanity_val_steps=0, resume_from_checkpoint=resume_from_checkpoint, **cfg.trainer)
     else:
-        resume_from_checkpoint = trainer._checkpoint_connector.resume_from_checkpoint_fit_path
+        trainer = NLPTrainer(plugins=plugins, strategy=strategy, num_sanity_val_steps=0, **cfg.trainer)
 
-    logging.info(f'Resuming training from checkpoint: {resume_from_checkpoint}')
 
-    trainer._checkpoint_connector = CheckpointConnector(trainer, resume_from_checkpoint=resume_from_checkpoint)
+    exp_manager(trainer, cfg.exp_manager)
+    
+    # We use NLPCheckpointConnector which correctly loads global_step, epoch
+    #trainer._checkpoint_connector = CheckpointConnector(trainer, resume_from_checkpoint=resume_from_checkpoint)
     # Override timer callback to a stateless one
     for idx, callback in enumerate(trainer.callbacks):
         if isinstance(callback, Timer):

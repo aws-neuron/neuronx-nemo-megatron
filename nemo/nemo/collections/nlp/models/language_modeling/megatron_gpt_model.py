@@ -449,10 +449,9 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
                 log_fn('parameter_norm', param_norm.detach().cpu(), prog_bar=True, rank_zero_only=True)
             log_fn('global_step', global_step, prog_bar=True, rank_zero_only=True)
             log_fn('consumed_samples', consumed_samples, prog_bar=True, rank_zero_only=True)
-            log_fn('iteration_time', elapsed_time, prog_bar=True, rank_zero_only=True)
             log_fn('throughput', throughput, prog_bar=True, rank_zero_only=True)
             log_fn('throughput_peak', throughput_peak, prog_bar=True, rank_zero_only=True)
-        xm.add_step_closure(_log_metrics, (self.log, loss_mean.detach(), lr, float(self.trainer.global_step), float(consumed_samples), grad_norm, param_norm, throughput, throughput_peak))
+        xm.add_step_closure(_log_metrics, (self.log, loss_mean.detach(), lr, float(self.trainer.global_step), float(consumed_samples), grad_norm, param_norm, float(throughput), float(throughput_peak)))
 
         return loss_mean
 

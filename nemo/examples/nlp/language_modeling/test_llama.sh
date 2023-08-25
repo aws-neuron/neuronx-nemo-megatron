@@ -50,14 +50,18 @@ export NEURON_TRANSFER_WITH_STATIC_RING_OPS=""
 export MALLOC_ARENA_MAX=128
 
 export XLA_USE_BF16=1
-export NEURON_CC_FLAGS="--model-type transformer --enable-mixed-precision-accumulation --enable-experimental-O1 --distribution-strategy=nemo --cache_dir=$HOME/neuron_cache/llama/`hostname`"
+export NEURON_CC_FLAGS="--model-type transformer --distribution-strategy=nemo --cache_dir=$HOME/neuron_cache/llama/`hostname`"
 export TF_NUM_INTEROP_THREADS=8192
 
 export TRAIN_ITERS=20000
 CREATE_TB_LOGGER=True
-if [ "$NEURON_EXTRACT_GRAPHS_ONLY" = "1" ]; then
+CHECKPOINT_CALLBACK=True
+if [ "$COMPILE" = "1" ]; then
+    echo "compiling only run"
+    MAYBE_COMPILE="neuron_parallel_compile"
     export TRAIN_ITERS=3
     CREATE_TB_LOGGER=False
+    CHECKPOINT_CALLBACK=False
 fi
 
 : ${SEQ_LENGTH:=2048}
@@ -74,14 +78,14 @@ echo "SEQ_LEN=$SEQ_LENGTH, HS=$HS, FFN_HS=$FFN_HS TP=$TP PP=$PP N_LAYERS=$N_LAYE
 LOG_PATH=logs/$SLURM_JOB_ID/$NODEID/
 mkdir -p $LOG_PATH
 
-torchrun $DISTRIBUTED_ARGS megatron_gpt_pretraining.py  \
+$MAYBE_COMPILE torchrun $DISTRIBUTED_ARGS megatron_gpt_pretraining.py  \
     --config-path=conf \
     --config-name=megatron_llama_config \
     trainer.devices=$PROCESSES_PER_NODE \
     trainer.num_nodes=$NTASKS \
     trainer.max_epochs=null \
     trainer.max_steps=$TRAIN_ITERS\
-    trainer.val_check_interval=0.99 \
+    trainer.val_check_interval=$TRAIN_ITERS \
     trainer.log_every_n_steps=1 \
     trainer.limit_val_batches=1 \
     trainer.limit_test_batches=1 \
@@ -104,7 +108,6 @@ torchrun $DISTRIBUTED_ARGS megatron_gpt_pretraining.py  \
     model.data.data_prefix=[1.0,/root/scripts/data/books/book.jsonl-processed_text_document] \
     model.data.num_workers=1 \
     model.data.seq_length=$SEQ_LENGTH \
-    model.data.splits_string=\'980,10,10\' \
     model.optim.name=adamw \
     model.optim.lr=3.0e-4 \
     model.optim.betas=[0.9,0.95] \
@@ -122,12 +125,13 @@ torchrun $DISTRIBUTED_ARGS megatron_gpt_pretraining.py  \
     exp_manager.create_tensorboard_logger=$CREATE_TB_LOGGER \
     exp_manager.resume_if_exists=False \
     exp_manager.resume_ignore_no_checkpoint=False \
-    exp_manager.create_checkpoint_callback=True \
+    exp_manager.create_checkpoint_callback=$CHECKPOINT_CALLBACK \
     +exp_manager.checkpoint_callback_params.train_time_interval=36000 \
     exp_manager.checkpoint_callback_params.save_last=False \
     model.use_cpu_initialization=True   2>&1  | tee  $LOG_PATH/log
 
 # Note: to resume training using a checkpoint, please add the following configuration above, adjusting for your checkpoint path
+    # model.use_cpu_initialization=False \
     # +model.load_xser=True \
     # +model.resume_from_checkpoint='/root/scripts/example_datasets/llamav2_weights/llama7b_hf_converted_nemo_v3//mp_rank_07/model_optim_rng.ckpt' \
 # To use mixed precision optimizer, add
