@@ -137,11 +137,11 @@ $MAYBE_COMPILE torchrun $DISTRIBUTED_ARGS megatron_gpt_pretraining.py  \
     model.activations_checkpoint_granularity=$ACT_CHKPNT_GRANULARITY \
     model.activations_checkpoint_method=uniform \
     model.activations_checkpoint_num_layers=1 \
-    +model.save_xser=True \
+    +model.save_xser=False \
     exp_manager.create_tensorboard_logger=$CREATE_TB_LOGGER \
     exp_manager.resume_if_exists=False \
     exp_manager.resume_ignore_no_checkpoint=False \
-    exp_manager.create_checkpoint_callback=$CHECKPOINT_CALLBACK \
+    exp_manager.create_checkpoint_callback=False \
     exp_manager.explicit_log_dir=$EXPLICIT_LOGDIR \
     +exp_manager.checkpoint_callback_params.train_time_interval=3600 \
     model.use_cpu_initialization=True   2>&1  | tee  $LOG_PATH/log
