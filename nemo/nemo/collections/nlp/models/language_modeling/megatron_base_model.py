@@ -31,7 +31,7 @@ from nemo.collections.nlp.modules.common.megatron.clip_grads import (
 from nemo.collections.nlp.modules.common.megatron.megatron_init import initialize_model_parallel_for_nemo
 from nemo.collections.nlp.modules.common.tokenizer_utils import get_nmt_tokenizer
 from nemo.collections.nlp.parts.nlp_overrides import GradScaler
-from nemo.core.optim import MainParamsOptimizerWrapper, prepare_lr_scheduler
+from nemo.core.optim import MainParamsOptimizerWrapperXLA, MainParamsOptimizerWrapper, prepare_lr_scheduler
 from nemo.utils import AppState, logging
 from nemo.utils.get_rank import is_global_rank_zero
 
@@ -130,11 +130,16 @@ class MegatronBaseModel(NLPModel):
 
         # buffer used during train_step for logging average loss over gradient accumulation steps
         self._reduced_loss_buffer = []
-        # import pdb; pdb.set_trace()
+        if os.environ.get("TORCHELASTIC_RUN_ID") is not None:
+            g_rank=int(os.environ.get("RANK"))
+            l_rank=int(os.environ.get("LOCAL_RANK"))
+        else:
+            g_rank = trainer.global_rank
+            l_rank = trainer.local_rank
         initialize_model_parallel_for_nemo(
             world_size=int(trainer.num_nodes)*int(trainer.num_devices),
-            global_rank=trainer.global_rank,
-            local_rank=trainer.local_rank,
+            global_rank=g_rank,
+            local_rank=l_rank,
             tensor_model_parallel_size=cfg.get('tensor_model_parallel_size', 1),
             pipeline_model_parallel_size=cfg.get('pipeline_model_parallel_size', 1),
             virtual_pipeline_model_parallel_size=cfg.get('virtual_pipeline_model_parallel_size', None),
@@ -149,7 +154,7 @@ class MegatronBaseModel(NLPModel):
         self._validate_and_override_config()
 
         self.grad_clip_pl_default = False  # use pytorch default for gradient clipping. Default False
-
+        self.wrap_with_zero = self.cfg.get("wrap_with_zero", False)
         if hasattr(self._cfg, "tokenizer") or (
             hasattr(self._cfg, "encoder_tokenizer") and hasattr(self._cfg, "decoder_tokenizer")
         ):
@@ -241,6 +246,7 @@ class MegatronBaseModel(NLPModel):
             merges_file=self.register_artifact("tokenizer.merge_file", self._cfg.tokenizer.merge_file),
             delimiter=self.cfg.tokenizer.get('delimiter', None),
             legacy=legacy,
+            use_fast=self.cfg.tokenizer.get('use_fast', False)
         )
 
     def on_train_start(self) -> None:
@@ -286,7 +292,8 @@ class MegatronBaseModel(NLPModel):
            We use gradient clipping implementation from megatron-lm.
         """
         clip_val = self.trainer.gradient_clip_val
-        if clip_val is None:
+        if clip_val is None or self.wrap_with_zero:
+            # Zero1 optimizer handles gradient clipping for us across TP groups
             return
 
         clip_val = float(clip_val)
@@ -412,47 +419,16 @@ class MegatronBaseModel(NLPModel):
                 # Assume FP32 params, so no need to store main params
                 optim_kwargs['store_params'] = False
 
-        return super().setup_optimization(optim_config=optim_config, optim_kwargs=optim_kwargs)
+        return super().setup_optimization(optim_config=optim_config, optim_kwargs=optim_kwargs,
+                                          wrap_with_zero=self.wrap_with_zero)
 
     def configure_optimizers(self):
         self.setup_optimization()
 
         # Wrap the baseline optimizer with the optimizer class with master parameters
         if self.megatron_amp_o2 and not self.with_distributed_adam and self._optimizer is not None:
-            if self.cfg.precision == 'bf16':
-                fp32_grad_accum = True
-                contiguous_grad_bucket = True
-            elif self.cfg.precision == 16:
-                fp32_grad_accum = False
-                # TODO: contiguous grad bucket for fp16 is also planned to be supported
-                contiguous_grad_bucket = False
-                raise ValueError(
-                    "fp16 training is not yet supported with O2. Please set megatron_amp_O2 to False in the model config."
-                )
-
-            # if using tensor parallel only, we automatically use async grad all-reduce
-            # if using pipeline parallel or sequence parallel or gradient accumulation fusion, then we disable it
-            if self.cfg.get('pipeline_model_parallel_size', 1) == 1 and not (
-                self.cfg.get('sequence_parallel', False) or self.cfg.get('gradient_accumulation_fusion', False)
-            ):
-                async_grad_allreduce = True
-            else:
-                async_grad_allreduce = False
-
-            if async_grad_allreduce:
-                # we need this to be configurable until make_nccl_premul_sum is in public PyTorch.
-                # currently cannot be imported in PyTorch 1.12.0
-                grad_div_ar_fusion = self.cfg.get('grad_div_ar_fusion', False)
-            else:
-                grad_div_ar_fusion = False
-
-            self._optimizer = MainParamsOptimizerWrapper(
+            self._optimizer = MainParamsOptimizerWrapperXLA(
                 self._optimizer,
-                fp32_grad_accum=fp32_grad_accum,
-                contiguous_grad_bucket=contiguous_grad_bucket,
-                async_grad_allreduce=async_grad_allreduce,
-                grad_div_ar_fusion=grad_div_ar_fusion,
-                grad_allreduce_chunk_size_mb=self.cfg.get('grad_allreduce_chunk_size_mb', 125),
             )
 
             assert self._trainer.max_steps is not None, "'max_steps' is missing in trainer config."

@@ -1,5 +1,8 @@
 import torch
-from torch._six import string_classes
+if torch.__version__.startswith('2'):
+    string_classes = str
+else:
+    from torch._six import string_classes
 import functools
 import numpy as np
 import sys

@@ -1,4 +1,4 @@
-name: megatron_gpt
+name: megatron_llama
 restore_from_path: null # used when starting from a .nemo file
 
 trainer:
@@ -24,7 +24,7 @@ exp_manager:
   create_tensorboard_logger: True
   explicit_log_dir: null
   exp_dir: null
-  name: megatron_gpt
+  name: megatron_llama
   create_wandb_logger: False
   wandb_logger_kwargs:
     project: null
@@ -39,7 +39,7 @@ exp_manager:
     save_last: True
     always_save_nemo: False # saves nemo file during validation, not implemented for model parallel
     save_nemo_on_train_end: False # not recommended when training large models on clusters with short time limits
-    filename: 'megatron_gpt--{step}-{consumed_samples}'
+    filename: 'megatron_llama--{step}-{consumed_samples}'
     model_parallel_size: ${multiply:${model.tensor_model_parallel_size}, ${model.pipeline_model_parallel_size}}
 
 
@@ -57,31 +57,38 @@ model:
   max_position_embeddings: ${.encoder_seq_length}
   num_layers: 12
   hidden_size: 768
-  ffn_hidden_size: 3072 # Transformer FFN hidden size. Usually 4 * hidden_size.
+  ffn_hidden_size: 3072 # Transformer FFN hidden size. For Llama it's 8/3*hidden_size
   num_attention_heads: 12
   init_method_std: 0.02 # Standard deviation of the zero mean normal distribution used for weight initialization.')
   use_scaled_init_method: True # use scaled residuals initialization
-  hidden_dropout: 0.1 # Dropout probability for hidden state transformer.
-  attention_dropout: 0.1 # Dropout probability in the attention layer.
-  ffn_dropout: 0.1 # Dropout probability in the feed-forward layer.
+  hidden_dropout: 0 # Dropout probability for hidden state transformer.
+  attention_dropout: 0 # Dropout probability in the attention layer.
+  ffn_dropout: 0 # Dropout probability in the feed-forward layer.
   kv_channels: null # Projection weights dimension in multi-head attention. Set to hidden_size // num_attention_heads if null
   apply_query_key_layer_scaling: True # scale Q * K^T by 1 / layer-number.
-  normalization: layernorm # Type of normalization layers
+  normalization: 'rmsnorm' # Type of normalization layers ['rmsnorm', 'layernorm']
   layernorm_epsilon: 1e-5
   do_layer_norm_weight_decay: False # True means weight decay on all params
-  make_vocab_size_divisible_by: 128 # Pad the vocab size to be divisible by this value for computation efficiency.
+  make_vocab_size_divisible_by: 8 # Pad the vocab size to be divisible by this value for computation efficiency.
   pre_process: True # add embedding
   post_process: True # add pooler
   persist_layer_norm: True # Use of persistent fused layer norm kernel.
+  share_embeddings_and_output_weights: False # Untie embedding and output layer weights.
+  position_embedding_type: 'rope' # Position embedding type. Options ['learned_absolute', 'rope]
+  rotary_percentage: 1 # If using position_embedding_type=rope, then the per head dim is multiplied by this.
+  activation: 'swiglu' # ['swiglu', 'gelu']
+  transformer_block_type: 'pre_ln' # ['pre_ln', 'post_ln', 'normformer', 'gpt_j'] https://github.com/EleutherAI/gpt-neox/blob/303d7be582ae1c969347c25c54f568cc122445fc/megatron/model/transformer.py#L804-L847
+  has_bias: False
 
   tokenizer:
-    library: 'megatron'
-    type: 'GPT2BPETokenizer'
+    library: 'huggingface'
+    type: '/root/scripts/data/llama7b-hf'
     model: null
     vocab_file: null
     merge_file: null 
     delimiter: null # only used for tabular tokenizer
     sentencepiece_legacy: False # Legacy=True allows you to add special tokens to sentencepiece tokenizers.
+    use_fast: False
 
   # Mixed precision
   native_amp_init_scale: 4294967296 # 2 ** 32
@@ -110,22 +117,20 @@ model:
   apex_transformer_log_level: 30 # Python logging level displays logs with severity greater than or equal to this
   gradient_as_bucket_view: True # PyTorch DDP argument. Allocate gradients in a contiguous bucket to save memory (less fragmentation and buffer memory)
   sync_batch_comm: False # Enable stream synchronization after each p2p communication between pipeline stages
-  log_parameter_norm: False # Logs parameter norm across model parallel ranks
-  log_gradient_norm: False # Logs gradient norm across model parallel ranks
-  save_logits: False # Saves logits in numpy array of dimensions batch x sequence_length x vocab_size
-  save_logits_interval: 0 # Step interval at which to save logits to disk - Note should be Zero Indexed
+  log_parameter_norm: True # Logs parameter norm across model parallel ranks
+  log_gradient_norm: True # Logs gradient norm across model parallel ranks
 
   ## Activation Checkpointing
   # NeMo Megatron supports 'selective' activation checkpointing where only the memory intensive part of attention is checkpointed.
   # These memory intensive activations are also less compute intensive which makes activation checkpointing more efficient for LLMs (20B+).
   # See Reducing Activation Recomputation in Large Transformer Models: https://arxiv.org/abs/2205.05198 for more details.
   # 'full' will checkpoint the entire transformer layer.
-  activations_checkpoint_granularity: null # 'selective' or 'full' 
-  activations_checkpoint_method: null # 'uniform', 'block'
+  activations_checkpoint_granularity: selective # 'selective' or 'full' 
+  activations_checkpoint_method: uniform # 'uniform', 'block'
   # 'uniform' divides the total number of transformer layers and checkpoints the input activation
   # of each chunk at the specified granularity. When used with 'selective', 'uniform' checkpoints all attention blocks in the model.
   # 'block' checkpoints the specified number of layers per pipeline stage at the specified granularity
-  activations_checkpoint_num_layers: null
+  activations_checkpoint_num_layers: 1
   # when using 'uniform' this creates groups of transformer layers to checkpoint. Usually set to 1. Increase to save more memory.
   # when using 'block' this this will checkpoint the first activations_checkpoint_num_layers per pipeline stage.
   num_micro_batches_with_partial_activation_checkpoints: null
@@ -146,7 +151,7 @@ model:
   ## Sequence Parallelism
   # Makes tensor parallelism more memory efficient for LLMs (20B+) by parallelizing layer norms and dropout sequentially
   # See Reducing Activation Recomputation in Large Transformer Models: https://arxiv.org/abs/2205.05198 for more details.
-  sequence_parallel: False
+  sequence_parallel: True
 
   ## Zero Redundancy Optimizer
   # Wraps your chosen optimizer with a Zero Redundancy Optimizer

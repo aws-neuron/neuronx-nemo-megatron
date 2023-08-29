@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
 set -o pipefail
+set -e
 
-sudo sysctl -w net.ipv4.ip_local_reserved_ports=48620
+ulimit -n 65535
+
+sudo sysctl -w net.ipv4.ip_local_reserved_ports=41000
 
 export FI_EFA_USE_DEVICE_RDMA=1
 export FI_PROVIDER=efa
 export FI_EFA_FORK_SAFE=1
-export TPU_PORT=51101
 
-if [ -z "${SLURM_NNODES}" ]
+
+DATE=$(date +%F_%H-%M-%S)
+
+if [ -v SLURM_NNODES ]
 then
-    # Single-node, non-SLURM runs
-    HOSTS=(localhost)
-    NODEID=0
-    NTASKS=1
-else
-    # SLURM runs, single or multi-node
+    # SLURM runs
     IPS=""
     for h in $(scontrol show hostname); do
         IPS="$IPS $(nslookup $h  | awk '/^Address: / { print $2 }')";
@@ -23,64 +23,62 @@ else
     HOSTS=(${IPS//\ / })
     NODEID=$SLURM_NODEID
     NTASKS=$SLURM_NTASKS
+    export NEMO_EXPM_VERSION=$SLURM_JOB_ID
+    export EXPLICIT_LOGDIR=null
+    LOG_PATH=logs/$SLURM_JOB_ID.$DATE/$NODEID/
+elif [ -v OMPI_COMM_WORLD_RANK ]
+then
+    # MPI runs on EKS
+    export CCOM_SOCKET_IFNAME=eth0
+    NODELIST=`/nodelist_helper.py`
+    HOSTS=(${NODELIST//\ / })
+    NODEID=$OMPI_COMM_WORLD_RANK
+    NTASKS=$OMPI_COMM_WORLD_SIZE
+    export EXPLICIT_LOGDIR=/shared/nemo_experiments/$POD_UID.$DATE
+    LOG_PATH=$EXPLICIT_LOGDIR/$NODEID/
+else
+    # Single-node, non-SLURM, non-MPI runs
+    HOSTS=(localhost)
+    NODEID=0
+    NTASKS=1
+    export NEMO_EXPM_VERSION=$(date "+%Y-%m-%d_%H-%M-%S")
+    export EXPLICIT_LOGDIR=null
+    LOG_PATH=./nemo_experiments/logs.$DATE
 fi
 
+mkdir -p $LOG_PATH
+
+export HYDRA_FULL_ERROR=1
 export PROCESSES_PER_NODE=32
-export XRT_LOCAL_WORKER="c_localservice:$NODEID"
-export XRT_SHARD_ORDINAL=$NODEID
-export XRT_MESH_SERVICE_ADDRESS=${HOSTS[0]}:8477
-export TPU_MESH_CONTROLLER_ADDRESS=${HOSTS[0]}:8476
-export TPU_MESH_CONTROLLER_PORT=8476
-export NEURON_RT_ROOT_COMM_ID=${HOSTS[0]}:48620
-export TF_GRPC_DEFAULT_OPTIONS="grpc.keepalive_time_ms=60000,grpc.keepalive_timeout_ms=14400000,grpc.http2.max_pings_without_data=0,grpc.http2.min_ping_interval_without_data_ms=300000"
-export XRT_SHARD_WORLD_SIZE=$NTASKS
-export WORLD_SIZE=$((NTASKS*PROCESSES_PER_NODE))
 export MASTER_ADDR=${HOSTS[0]}
 export MASTER_PORT=41000
-export ALLOW_MULTIPLE_LIBTPU_LOAD=1
-export NEURON_USE_LOAD_COLLECTIVES=1
-export NEURON_GLOBAL_DEVICE_COUNT=$WORLD_SIZE
-export NEURON_RT_NUM_CORES=$PROCESSES_PER_NODE
-export NEURON_NUM_DEVICES=$NEURON_RT_NUM_CORES
-export CLOUD_TPU_TASK_ID=$NODEID
-export RANK=$((NODEID*PROCESSES_PER_NODE))
-export NEURON_GLOBAL_DEVICE_ID=$RANK
 
-export NEURON_FUSE_SOFTMAX=1
-export NEURON_RT_STOCHASTIC_ROUNDING_EN=0
+export NEURON_RT_EXEC_TIMEOUT=10
+DISTRIBUTED_ARGS="--nproc_per_node $PROCESSES_PER_NODE --nnodes $NTASKS --node_rank $NODEID --master_addr $MASTER_ADDR --master_port $MASTER_PORT"
+echo $DISTRIBUTED_ARGS
+
+export NEURON_RT_ASYNC_EXEC_MAX_INFLIGHT_REQUESTS=3
 export NEURON_TRANSFER_WITH_STATIC_RING_OPS=""
-export ALLOC_ARENA_MAX=128
-
-#### Need to set all the server related env variables before server launch
-export TPU_CHIPS_PER_HOST_BOUNDS=$NEURON_RT_NUM_CORES,$NEURON_RT_NUM_CORES
-
-export XLA_USE_BF16=1
-export NEURON_CC_FLAGS="--model-type=transformer --enable-internal-seeded-rng-dropout --tensorizer-options='--no-keep-remat-dma-transpose' --cache_dir=$HOME/neuron_cache/$NODEID"
+export MALLOC_ARENA_MAX=128
 export TF_NUM_INTEROP_THREADS=8192
 
-echo "Starting XRT server"
-if [ "$NODEID" = 0 ]; then
-    idx=0
-    for ip in ${HOSTS[@]}; do
-        tpu_configs+=("c_localservice;$((idx++));$ip:$TPU_PORT")
-    done
-    export XRT_TPU_CONFIG=$(IFS="|"; echo "${tpu_configs[*]}")
-    export TPU_NUM_DEVICES=$PROCESSES_PER_NODE
-fi
+export NEURON_RT_STOCHASTIC_ROUNDING_EN=1
+export XLA_USE_BF16=1
+export NEURON_CC_FLAGS="--model-type transformer --distribution-strategy=nemo"
+export NEURON_COMPILE_CACHE_URL="$HOME/neuron_cache" # Place cache on shared storage to reduce redundant compilations
 
-echo "NTASKS: $NTASKS"
-if [ $NTASKS = 1 ]; then
-    export XRT_TPU_CONFIG="localservice;0;localhost:$TPU_PORT"
-    export XRT_LOCAL_WORKER="localservice:$NODEID"
-    export TPU_NUM_DEVICES=$PROCESSES_PER_NODE
-fi
-
-export XRT_START_LOCAL_SERVER=0
 
 export TRAIN_ITERS=300000
 export GBS=$((NTASKS*32))
-if [ "$NEURON_EXTRACT_GRAPHS_ONLY" = "1" ]; then
-    export TRAIN_ITERS=3
+CREATE_TB_LOGGER=True
+CHECKPOINT_CALLBACK=True
+
+if [ "$COMPILE" = "1" ]; then
+    echo "compiling only run"
+    MAYBE_COMPILE="neuron_parallel_compile"
+    TRAIN_ITERS=4
+    CREATE_TB_LOGGER=False
+    CHECKPOINT_CALLBACK=False
 fi
 
 : ${SEQ_LENGTH:=2048}
@@ -90,18 +88,20 @@ fi
 : ${N_LAYERS:=32}
 : ${N_AH:=32}
 : ${UBS:=1}
-export FFN_HS=$(($HS*4))
+: ${ACT_CHKPNT_GRANULARITY:=full}
+FFN_HS=$(($HS*4))
 echo "SEQ_LEN=$SEQ_LENGTH, HS=$HS, FFN_HS=$FFN_HS TP=$TP PP=$PP N_LAYERS=$N_LAYERS N_AH=$N_AH GBS=$GBS UBS=$UBS"
 
-python3 megatron_gpt_pretraining.py  \
+
+$MAYBE_COMPILE torchrun $DISTRIBUTED_ARGS megatron_gpt_pretraining.py  \
     --config-path=conf \
     --config-name=megatron_gpt_config \
-    trainer.devices=$NEURON_NUM_DEVICES \
+    trainer.devices=$PROCESSES_PER_NODE \
     trainer.num_nodes=$NTASKS \
     trainer.max_epochs=null \
     trainer.max_steps=$TRAIN_ITERS\
     trainer.val_check_interval=$TRAIN_ITERS \
-    trainer.log_every_n_steps=10 \
+    trainer.log_every_n_steps=1 \
     trainer.limit_val_batches=1 \
     trainer.limit_test_batches=1 \
     trainer.accumulate_grad_batches=1 \
@@ -122,9 +122,8 @@ python3 megatron_gpt_pretraining.py  \
     model.tokenizer.vocab_file=$HOME/examples_datasets/gpt2/gpt2-vocab.json \
     model.tokenizer.merge_file=$HOME/examples_datasets/gpt2/gpt2-merges.txt \
     model.data.data_prefix=[1.0,$HOME/examples_datasets/gpt2/my-gpt2_text_document] \
-    model.data.num_workers=2 \
+    model.data.num_workers=1 \
     model.data.seq_length=$SEQ_LENGTH \
-    model.data.splits_string=\'980,10,10\' \
     model.optim.name=adamw \
     model.optim.capturable=True \
     model.optim.lr=0.00015 \
@@ -135,14 +134,18 @@ python3 megatron_gpt_pretraining.py  \
     model.optim.sched.constant_steps=80000 \
     model.optim.sched.min_lr=1.0e-5 \
     model.sequence_parallel=True  \
-    model.activations_checkpoint_granularity=full \
+    model.activations_checkpoint_granularity=$ACT_CHKPNT_GRANULARITY \
     model.activations_checkpoint_method=uniform \
     model.activations_checkpoint_num_layers=1 \
-    +model.save_xser=True \
+    +model.save_xser=False \
+    exp_manager.create_tensorboard_logger=$CREATE_TB_LOGGER \
     exp_manager.resume_if_exists=False \
     exp_manager.resume_ignore_no_checkpoint=False \
-    exp_manager.create_checkpoint_callback=True \
+    exp_manager.create_checkpoint_callback=False \
+    exp_manager.explicit_log_dir=$EXPLICIT_LOGDIR \
     +exp_manager.checkpoint_callback_params.train_time_interval=3600 \
-    model.use_cpu_initialization=True   2>&1  | tee  $(hostname).log  &
+    model.use_cpu_initialization=True   2>&1  | tee  $LOG_PATH/log
 
-python3 -m torch_neuronx.distributed._xrt_run_server --port $TPU_PORT --pid_to_track $!
+# Note: to resume training using a checkpoint, please add the following configuration above, adjusting for your checkpoint path
+#    +model.load_xser=True \
+#    model.resume_from_checkpoint='/efs/checkpoint/megatron_gpt--step\=1085-consumed_samples\=69632.0-last.ckpt' \

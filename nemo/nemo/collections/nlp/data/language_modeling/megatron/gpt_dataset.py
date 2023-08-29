@@ -16,6 +16,7 @@
 
 import os
 import time
+from typing import Optional
 
 import numpy as np
 import torch
@@ -65,6 +66,7 @@ try:
 except:
     print("Unable to override")
 
+USING_TORCH_VERSION2 = torch.__version__.startswith('2')
 
 def build_dataset(cfg, trainer, data_prefix, data_impl, num_samples, seq_length, seed, skip_warmup, tokenizer, name):
     def _build_dataset(current_data_prefix, current_num_samples):
@@ -347,6 +349,10 @@ class GPTDataset(Dataset):
                     os.makedirs(self.index_mapping_dir)
             torch.distributed.barrier()
 
+        gloo_group = None
+        if USING_TORCH_VERSION2:
+            gloo_group = trainer.strategy.gloo_group
+
         # Build index mappings.
         self.doc_idx, self.sample_idx, self.shuffle_idx = _build_index_mappings(
             self.name,
@@ -359,6 +365,7 @@ class GPTDataset(Dataset):
             index_mapping_dir=self.index_mapping_dir,
             drop_last=drop_last,
             add_extra_token=self.add_extra_token,
+            gloo_group=gloo_group
         )
         deallocate_indexed_dataset_memory(self.indexed_dataset)
 
@@ -451,8 +458,6 @@ def _create_ltor_masks_and_position_ids(
     """
     assert tokens.ndim == 1
     seq_length = tokens.numel()
-    # `attention_mask` has the shape of [1, seq_length, seq_length]
-    attention_mask = torch.tril(torch.ones((seq_length, seq_length))).unsqueeze(0)
     loss_mask = torch.ones(seq_length, dtype=torch.float)
     if eod_mask_loss:
         loss_mask[tokens == eod_token] = 0.0
@@ -461,26 +466,36 @@ def _create_ltor_masks_and_position_ids(
     if reset_position_ids:
         position_ids = position_ids.clone()
 
-    if reset_position_ids or reset_attention_mask:
+    if reset_position_ids:
         # Find indices where EOD token is.
-        eod_index = position_ids[tokens[b] == eod_token]
+        eod_index = position_ids[tokens == eod_token]
         # Detach indices from positions if going to modify positions.
         if reset_position_ids:
             eod_index = eod_index.clone()
         prev_index = 0
         for j in range(eod_index.numel()):
             i = eod_index[j]
-            if reset_attention_mask:
-                attention_mask[0, (i + 1) :, : (i + 1)] = 0
             if reset_position_ids:
                 position_ids[(i + 1) :] -= i + 1 - prev_index
                 prev_index = i + 1
-    # Convert attention mask to binary.
-    attention_mask = attention_mask < 0.5
     if is_torch_tpu_available():
+        assert (not reset_attention_mask),"Neuron flow does not support attention mask reset"
         attention_mask = torch.tensor([True])
-        # Needs to be a dummy tensor since a whole bunch of bach things are done under the hood. 
+        # Needs to be a dummy tensor since a whole bunch of batch things are done under the hood. 
         # Size does not matter, it will be replaced by device tensor
+    else:
+        # `attention_mask` has the shape of [1, seq_length, seq_length]
+        attention_mask = torch.tril(torch.ones((seq_length, seq_length))).unsqueeze(0)
+        if reset_attention_mask:
+            # Find indices where EOD token is.
+            eod_index = position_ids[tokens == eod_token]
+            prev_index = 0
+            for j in range(eod_index.numel()):
+                i = eod_index[j]
+                if reset_attention_mask:
+                    attention_mask[0, (i + 1) :, : (i + 1)] = 0
+        # Convert attention mask to binary.
+        attention_mask = attention_mask < 0.5
     return attention_mask, loss_mask, position_ids
 
 
@@ -495,6 +510,7 @@ def _build_index_mappings(
     index_mapping_dir: str = None,
     drop_last: bool = True,
     add_extra_token: int = 1,
+    gloo_group: Optional[torch.distributed.ProcessGroup] = None
 ):
     """Build doc-idx, sample-idx, and shuffle-idx.
     doc-idx: is an array (ordered) of documents to be used in training.
@@ -621,7 +637,10 @@ def _build_index_mappings(
 
     # torch.distributed.barrier()
     import torch_xla.core.xla_model as xm
-    xm.rendezvous('shuffle_idx_mapping')
+    if USING_TORCH_VERSION2:
+        torch.distributed.monitored_barrier(group=gloo_group)
+    else:
+        xm.rendezvous('shuffle_idx_mapping')
     #counts = torch.cuda.LongTensor([1])
     #torch.distributed.all_reduce(counts, group=parallel_state.get_data_parallel_group())
     #torch.distributed.all_reduce(counts, group=parallel_state.get_pipeline_model_parallel_group())

@@ -515,3 +515,199 @@ class MainParamsOptimizerWrapper(torch.optim.Optimizer):
         self.optimizer.defaults = value
 
     defaults = property(_get_defaults, _set_defaults)
+
+
+class MainParamsOptimizerWrapperXLA(torch.optim.Optimizer):
+    """
+    Float16 optimizer wrapper for half precision (fp16 and bf16) data types.
+    This optimizer wrapper holds main parameters and gradients in fp32 to support
+    stable convergence.
+
+    Arguments:
+        optimizer: base optimizer such as Adam or SGD.
+        fp32_grad_accum: to enable the use of fp32 in gradient accumulation and allreduce.
+        contiguous_grad_bucket: to enable allocating the master gradients in the 
+            contiguous memory space to reduce memory fragmentation.
+        async_grad_allreduce: enable asynchronous gradient allreduce that is executed
+            along with the training step backprop.
+    """
+
+    def __init__(
+        self,
+        optimizer,
+    ):
+        self.optimizer = optimizer
+        assert self.optimizer, 'no optimizer is provided.'
+
+        self.float32_groups = []  # original float32 parameters
+        self.fp64_from_float32_groups = []  # fp64 copy of float32 parameters
+
+        # For all the groups in the original optimizer:
+        for i, param_group in enumerate(self.optimizer.param_groups):
+            float32_params_this_group = []
+            fp64_from_float32_params_this_group = []
+            # For all the parameters in this group:
+            for j, param in enumerate(param_group['params']):
+                if param.requires_grad:
+                    float32_params_this_group.append(param)
+
+                    # Allocate the main parameter
+                    main_param = param.detach().clone().double()
+
+                    # Copy tensor model parallel attributes.
+                    copy_tensor_model_parallel_attributes(main_param, param)
+                    if hasattr(param, 'shared'):
+                        main_param.shared = param.shared
+
+                    # Replace the optimizer params with the new fp64 copy.
+                    param_group['params'][j] = main_param
+                    fp64_from_float32_params_this_group.append(main_param)
+                    # Reset existing state dict key to the new main param.
+                    if param in self.optimizer.state:
+                        self.optimizer.state[main_param] = self.optimizer.state.pop(param)
+
+            self.float32_groups.append(float32_params_this_group)
+            self.fp64_from_float32_groups.append(fp64_from_float32_params_this_group)
+
+        # Leverage state_dict() and load_state_dict() to
+        # recast preexisting per-param state tensors
+        self.optimizer.load_state_dict(self.optimizer.state_dict())
+
+
+    def zero_grad(self, set_to_none=True):
+        """We only need to zero the model related parameters, i.e.,
+        float32_groups."""
+        for group in self.float32_groups:
+            _zero_grad_group_helper(group, set_to_none)
+
+    def _copy_model_grads_to_main_grads(self):
+        # This only needs to be done for the float16 group.
+        for model_group, main_group in zip(self.float32_groups, self.fp64_from_float32_groups):
+            for model_param, main_param in zip(model_group, main_group):
+                if model_param.grad is not None:
+                    main_param.grad = model_param.grad.double()
+
+    def _get_model_and_main_params_data_float64(self):
+        model_data = []
+        main_data = []
+        for model_group, main_group in zip(self.float32_groups, self.fp64_from_float32_groups):
+            for model_param, main_param in zip(model_group, main_group):
+                model_data.append(model_param.data)
+                main_data.append(main_param.data)
+        return model_data, main_data
+
+    def _copy_main_params_to_model_params(self):
+        model_data, main_data = self._get_model_and_main_params_data_float64()
+        for this_, that_ in zip(main_data, model_data):
+            that_.copy_(this_.to(float))
+
+    def _copy_model_params_to_main_params(self):
+        model_data, main_data = self._get_model_and_main_params_data_float64()
+        for this_, that_ in zip(model_data, main_data):
+            that_.copy_(this_.double())
+
+    def reload_model_params(self):
+        self._copy_model_params_to_main_params()
+
+#    @torch.no_grad()
+#    def step(self, **kwargs):
+#        # Copy gradients from model params to main params.
+#        with torch.no_grad():
+#            self._copy_model_grads_to_main_grads()
+#        # Step the optimizer.
+#        self.optimizer.step()
+#
+#        # Update params from main params.
+#        with torch.no_grad():
+#            self._copy_main_params_to_model_params()
+#
+#        # Successful update.
+#        return True
+
+    def step(self, closure):
+        closure_result = closure()
+ 
+        # Copy gradients from model params to main params.
+        with torch.no_grad():
+            self._copy_model_grads_to_main_grads()
+        # Step the optimizer.
+        self.optimizer.step()
+ 
+        # Update params from main params.
+        with torch.no_grad():
+            self._copy_main_params_to_model_params()
+ 
+        # Successful update.
+        return closure_result
+
+  
+
+    def state_dict(self):
+        state_dict = {}
+        state_dict['optimizer'] = self.optimizer.state_dict()
+        state_dict['fp64_from_fp32_params'] = self.fp64_from_float32_groups
+        return state_dict
+
+    def load_state_dict(self, state_dict):
+        # Optimizer.
+        optimizer_key = 'optimizer'
+        if optimizer_key not in state_dict:
+            optimizer_key = 'optimizer_state_dict'
+            logging.info('***WARNING*** loading optimizer from ' 'an old checkpoint ...')
+        self.optimizer.load_state_dict(state_dict[optimizer_key])
+
+        # Copy data for the main params.
+        fp64_from_float32_params_key = 'fp64_from_fp32_params'
+        if fp64_from_float32_params_key not in state_dict:
+            fp64_from_float32_params_key = 'fp64_from_fp32'
+        for current_group, saved_group in zip(self.fp64_from_float32_groups, state_dict[fp64_from_float32_params_key]):
+            for current_param, saved_param in zip(current_group, saved_group):
+                current_param.data.copy_(saved_param.data)
+
+    def get_parameters(self):
+        params = []
+        #for param_group in self.optimizer.param_groups:
+        for param_group in self.float32_groups:
+            for param in param_group:
+                params.append(param)
+        return params
+
+    # Promote state so it can be retrieved or set via
+    # "optimizer_instance.state"
+    def _get_state(self):
+        if hasattr(self, 'optimizer'):
+            return self.optimizer.state
+        else:
+            return []
+
+    def _set_state(self, value):
+        self.optimizer.state = value
+
+    state = property(_get_state, _set_state)
+
+    # Promote param_groups so it can be retrieved or set via
+    # "optimizer_instance.param_groups"
+    # (for example, to adjust the learning rate)
+    def _get_param_groups(self):
+        if hasattr(self, 'optimizer'):
+            return self.optimizer.param_groups
+        else:
+            return []
+
+    def _set_param_groups(self, value):
+        self.optimizer.param_groups = value
+
+    param_groups = property(_get_param_groups, _set_param_groups)
+
+    # Promote defaults so it can be retrieved or set via
+    # "optimizer_instance.defaults
+    def _get_defaults(self):
+        if hasattr(self, 'optimizer'):
+            return self.optimizer.defaults
+        else:
+            return []
+
+    def _set_defaults(self, value):
+        self.optimizer.defaults = value
+
+    defaults = property(_get_defaults, _set_defaults)

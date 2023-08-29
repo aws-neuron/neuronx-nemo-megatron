@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import lightning_neuron_patch
+import os
 
 from lightning_lite.plugins.environments import TorchElasticEnvironment
 from omegaconf.omegaconf import OmegaConf, open_dict
@@ -61,11 +62,16 @@ def main(cfg) -> None:
     plugins = []
     
     nlp_xla_checkpoint_io = NLPCheckpointIO()
+    cluster_environment = None
+    if os.environ.get("TORCHELASTIC_RUN_ID") is not None:
+        cluster_environment=TorchElasticEnvironment()
     strategy = NLPDDPStrategy(
         no_ddp_communication_hook=True,  # we don't use DDP for async grad allreduce
         gradient_as_bucket_view=cfg.model.gradient_as_bucket_view,
         find_unused_parameters=False,
-        checkpoint_io=nlp_xla_checkpoint_io
+        cluster_environment=cluster_environment,
+        checkpoint_io=nlp_xla_checkpoint_io,
+        megatron_amp_o2=megatron_amp_o2
     )
     if cfg.trainer.precision in [16, 'bf16']:
         scaler = None
@@ -83,19 +89,18 @@ def main(cfg) -> None:
     if cfg.get('cluster_type', None) == 'BCP':
         plugins.append(TorchElasticEnvironment())
 
-    trainer = NLPTrainer(plugins=plugins, strategy=strategy, num_sanity_val_steps=0, **cfg.trainer)
-
-    exp_manager(trainer, cfg.exp_manager)
-
     # update resume from checkpoint found by exp_manager
     if cfg.model.resume_from_checkpoint is not None:
         resume_from_checkpoint = cfg.model.resume_from_checkpoint
+        trainer = NLPTrainer(plugins=plugins, strategy=strategy, num_sanity_val_steps=0, resume_from_checkpoint=resume_from_checkpoint, **cfg.trainer)
     else:
-        resume_from_checkpoint = trainer._checkpoint_connector.resume_from_checkpoint_fit_path
+        trainer = NLPTrainer(plugins=plugins, strategy=strategy, num_sanity_val_steps=0, **cfg.trainer)
 
-    logging.info(f'Resuming training from checkpoint: {resume_from_checkpoint}')
 
-    trainer._checkpoint_connector = CheckpointConnector(trainer, resume_from_checkpoint=resume_from_checkpoint)
+    exp_manager(trainer, cfg.exp_manager)
+    
+    # We use NLPCheckpointConnector which correctly loads global_step, epoch
+    #trainer._checkpoint_connector = CheckpointConnector(trainer, resume_from_checkpoint=resume_from_checkpoint)
     # Override timer callback to a stateless one
     for idx, callback in enumerate(trainer.callbacks):
         if isinstance(callback, Timer):

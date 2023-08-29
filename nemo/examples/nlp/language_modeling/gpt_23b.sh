@@ -6,6 +6,7 @@ export TP=8
 export PP=4
 export N_LAYERS=28
 export N_AH=64
+export ACT_CHKPNT_GRANULARITY=selective
 
 ./test.sh
 
