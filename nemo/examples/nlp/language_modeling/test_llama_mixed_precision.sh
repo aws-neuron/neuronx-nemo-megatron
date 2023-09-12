@@ -45,17 +45,17 @@ echo $DISTRIBUTED_ARGS
 export NEURON_FUSE_SOFTMAX=1
 export NEURON_RT_STOCHASTIC_ROUNDING_EN=1
 export NEURON_RT_ENABLE_VERBOSE_NUMERICAL_ERRORS=0
-export NEURON_RT_ASYNC_EXEC_MAX_INFLIGHT_REQUESTS=3
+export NEURON_RT_ASYNC_EXEC_MAX_INFLIGHT_REQUESTS=0
 export NEURON_TRANSFER_WITH_STATIC_RING_OPS=""
 export MALLOC_ARENA_MAX=128
 
 export XLA_USE_BF16=0
 export XLA_DOWNCAST_BF16=1
 
-export NEURON_CC_FLAGS="--model-type transformer --distribution-strategy=nemo --cache_dir=$HOME/neuron_cache/llama/`hostname`"
+export NEURON_CC_FLAGS="--model-type transformer --distribution-strategy=nemo --enable-mixed-precision-accumulation --cache_dir=$HOME/neuron_cache/llama/`hostname`"
 export TF_NUM_INTEROP_THREADS=8192
 
-export TRAIN_ITERS=10000
+export TRAIN_ITERS=400000
 CREATE_TB_LOGGER=True
 if [ "$COMPILE" = "1" ]; then
     echo "compiling only run"
@@ -107,19 +107,19 @@ $MAYBE_COMPILE torchrun $DISTRIBUTED_ARGS megatron_gpt_pretraining.py  \
     model.layernorm_epsilon=1e-6 \
     model.apply_query_key_layer_scaling=False \
     model.data.data_prefix=[1.0,/root/scripts/data/books/book.jsonl-processed_text_document] \
-    model.data.num_workers=2 \
+    model.data.num_workers=1 \
     model.data.seq_length=$SEQ_LENGTH \
     model.optim.name=adamw \
-    model.optim.lr=3.0e-5 \
+    model.optim.lr=3.0e-4 \
     model.optim.betas=[0.9,0.95] \
     model.optim.weight_decay=0.1 \
     model.optim.sched.name=CosineAnnealing \
-    model.optim.sched.warmup_steps=0 \
+    model.optim.sched.warmup_steps=2000 \
     model.optim.sched.constant_steps=0 \
-    model.optim.sched.min_lr=0 \
+    model.optim.sched.min_lr=3.0e-5 \
     model.optim.capturable=True \
     model.sequence_parallel=True  \
-    model.activations_checkpoint_granularity=selective \
+    model.activations_checkpoint_granularity=full \
     model.activations_checkpoint_method=uniform \
     model.activations_checkpoint_num_layers=1 \
     +model.save_xser=False \

@@ -56,7 +56,7 @@ from pytorch_lightning.utilities.model_helpers import is_overridden
 from pytorch_lightning.utilities.auto_restart import _add_capture_metadata_collate
 from pytorch_lightning.utilities.imports import _fault_tolerant_training
 from pytorch_lightning.utilities.argparse import _defaults_from_env_vars
-from pytorch_lightning.utilities.rank_zero import rank_zero_warn
+from pytorch_lightning.utilities.rank_zero import rank_zero_warn 
 from pytorch_lightning.loops.utilities import _block_parallel_sync_behavior
 from pytorch_lightning.trainer.connectors.accelerator_connector import AcceleratorConnector, _LITERAL_WARN
 from pytorch_lightning.trainer.connectors.checkpoint_connector import CheckpointConnector
@@ -1147,10 +1147,30 @@ class NLPDDPStrategy(TPUSpawnStrategy):
         torch.cuda.empty_cache()
         checkpoint_path = inject_model_parallel_rank(checkpoint_path)
         import torch_xla.utils.serialization as xser
+        import torch_xla.core.xla_model as xm
        
+        def device_load_xser(path):
+            ref_data = torch.load(path)
+
+            def convert_fn(tensors):
+                rewritten_tensors = []
+                for t in tensors:
+                    rewritten_tensors.append(
+                    torch.load(os.path.join(path + '.tensors', 'tensor_{}.pt'.format(t.tid)))
+                    .to(device=xm.xla_device()))
+                return rewritten_tensors
+
+            def select_fn(v):
+                return type(v) == xser.TensorReference
+
+            return xm.ToXlaTensorArena(convert_fn, select_fn).transform(ref_data)
+
         if self.is_load_type_xser():
-            return xser.load(checkpoint_path)
-        return self.checkpoint_io.load_checkpoint(checkpoint_path)
+            loaded_checkpoint = device_load_xser(checkpoint_path)
+        else:
+            loaded_checkpoint = self.checkpoint_io.load_checkpoint(checkpoint_path)
+
+        return loaded_checkpoint
 
     def remove_checkpoint(self, filepath: _PATH) -> None:
         app_state = AppState()
