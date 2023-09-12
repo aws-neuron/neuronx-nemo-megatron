@@ -13,6 +13,8 @@ trainer:
   max_steps: 100000 # consumed_samples = global_step * micro_batch_size * data_parallel_size * accumulate_grad_batches
   log_every_n_steps: 10
   val_check_interval: 100
+  check_val_every_n_epoch: null
+  num_sanity_val_steps: 0
   limit_val_batches: 50
   limit_test_batches: 500
   accumulate_grad_batches: 1 # do not modify, grad acc is automatic for training megatron models
@@ -21,6 +23,7 @@ trainer:
   enable_model_summary: False # default PTL callback for this does not support model parallelism, instead we log manually
 
 exp_manager:
+  log_local_rank_0_only: True # reduce file system access pressure
   create_tensorboard_logger: True
   explicit_log_dir: null
   exp_dir: null
@@ -34,12 +37,12 @@ exp_manager:
   create_checkpoint_callback: True
   checkpoint_callback_params:
     monitor: step
-    save_top_k: -1
+    save_top_k: 1
     mode: max
-    save_last: True
+    save_last: False
     always_save_nemo: False # saves nemo file during validation, not implemented for model parallel
     save_nemo_on_train_end: False # not recommended when training large models on clusters with short time limits
-    filename: 'megatron_gpt--{step}-{consumed_samples}'
+    filename: megatron_gpt--{step}-{consumed_samples}
     model_parallel_size: ${multiply:${model.tensor_model_parallel_size}, ${model.pipeline_model_parallel_size}}
 
 

@@ -16,7 +16,6 @@ import os
 
 from lightning_lite.plugins.environments import TorchElasticEnvironment
 from omegaconf.omegaconf import OmegaConf, open_dict
-from omegaconf.dictconfig import DictConfig
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks.timer import Timer
 from pytorch_lightning.trainer.connectors.checkpoint_connector import CheckpointConnector
@@ -38,19 +37,6 @@ import torch.optim.adamw as torch_adamw
 from nemo.core.optim.adamw import _single_tensor_adamw_
 torch_adamw._single_tensor_adamw = _single_tensor_adamw_
 
-
-class PretrainGPTModel(MegatronGPTModel):
-    """
-    Pretrain GPT Model without validation
-    """
-    def __init__(self, cfg: DictConfig, trainer: Trainer):
-        super().__init__(cfg, trainer)
-
-    def validation_epoch_end(self, outputs):
-        pass
-
-    def validation_step(self, batch, batch_idx):
-        pass
 
 @hydra_runner(config_path="conf", config_name="megatron_gpt_config")
 def main(cfg) -> None:
@@ -92,13 +78,12 @@ def main(cfg) -> None:
     # update resume from checkpoint found by exp_manager
     if cfg.model.resume_from_checkpoint is not None:
         resume_from_checkpoint = cfg.model.resume_from_checkpoint
-        trainer = NLPTrainer(plugins=plugins, strategy=strategy, num_sanity_val_steps=0, resume_from_checkpoint=resume_from_checkpoint, **cfg.trainer)
+        trainer = NLPTrainer(plugins=plugins, strategy=strategy, resume_from_checkpoint=resume_from_checkpoint, **cfg.trainer)
     else:
-        trainer = NLPTrainer(plugins=plugins, strategy=strategy, num_sanity_val_steps=0, **cfg.trainer)
+        trainer = NLPTrainer(plugins=plugins, strategy=strategy, **cfg.trainer)
 
 
     exp_manager(trainer, cfg.exp_manager)
-    
     # We use NLPCheckpointConnector which correctly loads global_step, epoch
     #trainer._checkpoint_connector = CheckpointConnector(trainer, resume_from_checkpoint=resume_from_checkpoint)
     # Override timer callback to a stateless one
@@ -110,7 +95,7 @@ def main(cfg) -> None:
     with open_dict(cfg):
         cfg.model.precision = cfg.trainer.precision
 
-    model = PretrainGPTModel(cfg.model, trainer)
+    model = MegatronGPTModel(cfg.model, trainer)
     trainer.fit(model)
 
 if __name__ == '__main__':

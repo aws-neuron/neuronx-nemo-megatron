@@ -208,26 +208,29 @@ def fake_initialize_model_parallel(
     pipeline_model_parallel_size = min(pipeline_model_parallel_size_, world_size)
     model_parallel_size = tensor_model_parallel_size * pipeline_model_parallel_size
 
+    neuron_nemo_debug = (os.environ.get('NEURON_NEMO_DEBUG', None) == '1')
+
     assert (
         world_size % tensor_model_parallel_size * pipeline_model_parallel_size == 0
     ), f'world_size: {world_size} must be divisible by tensor_model_parallel_size: {tensor_model_parallel_size} times pipeline_model_parallel_size {pipeline_model_parallel_size}'
     data_parallel_size = world_size // (tensor_model_parallel_size * pipeline_model_parallel_size)
 
-    assert (
-        tensor_model_parallel_size in [1, 8 ,32]
-    ), f'tensor_model_parallel_size: {tensor_model_parallel_size} must be 1, 8, or 32.'
+    if not neuron_nemo_debug: # We do no checking for debug flag - you are expected to verify config manually if using this flag
+        assert (
+            tensor_model_parallel_size in [1, 8 ,32]
+        ), f'tensor_model_parallel_size: {tensor_model_parallel_size} must be 1, 8, or 32.'
 
-    if pipeline_model_parallel_size > 1:
-        if tensor_model_parallel_size == 1:
-            assert (
-                (data_parallel_size == 1) or (data_parallel_size == 8) or (data_parallel_size >= 32)
-            ), f'When pipeline_model_parallel_size: {pipeline_model_parallel_size} is greater than 1, \
+        if pipeline_model_parallel_size > 1:
+            if tensor_model_parallel_size == 1:
+                assert (
+                    (data_parallel_size == 1) or (data_parallel_size == 8) or (data_parallel_size >= 32)
+                ), f'When pipeline_model_parallel_size: {pipeline_model_parallel_size} is greater than 1, \
 and tensor_model_parallel_size is 1, data_parallel_size: {data_parallel_size} \
 must be 1, 8, or greater than or equal to 32'
-        else:
-            assert (
-                (data_parallel_size == 1) or ((data_parallel_size * tensor_model_parallel_size) >= 32)
-            ), f'When pipeline_model_parallel_size: {pipeline_model_parallel_size} and tensor_model_parallel_size: \
+            else:
+                assert (
+                    (data_parallel_size == 1) or ((data_parallel_size * tensor_model_parallel_size) >= 32)
+                ), f'When pipeline_model_parallel_size: {pipeline_model_parallel_size} and tensor_model_parallel_size: \
 {tensor_model_parallel_size} are greater than 1, data_parallel_size: {data_parallel_size} \
 must be 1 or data_parallel_size: {data_parallel_size} times tensor_model_parallel_size: \
 {tensor_model_parallel_size} ({data_parallel_size * tensor_model_parallel_size}) must be greater than or equal to 32'

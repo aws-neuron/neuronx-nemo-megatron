@@ -55,13 +55,11 @@ export TF_NUM_INTEROP_THREADS=8192
 
 export TRAIN_ITERS=20000
 CREATE_TB_LOGGER=True
-CHECKPOINT_CALLBACK=True
 if [ "$COMPILE" = "1" ]; then
     echo "compiling only run"
     MAYBE_COMPILE="neuron_parallel_compile"
     export TRAIN_ITERS=3
     CREATE_TB_LOGGER=False
-    CHECKPOINT_CALLBACK=False
 fi
 
 : ${SEQ_LENGTH:=2048}
