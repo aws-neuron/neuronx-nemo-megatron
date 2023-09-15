@@ -1239,6 +1239,7 @@ class NLPDDPStrategy(TPUSpawnStrategy):
             )
 
         import torch_xla.core.xla_model as xm
+        xm.mark_step()
 
         torch.distributed.all_reduce(output, op=torch.distributed.ReduceOp.SUM)
 

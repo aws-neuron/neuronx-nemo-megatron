@@ -45,14 +45,14 @@ echo $DISTRIBUTED_ARGS
 export NEURON_FUSE_SOFTMAX=1
 export NEURON_RT_STOCHASTIC_ROUNDING_EN=1
 export NEURON_RT_ENABLE_VERBOSE_NUMERICAL_ERRORS=0
-export NEURON_RT_ASYNC_EXEC_MAX_INFLIGHT_REQUESTS=0
+export NEURON_RT_ASYNC_EXEC_MAX_INFLIGHT_REQUESTS=3
 export NEURON_TRANSFER_WITH_STATIC_RING_OPS=""
 export MALLOC_ARENA_MAX=128
 
 export XLA_USE_BF16=0
 export XLA_DOWNCAST_BF16=1
 
-export NEURON_CC_FLAGS="--model-type transformer --distribution-strategy=nemo --enable-mixed-precision-accumulation --cache_dir=$HOME/neuron_cache/llama/`hostname`"
+export NEURON_CC_FLAGS="--model-type transformer --distribution-strategy=nemo --enable-mixed-precision-accumulation --cache_dir=$HOME/neuron_cache/"
 export TF_NUM_INTEROP_THREADS=8192
 
 export TRAIN_ITERS=400000
@@ -91,7 +91,7 @@ $MAYBE_COMPILE torchrun $DISTRIBUTED_ARGS megatron_gpt_pretraining.py  \
     trainer.limit_test_batches=1 \
     trainer.accumulate_grad_batches=1 \
     trainer.precision=32 \
-    model.tokenizer.type='/root/scripts/example_datasets/llamav2_weights/7b-hf' \
+    model.tokenizer.type=$HOME/llamav2_weights/7b-hf \
     model.micro_batch_size=$UBS \
     model.global_batch_size=$GBS \
     model.tensor_model_parallel_size=$TP \
@@ -106,7 +106,7 @@ $MAYBE_COMPILE torchrun $DISTRIBUTED_ARGS megatron_gpt_pretraining.py  \
     model.hidden_dropout=0 \
     model.layernorm_epsilon=1e-6 \
     model.apply_query_key_layer_scaling=False \
-    model.data.data_prefix=[1.0,/root/scripts/data/books/book.jsonl-processed_text_document] \
+    model.data.data_prefix=[1.0,$HOME/examples_datasets/llama_7b/book.jsonl-processed_text_document] \
     model.data.num_workers=1 \
     model.data.seq_length=$SEQ_LENGTH \
     model.optim.name=adamw \

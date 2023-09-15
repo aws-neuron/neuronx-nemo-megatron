@@ -43,9 +43,11 @@ else
     export EXPLICIT_LOGDIR=null
     LOG_PATH=./nemo_experiments/logs
 fi
-./setup.sh   2>&1  | tee  $LOG_PATH/setup.log
+
 
 mkdir -p $LOG_PATH
+
+./setup.sh   2>&1  | tee  $LOG_PATH/setup.log
 
 export HYDRA_FULL_ERROR=1
 export PROCESSES_PER_NODE=32
