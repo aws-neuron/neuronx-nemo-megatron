@@ -352,7 +352,6 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
         # run forward and backwards passes for an entire global batch
         # we do this inside training_step to support pipeline parallelism
         fwd_bwd_function = self._get_fwd_bwd_function()
-
         losses_per_micro_batch = fwd_bwd_function(
             forward_step_func=self.get_forward_output_and_loss_func(),
             batch=batch_for_pipeline,
@@ -454,6 +453,10 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
         xm.add_step_closure(_log_metrics, (self.log, loss_mean.detach(), lr, float(self.trainer.global_step), float(consumed_samples), grad_norm, param_norm, float(throughput), float(throughput_peak)))
 
         return loss_mean
+
+    def on_train_batch_end(self, *args, **kwargs):
+        super().on_train_batch_end(*args, **kwargs)
+        xm.mark_step()
 
     def calculate_gradient_norm(self, parameters, norm_type=2):
         """Calculate gradient norms across model parallel ranks
@@ -777,6 +780,8 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
             sync_batch_comm=self.cfg.get('sync_batch_comm', False),
         )
 
+        xm.mark_step()
+
         # only the last stage of the pipeline returns losses
         if losses_per_micro_batch:
             if self.cfg.data.get('validation_drop_last', True):
@@ -809,15 +814,16 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
                 # Compute the avg loss by total_loss across all samples / total number of samples
                 total_loss_and_total_samples = torch.vstack(outputs).sum(axis=0)
                 avg_loss = total_loss_and_total_samples[0] / total_loss_and_total_samples[1]
-                averaged_loss = avg_loss.type(torch.float32).cuda()
+                averaged_loss = avg_loss.type(torch.float32)
         else:
-            averaged_loss = torch.tensor(0.0, dtype=torch.float32).cuda()
+            averaged_loss = torch.tensor(0.0, dtype=torch.float32, device=xm.xla_device())
 
-        # we can only log on one rank if it is rank zero so we broadcast from last rank
-        torch.distributed.broadcast(averaged_loss, get_last_rank())
+        # we can only log on one rank if it is rank zero so we all_reduce from last rank
+        # (effectively a broadcast since we are all_reducing with a zero tensor)
+        torch.distributed.all_reduce(averaged_loss, group=parallel_state.get_pipeline_model_parallel_group())
 
         def _log_val_loss(log_fn, loss):
-            log_fn('val_loss', loss.cpu(), prog_bar=True, rank_zero_only=True)
+            log_fn('val_loss', loss.cpu(), prog_bar=True, rank_zero_only=True, batch_size=1)
         xm.add_step_closure(_log_val_loss, (self.log, averaged_loss.detach(),))
 
     def test_step(self, batch, batch_idx):
@@ -1013,7 +1019,6 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
                 parallel_state.set_virtual_pipeline_model_parallel_rank(0)
             else:
                 self.model.sync_initial_word_embeddings()
-
         if self.cfg.get('transformer_engine', False):
             self.setup_transformer_engine_tp_groups()
 

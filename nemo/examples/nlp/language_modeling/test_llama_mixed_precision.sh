@@ -52,18 +52,16 @@ export MALLOC_ARENA_MAX=128
 export XLA_USE_BF16=0
 export XLA_DOWNCAST_BF16=1
 
-export NEURON_CC_FLAGS="--model-type transformer --distribution-strategy=nemo --cache_dir=$HOME/neuron_cache/llama/`hostname`"
+export NEURON_CC_FLAGS="--model-type transformer --distribution-strategy=nemo --enable-mixed-precision-accumulation --cache_dir=$HOME/neuron_cache/"
 export TF_NUM_INTEROP_THREADS=8192
 
-export TRAIN_ITERS=10000
+export TRAIN_ITERS=400000
 CREATE_TB_LOGGER=True
-CHECKPOINT_CALLBACK=True
 if [ "$COMPILE" = "1" ]; then
     echo "compiling only run"
     MAYBE_COMPILE="neuron_parallel_compile"
     export TRAIN_ITERS=3
     CREATE_TB_LOGGER=False
-    CHECKPOINT_CALLBACK=False
 fi
 
 : ${SEQ_LENGTH:=2048}
@@ -93,7 +91,7 @@ $MAYBE_COMPILE torchrun $DISTRIBUTED_ARGS megatron_gpt_pretraining.py  \
     trainer.limit_test_batches=1 \
     trainer.accumulate_grad_batches=1 \
     trainer.precision=32 \
-    model.tokenizer.type='/root/scripts/example_datasets/llamav2_weights/7b-hf' \
+    model.tokenizer.type=$HOME/llamav2_weights/7b-hf \
     model.micro_batch_size=$UBS \
     model.global_batch_size=$GBS \
     model.tensor_model_parallel_size=$TP \
@@ -108,20 +106,20 @@ $MAYBE_COMPILE torchrun $DISTRIBUTED_ARGS megatron_gpt_pretraining.py  \
     model.hidden_dropout=0 \
     model.layernorm_epsilon=1e-6 \
     model.apply_query_key_layer_scaling=False \
-    model.data.data_prefix=[1.0,/root/scripts/data/books/book.jsonl-processed_text_document] \
-    model.data.num_workers=2 \
+    model.data.data_prefix=[1.0,$HOME/examples_datasets/llama_7b/book.jsonl-processed_text_document] \
+    model.data.num_workers=1 \
     model.data.seq_length=$SEQ_LENGTH \
     model.optim.name=adamw \
-    model.optim.lr=3.0e-5 \
+    model.optim.lr=3.0e-4 \
     model.optim.betas=[0.9,0.95] \
     model.optim.weight_decay=0.1 \
     model.optim.sched.name=CosineAnnealing \
-    model.optim.sched.warmup_steps=0 \
+    model.optim.sched.warmup_steps=2000 \
     model.optim.sched.constant_steps=0 \
-    model.optim.sched.min_lr=0 \
+    model.optim.sched.min_lr=3.0e-5 \
     model.optim.capturable=True \
     model.sequence_parallel=True  \
-    model.activations_checkpoint_granularity=selective \
+    model.activations_checkpoint_granularity=full \
     model.activations_checkpoint_method=uniform \
     model.activations_checkpoint_num_layers=1 \
     +model.save_xser=False \

@@ -17,6 +17,7 @@ from contextlib import contextmanager
 import torch
 
 from nemo.utils import logging
+import os
 
 try:
     from apex.multi_tensor_apply import multi_tensor_applier
@@ -542,6 +543,12 @@ class MainParamsOptimizerWrapperXLA(torch.optim.Optimizer):
         self.float32_groups = []  # original float32 parameters
         self.fp64_from_float32_groups = []  # fp64 copy of float32 parameters
 
+        self._fp32_opt_states_only = False
+        #Return immediately without cloning master weights
+        if os.environ.get('FP32_OPT_STATES_ONLY', None) == 'True':
+            self._fp32_opt_states_only = True
+            return
+
         # For all the groups in the original optimizer:
         for i, param_group in enumerate(self.optimizer.param_groups):
             float32_params_this_group = []
@@ -574,9 +581,12 @@ class MainParamsOptimizerWrapperXLA(torch.optim.Optimizer):
         self.optimizer.load_state_dict(self.optimizer.state_dict())
 
 
-    def zero_grad(self, set_to_none=True):
+    def zero_grad(self, set_to_none=False):
         """We only need to zero the model related parameters, i.e.,
         float32_groups."""
+        if self._fp32_opt_states_only:
+            return self.optimizer.zero_grad(set_to_none=set_to_none)
+
         for group in self.float32_groups:
             _zero_grad_group_helper(group, set_to_none)
 
@@ -609,38 +619,38 @@ class MainParamsOptimizerWrapperXLA(torch.optim.Optimizer):
     def reload_model_params(self):
         self._copy_model_params_to_main_params()
 
-#    @torch.no_grad()
-#    def step(self, **kwargs):
-#        # Copy gradients from model params to main params.
-#        with torch.no_grad():
-#            self._copy_model_grads_to_main_grads()
-#        # Step the optimizer.
-#        self.optimizer.step()
-#
-#        # Update params from main params.
-#        with torch.no_grad():
-#            self._copy_main_params_to_model_params()
-#
-#        # Successful update.
-#        return True
-
     def step(self, closure):
         closure_result = closure()
  
-        # Copy gradients from model params to main params.
-        with torch.no_grad():
-            self._copy_model_grads_to_main_grads()
+        if self._fp32_opt_states_only:
+            for group in self.optimizer.param_groups:
+                for p in group['params']:
+                    if p.grad is None:
+                        continue
+                    p.grad.data = p.grad.data.double()
+                    p.data = p.data.double()
+        else:
+            # Copy gradients from model params to main params.
+            with torch.no_grad():
+                self._copy_model_grads_to_main_grads()
         # Step the optimizer.
         self.optimizer.step()
  
+        if self._fp32_opt_states_only:
+            for group in self.optimizer.param_groups:
+                for p in group['params']:
+                    if p.grad is None:
+                        continue
+                    p.grad.data = p.grad.data.float()
+                    p.data = p.data.float()
+        else:
         # Update params from main params.
-        with torch.no_grad():
-            self._copy_main_params_to_model_params()
+            with torch.no_grad():
+                self._copy_main_params_to_model_params()
  
         # Successful update.
         return closure_result
 
-  
 
     def state_dict(self):
         state_dict = {}
@@ -666,6 +676,13 @@ class MainParamsOptimizerWrapperXLA(torch.optim.Optimizer):
 
     def get_parameters(self):
         params = []
+        if self._fp32_opt_states_only:
+            for param_group in self.optimizer.param_groups:
+                for param in param_group['params']:
+                    if param.requires_grad:
+                        params.append(param)
+            return params
+
         #for param_group in self.optimizer.param_groups:
         for param_group in self.float32_groups:
             for param in param_group:

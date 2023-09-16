@@ -10,9 +10,6 @@ export FI_EFA_USE_DEVICE_RDMA=1
 export FI_PROVIDER=efa
 export FI_EFA_FORK_SAFE=1
 
-
-DATE=$(date +%F_%H-%M-%S)
-
 if [ -v SLURM_NNODES ]
 then
     # SLURM runs
@@ -25,7 +22,8 @@ then
     NTASKS=$SLURM_NTASKS
     export NEMO_EXPM_VERSION=$SLURM_JOB_ID
     export EXPLICIT_LOGDIR=null
-    LOG_PATH=logs/$SLURM_JOB_ID.$DATE/$NODEID/
+    : ${SLURM_RESTART_COUNT:=0}
+    LOG_PATH=logs/$SLURM_JOB_ID/$SLURM_RESTART_COUNT/$NODEID/
 elif [ -v OMPI_COMM_WORLD_RANK ]
 then
     # MPI runs on EKS
@@ -34,7 +32,7 @@ then
     HOSTS=(${NODELIST//\ / })
     NODEID=$OMPI_COMM_WORLD_RANK
     NTASKS=$OMPI_COMM_WORLD_SIZE
-    export EXPLICIT_LOGDIR=/shared/nemo_experiments/$POD_UID.$DATE
+    export EXPLICIT_LOGDIR=/shared/nemo_experiments/$POD_UID
     LOG_PATH=$EXPLICIT_LOGDIR/$NODEID/
 else
     # Single-node, non-SLURM, non-MPI runs
@@ -43,10 +41,13 @@ else
     NTASKS=1
     export NEMO_EXPM_VERSION=$(date "+%Y-%m-%d_%H-%M-%S")
     export EXPLICIT_LOGDIR=null
-    LOG_PATH=./nemo_experiments/logs.$DATE
+    LOG_PATH=./nemo_experiments/logs
 fi
 
+
 mkdir -p $LOG_PATH
+
+./setup.sh   2>&1  | tee  $LOG_PATH/setup.log
 
 export HYDRA_FULL_ERROR=1
 export PROCESSES_PER_NODE=32
@@ -63,22 +64,45 @@ export MALLOC_ARENA_MAX=128
 export TF_NUM_INTEROP_THREADS=8192
 
 export NEURON_RT_STOCHASTIC_ROUNDING_EN=1
-export XLA_USE_BF16=1
-export NEURON_CC_FLAGS="--model-type transformer --distribution-strategy=nemo"
+
+#training_precision is one of 'bf16SR', 'megatron_amp_O2', 'fp32_OptStates'
+#training_precision = "bf16SR", uses BF16 + Stochastic Rounding
+#training_precision = "megatron_amp_O2", master weights and optimizer states are stored in fp32, model weights in bf16
+#training_precision = "fp32_OptStates", optimizer states are stored in fp32, model weights in bf16
+training_precision="bf16SR"
+if [[ $training_precision == "bf16SR" ]];then
+    echo using BF16 SR
+    export XLA_USE_BF16=1
+    export NEURON_CC_FLAGS="--model-type transformer --distribution-strategy=nemo --enable-mixed-precision-accumulation"
+    OPTIM_NAME=adamw
+    megatron_amp_O2=false
+elif [[ $training_precision == "megatron_amp_O2" ]]; then
+    echo using megatron_amp_O2
+    export XLA_DOWNCAST_BF16=1
+    export NEURON_CC_FLAGS="--model-type transformer --distribution-strategy=nemo --enable-mixed-precision-accumulation"
+    OPTIM_NAME=adamw
+    megatron_amp_O2=true
+elif [[ $training_precision == "fp32_OptStates" ]]; then
+    echo using FP32 Optimizer States
+    export XLA_DOWNCAST_BF16=1
+    export NEURON_CC_FLAGS="--model-type transformer --distribution-strategy=nemo --enable-mixed-precision-accumulation"
+    OPTIM_NAME=adamw_fp32OptState
+    megatron_amp_O2=false
+else
+    echo Incorrect Training Precision Provided
+fi 
+
 export NEURON_COMPILE_CACHE_URL="$HOME/neuron_cache" # Place cache on shared storage to reduce redundant compilations
 
 
 export TRAIN_ITERS=300000
-export GBS=$((NTASKS*32))
 CREATE_TB_LOGGER=True
-CHECKPOINT_CALLBACK=True
 
 if [ "$COMPILE" = "1" ]; then
     echo "compiling only run"
     MAYBE_COMPILE="neuron_parallel_compile"
     TRAIN_ITERS=4
     CREATE_TB_LOGGER=False
-    CHECKPOINT_CALLBACK=False
 fi
 
 : ${SEQ_LENGTH:=2048}
@@ -89,6 +113,9 @@ fi
 : ${N_AH:=32}
 : ${UBS:=1}
 : ${ACT_CHKPNT_GRANULARITY:=full}
+: ${GBS_MULTIPLE:=32}
+GBS=$((NTASKS*GBS_MULTIPLE))
+
 FFN_HS=$(($HS*4))
 echo "SEQ_LEN=$SEQ_LENGTH, HS=$HS, FFN_HS=$FFN_HS TP=$TP PP=$PP N_LAYERS=$N_LAYERS N_AH=$N_AH GBS=$GBS UBS=$UBS"
 
@@ -100,12 +127,13 @@ $MAYBE_COMPILE torchrun $DISTRIBUTED_ARGS megatron_gpt_pretraining.py  \
     trainer.num_nodes=$NTASKS \
     trainer.max_epochs=null \
     trainer.max_steps=$TRAIN_ITERS\
-    trainer.val_check_interval=$TRAIN_ITERS \
+    trainer.val_check_interval=$(($TRAIN_ITERS+1)) \
     trainer.log_every_n_steps=1 \
     trainer.limit_val_batches=1 \
     trainer.limit_test_batches=1 \
     trainer.accumulate_grad_batches=1 \
     trainer.precision=32 \
+    model.megatron_amp_O2=$megatron_amp_O2 \
     model.micro_batch_size=$UBS \
     model.global_batch_size=$GBS \
     model.tensor_model_parallel_size=$TP \
@@ -124,7 +152,7 @@ $MAYBE_COMPILE torchrun $DISTRIBUTED_ARGS megatron_gpt_pretraining.py  \
     model.data.data_prefix=[1.0,$HOME/examples_datasets/gpt2/my-gpt2_text_document] \
     model.data.num_workers=1 \
     model.data.seq_length=$SEQ_LENGTH \
-    model.optim.name=adamw \
+    model.optim.name=$OPTIM_NAME \
     model.optim.capturable=True \
     model.optim.lr=0.00015 \
     model.optim.betas=[0.9,0.95] \
