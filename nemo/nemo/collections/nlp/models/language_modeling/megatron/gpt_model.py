@@ -168,6 +168,7 @@ class GPTModel(MegatronModule):
         use_emha=False,
         multi_query_attention=False,
         save_logits=False,
+        num_query_groups=None,
     ):
 
         super(GPTModel, self).__init__(share_token_embeddings=share_embeddings_and_output_weights)
@@ -249,6 +250,7 @@ class GPTModel(MegatronModule):
             reduce_amax=reduce_amax,
             use_emha=use_emha,
             multi_query_attention=multi_query_attention,
+            num_query_groups=num_query_groups,
         )
 
         if self.share_embeddings_and_output_weights:

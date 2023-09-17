@@ -250,6 +250,7 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
             fp8_amax_compute_algo=self.cfg.get('fp8_amax_compute_algo', 'most_recent'),
             use_emha=self.cfg.get('use_emha', False),
             save_logits=self.cfg.get('save_logits', False),
+            num_query_groups=self.cfg.get('num_query_groups', None),
         )
 
         return model

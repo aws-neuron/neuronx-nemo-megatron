@@ -5,6 +5,7 @@ export TP=8
 export PP=4
 export N_LAYERS=40
 export N_AH=40
+export N_QG=40
 export FFN_HS=13824
 export GBS=1024
 export UBS=1
