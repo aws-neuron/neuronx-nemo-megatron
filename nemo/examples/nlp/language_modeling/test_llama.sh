@@ -68,10 +68,11 @@ fi
 : ${PP:=1}
 : ${N_LAYERS:=32}
 : ${N_AH:=32}
+: ${N_QG:=32}
 : ${UBS:=1}
 : ${FFN_HS:=11008}
 : ${GBS:=256}
-echo "SEQ_LEN=$SEQ_LENGTH, HS=$HS, FFN_HS=$FFN_HS TP=$TP PP=$PP N_LAYERS=$N_LAYERS N_AH=$N_AH GBS=$GBS UBS=$UBS"
+echo "SEQ_LEN=$SEQ_LENGTH, HS=$HS, FFN_HS=$FFN_HS TP=$TP PP=$PP N_LAYERS=$N_LAYERS N_AH=$N_AH N_QG=$N_QG GBS=$GBS UBS=$UBS"
 
 LOG_PATH=logs/$SLURM_JOB_ID/$NODEID/
 mkdir -p $LOG_PATH
@@ -100,6 +101,7 @@ $MAYBE_COMPILE torchrun $DISTRIBUTED_ARGS megatron_gpt_pretraining.py  \
     model.ffn_hidden_size=$FFN_HS \
     model.num_layers=$N_LAYERS \
     model.num_attention_heads=$N_AH \
+    model.num_query_groups=$N_QG \
     model.init_method_std=0.021 \
     model.hidden_dropout=0 \
     model.layernorm_epsilon=1e-5 \
