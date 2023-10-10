@@ -18,11 +18,18 @@ from typing import Any, List, Optional, Union
 import numpy as np
 import torch
 import time
+import datetime
 import math
+
+from omegaconf import ListConfig
 from omegaconf.dictconfig import DictConfig
 from pytorch_lightning.trainer.trainer import Trainer
 
+from nemo.collections.nlp.data.language_modeling.megatron.base_dataset_utils import get_datasets_weights_and_num_samples
+from nemo.collections.nlp.data.language_modeling.megatron.blendable_dataset import MemoryEfficientBlendableDataset
 from nemo.collections.nlp.data.language_modeling.megatron.gpt_dataset import build_train_valid_test_datasets
+from nemo.collections.nlp.data.language_modeling.megatron.gpt_sft_chat_dataset import GPTSFTChatDataset
+from nemo.collections.nlp.data.language_modeling.megatron.gpt_sft_dataset import GPTSFTDataset
 from nemo.collections.nlp.data.language_modeling.megatron.megatron_batch_samplers import (
     MegatronPretrainingBatchSampler,
     MegatronPretrainingRandomBatchSampler,
@@ -155,7 +162,7 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
         self.save_logits = cfg.get('save_logits', False)
         self.save_logits_interval = cfg.get('save_logits_interval', 0)
     
-        self.throughput = Throughput(100) 
+        self.throughput = Throughput(10)
     def _build_model(self):
         # build_model returns a list of modules which are used for interleaved pipeline parallelism
         self.model = build_model(
@@ -163,6 +170,7 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
             wrap_with_ddp=False,
             virtual_pipeline_model_parallel_size=self.cfg.get('virtual_pipeline_model_parallel_size', None),
         )
+        logging.trace(f"In gpt_model._build_model() leave apex.transformer.pipeline_parallel.build_model", trace_type="recovery_time")
 
         # if we're not using interleaved, then self.model is a module.
         if self.cfg.get('virtual_pipeline_model_parallel_size', None) is None:
@@ -171,23 +179,7 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
         if self.megatron_amp_o2:
             #We use XLA_USE_DOWNCAST=1 to downcast the model weights constructed in fp32
             #Not doing explicit model casting below
-            return 
-            if not self.with_distributed_adam:
-                # Pre-allocate the model on GPU to have master parameters allocated on the same device with matching data type
-                if isinstance(self.model, list):
-                    for module in self.model:
-                        module.cuda(torch.cuda.current_device())
-                else:
-                    self.model.cuda(torch.cuda.current_device())
-
-            # Model wrapper to convert both model and inputs to half precision
-            if isinstance(self.model, list):
-                converted_model = []
-                for module in self.model:
-                    converted_model.append(Float16Module(module=module, precision=cfg.precision))
-                    self.model = converted_model
-            else:
-                self.model = Float16Module(module=self.model, precision=cfg.precision)
+            return
 
     def set_inference_config(self, inference_config):
         self._inference_config = inference_config
@@ -197,6 +189,8 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
 
     def model_provider_func(self, pre_process, post_process):
         """Model depends on pipeline paralellism."""
+
+        logging.trace(f"In gpt_model._build_model, enter GPTModel()", trace_type="recovery_time")
         model = GPTModel(
             vocab_size=self.padded_vocab_size,
             hidden_size=self.cfg.hidden_size,
@@ -250,8 +244,9 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
             fp8_amax_compute_algo=self.cfg.get('fp8_amax_compute_algo', 'most_recent'),
             use_emha=self.cfg.get('use_emha', False),
             save_logits=self.cfg.get('save_logits', False),
+            position_interpolation_factor=self.cfg.get('positition_interpolation_factor', 1.0),
         )
-
+        logging.trace(f"In gpt_model._build_model, leave GPTModel()", trace_type="recovery_time")
         return model
 
     def setup_optimizer_param_groups(self):
@@ -440,7 +435,7 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
         if self.log_gradient_norm:
             grad_norm = self.calculate_gradient_norm(self.parameters())
         def _log_metrics(log_fn, loss_mean, lr, global_step, consumed_samples, grad_norm, param_norm, throughput, throughput_peak):
-            log_fn('reduced_train_loss', loss_mean.cpu(), prog_bar=True, rank_zero_only=True)
+            log_fn('reduced_train_loss', loss_mean.detach().cpu(), prog_bar=True, rank_zero_only=True)
             log_fn('lr', lr, rank_zero_only=True)
             if grad_norm:
                 log_fn('gradient_norm', grad_norm.detach().cpu(), prog_bar=True, rank_zero_only=True)
@@ -450,7 +445,7 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
             log_fn('consumed_samples', consumed_samples, prog_bar=True, rank_zero_only=True)
             log_fn('throughput', throughput, prog_bar=True, rank_zero_only=True)
             log_fn('throughput_peak', throughput_peak, prog_bar=True, rank_zero_only=True)
-        xm.add_step_closure(_log_metrics, (self.log, loss_mean.detach(), lr, float(self.trainer.global_step), float(consumed_samples), grad_norm, param_norm, float(throughput), float(throughput_peak)))
+        xm.add_step_closure(_log_metrics, (self.log, loss_mean, lr, float(self.trainer.global_step), float(consumed_samples), grad_norm, param_norm, float(throughput), float(throughput_peak)))
 
         return loss_mean
 
@@ -779,9 +774,7 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
             sequence_parallel_enabled=self.cfg.get('sequence_parallel', False),
             sync_batch_comm=self.cfg.get('sync_batch_comm', False),
         )
-
         xm.mark_step()
-
         # only the last stage of the pipeline returns losses
         if losses_per_micro_batch:
             if self.cfg.data.get('validation_drop_last', True):
@@ -823,7 +816,7 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
         torch.distributed.all_reduce(averaged_loss, group=parallel_state.get_pipeline_model_parallel_group())
 
         def _log_val_loss(log_fn, loss):
-            log_fn('val_loss', loss.cpu(), prog_bar=True, rank_zero_only=True, batch_size=1)
+            log_fn('val_loss', loss.cpu(), prog_bar=True, on_step=True, rank_zero_only=True, batch_size=1)
         xm.add_step_closure(_log_val_loss, (self.log, averaged_loss.detach(),))
 
     def test_step(self, batch, batch_idx):
@@ -931,7 +924,7 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
         
 
         return torch.utils.data.DataLoader(
-            dataset, batch_sampler=batch_sampler, num_workers=self.cfg.data.num_workers, pin_memory=False
+            dataset, batch_sampler=batch_sampler, num_workers=self.cfg.data.num_workers, pin_memory=False, prefetch_factor=1
         )
 
 
@@ -942,6 +935,7 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
         Args:
             stage (str, optional): Can be 'fit', 'validate', 'test' or 'predict'. Defaults to None.
         """
+        logging.trace(f"Enter MegatronGPTModel.setup()", trace_type="recovery_time")
         if not hasattr(self, 'server'):
             import torch_xla.debug.profiler as xp
             (dp_rank, tp_rank, pp_rank, vp_rank) = parallel_state.get_rank_info()
@@ -952,7 +946,9 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
 
 
         self.initialize_model_parallel_for_nemo(main_proc=False)
+        logging.trace(f"In gpt_model.setup() enter _build_model()", trace_type="recovery_time")
         self._build_model()
+        logging.trace(f"In gpt_model.setup() leave _build_model()", trace_type="recovery_time")
 
         # log number of parameters
         if isinstance(self.model, list):
@@ -1002,6 +998,11 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
 
         if stage == 'predict':
             return
+        elif self.cfg.data.get("fine_tuning", False):
+            self.build_sft_dataets()
+            self.setup_training_data(self.cfg.data)
+            self.setup_validation_data(self.cfg.data)
+            self.setup_test_data(self.cfg.data)
         else:
             # TODO: consider adding a ModelPT guard to check if model is being restored.
             # allowing restored models to optionally setup datasets
@@ -1022,13 +1023,133 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
         if self.cfg.get('transformer_engine', False):
             self.setup_transformer_engine_tp_groups()
 
+        logging.trace(f"Leave MegatronGPTModel.setup()", trace_type="recovery_time")
+
+    def build_sft_dataets(self):
+        if self.trainer.limit_val_batches > 1.0 and isinstance(self.trainer.limit_val_batches, float):
+            raise ValueError("limit_val_batches must be an integer or float less than or equal to 1.0.")
+
+        if hasattr(self.cfg.data, 'validation_ds') and self.cfg.data.validation_ds.get('file_names', None) is not None:
+            logging.info('Building GPT SFT validation datasets.')
+            # Wrap this in a list since the general finetuning parent class supports multi-validation.
+            self._validation_ds = self._build_dataset(self.cfg.data.validation_ds, is_train=False, is_validation=True)
+            logging.info(f'Length of val dataset: {len(self._validation_ds)}')
+
+        if hasattr(self.cfg.data, 'test_ds') and self.cfg.data.test_ds.get('file_names', None) is not None:
+            logging.info('Building GPT SFT test datasets.')
+            # Wrap this in a list since the general finetuning parent class supports multi-validation.
+            self._test_ds = self._build_dataset(self.cfg.data.test_ds, is_train=False)
+            logging.info(f'Length of test dataset: {len(self._test_ds[0])}')
+
+        logging.info('Building GPT SFT training datasets.')
+        self._train_ds = self._build_dataset(self.cfg.data.train_ds)
+        logging.info(f'Length of train dataset: {len(self._train_ds)}')
+
+    def _build_dataset(self, data_cfg, is_train=True, is_validation=False):
+        datasets = []
+        # Determine if we are using a single dataset or a list of datasets.
+        is_list_config = isinstance(data_cfg.file_names, ListConfig)
+        if not is_list_config:
+            raise ValueError(f"SFT train/validation datasets must be provided as a list of individual JSONL files.")
+        max_steps = 0
+        if is_train:
+            max_steps = self.trainer.max_steps
+        elif is_validation:
+            max_steps = (self.trainer.max_steps // self.trainer.val_check_interval + 1) * self.trainer.limit_val_batches
+
+        # Construct the data prefix list for `get_datasets_weights_and_num_samples()`
+        # that is of the format [weight1,file_name1,weight2,file_name2,...]
+        if data_cfg.concat_sampling_probabilities is None or not isinstance(
+                data_cfg.concat_sampling_probabilities, ListConfig
+        ):
+            raise ValueError(
+                 (
+                    f"concat_sampling_probabilities must be a ListConfig with the same number of files in file_names."
+                    f"Found: {data_cfg.concat_sampling_probabilities}"
+                )
+            )
+
+        if len(data_cfg.get('concat_sampling_probabilities', None)) != len(data_cfg.file_names):
+            raise ValueError(
+                (
+                    f"concat_sampling_probabilities must be of the same size as file_names.",
+                       f"Provided size {len(data_cfg.concat_sampling_probabilities)}, number of datasets {len(data_cfg.file_names)}",
+                )
+            )
+
+        data_prefix = []
+        for weight, prefix in zip(data_cfg.concat_sampling_probabilities, data_cfg.file_names):
+            data_prefix.append(weight)
+            data_prefix.append(prefix)
+
+        num_train_samples = [max_steps * self.cfg.global_batch_size]
+        _, _, num_train_samples_per_dataset = get_datasets_weights_and_num_samples(data_prefix, num_train_samples)
+        num_train_samples_after_blend = sum([x[0] for x in num_train_samples_per_dataset])
+
+        # Check dataset max_seq_length and max_position_embeddings size
+        if (
+                self.cfg.get('position_embedding_type', None) in [None, 'learned_absolute']
+                and data_cfg.max_seq_length > self.cfg.max_position_embeddings
+        ):
+            logging.warning(
+                f"Set dataset max_seq_length to max_position_embeddings {self.cfg.max_position_embeddings} if using learned_absolute position embedding"
+            )
+            data_cfg.max_seq_length = self.cfg.max_position_embeddings
+
+        for file_path, num_samples in zip(data_cfg.file_names, num_train_samples_per_dataset):
+            if self.cfg.data.get("chat", False):
+                dataset_cls = GPTSFTChatDataset
+            else:
+                dataset_cls = GPTSFTDataset
+
+            dataset = dataset_cls(
+                file_path=file_path,
+                tokenizer=self.tokenizer,
+                max_seq_length=data_cfg.max_seq_length,
+                min_seq_length=data_cfg.min_seq_length,
+                add_bos=data_cfg.get('add_bos', False),
+                add_eos=data_cfg.get('add_eos', True),
+                add_sep=data_cfg.get('add_sep', False),
+                sep_id=None,
+                max_num_samples=num_samples[0],
+                seed=data_cfg.get('seed', 1234),
+                label_key=data_cfg.get('label_key', 'answer'),
+                answer_only_loss=self.cfg.get('answer_only_loss', True),
+                truncation_field=data_cfg.get('truncation_field', 'text'),
+                pad_to_max_length=data_cfg.get('pad_to_max_length', True),
+                index_mapping_dir=data_cfg.get('index_mapping_dir', None),
+                prompt_template=data_cfg.get('prompt_template', None),
+                virtual_tokens=0,
+                tokens_to_generate=data_cfg.get(
+                    'tokens_to_generate', 0
+                ),  # used at inference time to allocate tensor positions for tokens that will be generated by inf procedure.
+                memmap_workers=data_cfg.get(
+                    'memmap_workers', None
+                ),  # used to set num. of workers to create the memmap index files
+                hf_dataset=data_cfg.get(
+                    'hf_dataset', False
+                ),  # Whether to load the json file with the HuggingFace dataset. otherwise, will load the jsonl file with the JSONLMemMapDataset.
+                truncation_method=data_cfg.get(
+                    'truncation_method', 'right'
+                ),  # used to choose truncation method. Options: ['random', 'left', 'right']
+            )
+            datasets.append(dataset)
+
+        dataset = MemoryEfficientBlendableDataset(
+            datasets=datasets, weights=data_cfg.concat_sampling_probabilities, size=num_train_samples_after_blend
+        )
+        return dataset
+
     def setup_training_data(self, cfg):
         if hasattr(self, '_train_ds'):
             consumed_samples = self.compute_consumed_samples(0)
             logging.info(
                 f'Setting up train dataloader with len(len(self._train_ds)): {len(self._train_ds)} and consumed samples: {consumed_samples}'
             )
-            self._train_dl = self.build_pretraining_data_loader(self._train_ds, consumed_samples)
+            if self.cfg.data.get("fine_tuning", False):
+                self._train_dl = self.build_fine_tuning_data_loader(self._train_ds, cfg.train_ds)
+            else:
+                self._train_dl = self.build_pretraining_data_loader(self._train_ds, consumed_samples)
 
     def setup_validation_data(self, cfg):
         if hasattr(self, '_validation_ds'):
@@ -1045,10 +1166,12 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
             if self.cfg.data.get('pad_samples_to_global_batch_size', False):
                 logging.info('pad_samples_to_global_batch_size set to True')
                 pad_samples_to_global_batch_size = True
-
-            self._validation_dl = self.build_pretraining_data_loader(
-                self._validation_ds, consumed_samples, "validation", drop_last, pad_samples_to_global_batch_size
-            )
+            if self.cfg.data.get("fine_tuning", False):
+                self._validation_dl = self.build_fine_tuning_data_loader(self._validation_ds, cfg.validation_ds)
+            else:
+                self._validation_dl = self.build_pretraining_data_loader(
+                    self._validation_ds, consumed_samples, "validation", drop_last, pad_samples_to_global_batch_size
+                )
 
     def setup_test_data(self, cfg):
         if hasattr(self, '_test_ds'):
@@ -1056,7 +1179,36 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
             logging.info(
                 f'Setting up test dataloader with len(len(self._test_ds)): {len(self._test_ds)} and consumed samples: {consumed_samples}'
             )
-            self._test_dl = self.build_pretraining_data_loader(self._test_ds, consumed_samples)
+            if self.cfg.data.get("fine_tuning", False):
+                self._test_dl = self.build_fine_tuning_data_loader(self._test_ds, cfg.test_ds)
+            else:
+                self._test_dl = self.build_pretraining_data_loader(self._test_ds, consumed_samples)
+
+    def build_fine_tuning_data_loader(self, dataset, data_cfg, consumed_samples=0):
+        """Buld fine tuning dataloader given an input dataset."""
+
+        logging.info(f'Building fine tuning dataloader with consumed samples: {consumed_samples}')
+
+        collate_fn = dataset.datasets[0].collate_fn
+
+        batch_sampler = MegatronPretrainingBatchSampler(
+            total_samples=len(dataset),
+            consumed_samples=consumed_samples,
+            micro_batch_size=self.cfg.micro_batch_size,
+            global_batch_size=self.cfg.global_batch_size,
+            data_parallel_rank=parallel_state.get_data_parallel_rank(),
+            data_parallel_size=parallel_state.get_data_parallel_world_size(),
+            drop_last=True,
+            pad_samples_to_global_batch_size=False,
+        )
+        return torch.utils.data.DataLoader(
+            dataset,
+            batch_sampler=batch_sampler,
+            collate_fn=collate_fn,
+            num_workers=data_cfg.num_workers,
+            pin_memory=False,
+            prefetch_factor=1
+        )
 
     def generate(
         self,

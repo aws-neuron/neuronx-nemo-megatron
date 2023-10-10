@@ -52,6 +52,13 @@ try:
 except (ImportError, ModuleNotFoundError):
     HAVE_APEX = False
 
+try:
+    import torch_xla.core.xla_model as xm
+    import torch_xla.distributed.parallel_loader as pl
+    HAVE_XLA = True
+except (ImportError, ModuleNotFoundError):
+    HAVE_XLA = False
+
 
 class MegatronBertModel(MegatronBaseModel):
     """
@@ -89,8 +96,8 @@ class MegatronBertModel(MegatronBaseModel):
         self.model = build_model(model_provider_func=self.model_provider_func, wrap_with_ddp=False,)[0]
 
         if self.megatron_amp_o2:
-            if not self.with_distributed_adam:
-                self.model.cuda(torch.cuda.current_device())
+            # if not self.with_distributed_adam:
+            #     self.model.cuda(torch.cuda.current_device())
             self.model = Float16Module(module=self.model, precision=cfg.precision)
 
     def model_provider_func(self, pre_process, post_process):
@@ -125,6 +132,7 @@ class MegatronBertModel(MegatronBaseModel):
             layernorm_epsilon=cfg.get('layernorm_epsilon', 1e-5),
             masked_softmax_fusion=cfg.get('masked_softmax_fusion', True),
             bias_gelu_fusion=cfg.get('bias_gelu_fusion', True),
+            bias_dropout_add_fusion=cfg.get("bias_dropout_add_fusion", True),
             onnx_safe=cfg.get('onnx_safe', False),
             add_binary_head=cfg.bert_binary_head,
             megatron_legacy=cfg.get('megatron_legacy', False),
@@ -267,6 +275,7 @@ class MegatronBertModel(MegatronBaseModel):
                 'num_micro_batches_with_partial_activation_checkpoints', None
             ),
         )
+        xm.mark_step()
 
         if losses_reduced_per_micro_batch:
             loss_tensors_list = [loss_reduced['avg'] for loss_reduced in losses_reduced_per_micro_batch]
@@ -278,6 +287,7 @@ class MegatronBertModel(MegatronBaseModel):
         # when using sequence parallelism, the sequence parallel layernorm grads must be all-reduced
         if self.cfg.get('tensor_model_parallel_size', 1) > 1 and self.cfg.get('sequence_parallel', False):
             self.allreduce_sequence_parallel_gradients()
+        xm.mark_step()
 
         if self.with_distributed_adam:
             # gradients are reduced internally in distributed optimizer
@@ -290,12 +300,15 @@ class MegatronBertModel(MegatronBaseModel):
             # async grad allreduce is not currently implemented for O1/autocasting mixed precision training
             # so we all-reduce gradients after the pipeline
             self.allreduce_gradients()  # @sangkug we think this is causing memory to blow up (hurts perf)
+        xm.mark_step()
 
         if self.cfg.get('pipeline_model_parallel_size', 1) > 1:
             # when using pipeline parallelism the first and last stage must keep embeddings in sync
             self.allreduce_first_last_embeddings()
+        xm.mark_step()
 
         torch.distributed.broadcast(loss_mean, get_last_rank())
+        xm.mark_step()
 
         if self.cfg.precision == 16:
             loss_scale = self.trainer.precision_plugin.scaler._scale
@@ -318,6 +331,10 @@ class MegatronBertModel(MegatronBaseModel):
             )
 
         return loss_mean[0]
+
+    def on_train_batch_end(self, *args, **kwargs):
+        super().on_train_batch_end(*args, **kwargs)
+        xm.mark_step()
 
     def allreduce_first_last_embeddings(self):
 
@@ -355,6 +372,7 @@ class MegatronBertModel(MegatronBaseModel):
             dtype=self.autocast_dtype,
             sequence_parallel_enabled=self.cfg.get('sequence_parallel', False),
         )
+        xm.mark_step()
 
         if losses_reduced_per_micro_batch:
             loss_tensors_list = [loss_reduced['avg'] for loss_reduced in losses_reduced_per_micro_batch]

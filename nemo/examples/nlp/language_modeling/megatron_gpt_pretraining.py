@@ -13,13 +13,17 @@
 # limitations under the License.
 import lightning_neuron_patch
 import os
-
+import datetime
 from lightning_lite.plugins.environments import TorchElasticEnvironment
 from omegaconf.omegaconf import OmegaConf, open_dict
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks.timer import Timer
 from pytorch_lightning.trainer.connectors.checkpoint_connector import CheckpointConnector
 
+from checkpoint_conversion.convert_nemo_checkpoint_to_hf_llama import convert_checkpoint as convert_checkpoint_llama
+
+from checkpoint_conversion.convert_nemo_checkpoint_to_hf import convert_checkpoint as convert_checkpoint_gpt2
+from checkpoint_conversion.convert_nemo_checkpoint_to_hf_neox import convert_checkpoint as convert_checkpoint_neox
 from nemo.collections.nlp.models.language_modeling.megatron_gpt_model import MegatronGPTModel
 from nemo.collections.nlp.parts.nlp_overrides import (
     GradScaler,
@@ -33,13 +37,12 @@ from nemo.core.config import hydra_runner
 from nemo.utils import logging
 from nemo.utils.exp_manager import StatelessTimer, exp_manager
 
-import torch.optim.adamw as torch_adamw
-from nemo.core.optim.adamw import _single_tensor_adamw_
-torch_adamw._single_tensor_adamw = _single_tensor_adamw_
-
-
 @hydra_runner(config_path="conf", config_name="megatron_gpt_config")
 def main(cfg) -> None:
+    if cfg.enable_recovery_time_instrumentation:
+        logging.add_allowed_trace_type("recovery_time")
+        print(f"Entering main at {datetime.datetime.now()}")
+
     logging.info("\n\n************** Experiment configuration ***********")
     logging.info(f'\n{OmegaConf.to_yaml(cfg)}')
 
@@ -57,7 +60,8 @@ def main(cfg) -> None:
         find_unused_parameters=False,
         cluster_environment=cluster_environment,
         checkpoint_io=nlp_xla_checkpoint_io,
-        megatron_amp_o2=megatron_amp_o2
+        megatron_amp_o2=megatron_amp_o2,
+        restore_path=cfg.model.resume_from_checkpoint
     )
     if cfg.trainer.precision in [16, 'bf16']:
         scaler = None
@@ -97,6 +101,25 @@ def main(cfg) -> None:
 
     model = MegatronGPTModel(cfg.model, trainer)
     trainer.fit(model)
+    # Convert checkpoint to HuggingFace
+    if cfg.model.convert_to_hf and cfg.exp_manager.create_checkpoint_callback:
+        import torch_xla.core.xla_model as xm
+        if xm.get_ordinal() == 0:
+            if cfg.name == "megatron_llama":
+                logging.info("Converting LLama checkpoints to HuggingFace format")
+                checkpoint_path = os.path.join(os.getcwd(), "nemo_experiments", cfg.exp_manager.name, os.environ.get('SLURM_JOB_ID'), "checkpoints")
+                convert_checkpoint_llama(cfg.model.config_path, checkpoint_path, cfg.model.output_dir, 2.0, True)
+                logging.info("Finished converting Llama checkpoints")
+            elif cfg.name == "megatron_neox":
+                logging.info("Converting Neox checkpoints to HuggingFace format")
+                checkpoint_path = os.path.join(os.getcwd(), "nemo_experiments", cfg.exp_manager.name, os.environ.get('SLURM_JOB_ID'), "checkpoints")
+                convert_checkpoint_neox(cfg.model.config_path, checkpoint_path, cfg.model.output_dir, 2.0, True)
+                logging.info("Finished converting Llama checkpoints")
+            elif cfg.name == "megatron_gpt":
+                logging.info("Converting GPT2 checkpoints to HuggingFace format")
+                checkpoint_path = os.path.join(os.getcwd(), "nemo_experiments", cfg.exp_manager.name, os.environ.get('SLURM_JOB_ID'), "checkpoints")
+                convert_checkpoint_gpt2(cfg.model.config_path, checkpoint_path, cfg.model.output_dir, 2.0, True)
+                logging.info("Finished converting GPT2 checkpoints")
 
 if __name__ == '__main__':
     main()

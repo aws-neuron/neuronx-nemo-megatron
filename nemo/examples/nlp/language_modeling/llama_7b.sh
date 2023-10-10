@@ -8,6 +8,11 @@ export N_LAYERS=32
 export N_AH=32
 export FFN_HS=11008
 export GBS=256
+export TRAIN_ITERS=20000
+
+export INIT_METHOD_STD=0.021
+export LAYERNORM_EPSILON=1e-5
+export WARMUP_STEPS=10
 
 # pushd .
 # cd /usr/local/lib/python3.8/site-packages/nemo/collections/nlp/data/language_modeling/megatron/

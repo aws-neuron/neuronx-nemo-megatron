@@ -78,16 +78,16 @@ class CallbackParams:
     save_top_k: Optional[int] = 3
     save_weights_only: Optional[bool] = False
     mode: Optional[str] = "min"
-    every_n_epochs: Optional[int] = 1
+    every_n_epochs: Optional[int] = 0
+    every_n_train_steps: Optional[int] = None
+    train_time_interval: Optional[int] = None
     prefix: Optional[str] = None  # If None, exp_manager will attempt to handle the filepath
     postfix: str = ".nemo"
     save_best_model: bool = False
     always_save_nemo: bool = False
     save_nemo_on_train_end: Optional[bool] = True  # Whether to automatically save .nemo file durin on_train_end hook
     model_parallel_size: Optional[int] = None  # tensor parallel size * pipeline parallel size
-    train_time_interval: int = 0
-    every_n_epochs: int = 0
-    every_n_train_steps: int = 0
+    save_on_train_epoch_end: Optional[bool] = False  # Save after training, not after validation
 
 
 @dataclass
@@ -760,7 +760,6 @@ class NeMoModelCheckpoint(ModelCheckpoint):
         postfix: str = ".nemo",
         n_resume: bool = False,
         model_parallel_size: int = None,
-        train_time_interval: int = 0,
         **kwargs,
     ):
         # Parse and store "extended" parameters: save_best model and postfix.
@@ -784,8 +783,13 @@ class NeMoModelCheckpoint(ModelCheckpoint):
         else:
             self.prefix = ""
 
+        # Solve type mismatch between NeMo and PTL: https://github.com/NVIDIA/NeMo/pull/6108#issuecomment-1448998342
+        train_time_interval = kwargs.pop('train_time_interval', None)
+        if train_time_interval is not None:
+            train_time_interval = timedelta(seconds=train_time_interval)
+
         # Call the parent class constructor with the remaining kwargs.
-        super().__init__(train_time_interval=timedelta(seconds=train_time_interval), **kwargs)
+        super().__init__(train_time_interval=train_time_interval, **kwargs)
 
         if self.save_top_k != -1 and n_resume:
             logging.debug("Checking previous runs")
@@ -874,6 +878,33 @@ class NeMoModelCheckpoint(ModelCheckpoint):
             else:
                 pl_module.save_to(save_path=app_state.model_restore_path)
             return output
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        """Save checkpoint on train batch end if we meet the criteria for `every_n_train_steps`"""
+        if self._should_skip_saving_checkpoint(trainer):
+            return
+        skip_batch = self._every_n_train_steps < 1 or (trainer.global_step % self._every_n_train_steps != 0)
+
+        train_time_interval = self._train_time_interval
+        skip_time = True
+        now = time.monotonic()
+        if train_time_interval:
+            prev_time_check = self._last_time_checked
+            import torch_xla.core.xla_model as xm
+            if isinstance(prev_time_check, float):
+                decision = True if (now - prev_time_check) < train_time_interval.total_seconds() else False
+                # in case we have time differences across ranks
+                # have all ranks agree to avoid possible hangs
+                decision = trainer.strategy.reduce_boolean_decision(decision)
+            skip_time = prev_time_check is None or decision
+        if skip_batch and skip_time:
+            return
+        if not skip_time:
+            self._last_time_checked = now
+
+        monitor_candidates = self._monitor_candidates(trainer)
+        self._save_topk_checkpoint(trainer, monitor_candidates)
+        self._save_last_checkpoint(trainer, monitor_candidates)
 
     def on_train_end(self, trainer, pl_module):
         if trainer.fast_dev_run:

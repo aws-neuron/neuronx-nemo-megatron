@@ -56,7 +56,7 @@ __all__ = ["MegatronBaseModel"]
 _ALLREDUCE_BUCKET_CAP_MB = 512
 ########NEURON EDIT#############
 def bucket_allreduce(tensor_list):
-    bucket_cap = int(os.getenv('BUCKET_CAP_KB', _ALLREDUCE_BUCKET_CAP_MB))*1024*1024
+    bucket_cap = int(os.getenv('BUCKET_CAP_MB', _ALLREDUCE_BUCKET_CAP_MB))*1024*1024
     # Reverse the gradients list so that we start allreduce from the last layer
     # onwards. This allows allreduce to trigger as soon as the bucket fills up and
     # overlap with backward pass.

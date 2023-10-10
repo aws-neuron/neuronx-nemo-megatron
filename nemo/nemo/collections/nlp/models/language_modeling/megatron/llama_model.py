@@ -12,11 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""GPT-2 model."""
+"""Llama GQA model."""
 
 import torch
-from nemo.utils import logging
+
 from nemo.collections.nlp.modules.common.megatron.language_model import get_language_model
+from nemo.collections.nlp.modules.common.megatron.llama_module import get_llama_language_model
 from nemo.collections.nlp.modules.common.megatron.module import MegatronModule
 from nemo.collections.nlp.modules.common.megatron.utils import (
     ApexGuardDefaults,
@@ -107,7 +108,7 @@ def post_language_model_processing(
         return loss, logits
 
 
-class GPTModel(MegatronModule):
+class LlamaModel(MegatronModule):
     """GPT-2 Language model."""
 
     def __init__(
@@ -147,9 +148,9 @@ class GPTModel(MegatronModule):
         headscale=False,
         transformer_block_type='pre_ln',
         normalize_attention_scores=True,
-        position_embedding_type='learned_absolute',
+        position_embedding_type='rope',
         rotary_percentage=1.0,
-        attention_type='multihead',
+        attention_type='multiquery',
         share_embeddings_and_output_weights=True,
         gradient_accumulation_fusion=False,
         persist_layer_norm=False,
@@ -168,10 +169,10 @@ class GPTModel(MegatronModule):
         use_emha=False,
         multi_query_attention=False,
         save_logits=False,
-        position_interpolation_factor=1.0,
+        num_kv_heads=None,
     ):
 
-        super(GPTModel, self).__init__(share_token_embeddings=share_embeddings_and_output_weights)
+        super(LlamaModel, self).__init__(share_token_embeddings=share_embeddings_and_output_weights)
 
         self.parallel_output = parallel_output
         self.pre_process = pre_process
@@ -193,10 +194,7 @@ class GPTModel(MegatronModule):
             if use_scaled_init_method
             else init_method_normal(init_method_std)
         )
-
-        logging.trace(f"In GPTModel._init_() enter get_language_model()", trace_type="recovery_time")
-
-        self.language_model, self._language_model_key = get_language_model(
+        self.language_model, self._language_model_key = get_llama_language_model(
             vocab_size=vocab_size,
             hidden_size=hidden_size,
             hidden_dropout=hidden_dropout,
@@ -253,10 +251,8 @@ class GPTModel(MegatronModule):
             reduce_amax=reduce_amax,
             use_emha=use_emha,
             multi_query_attention=multi_query_attention,
-            position_interpolation_factor=position_interpolation_factor,
+            num_kv_heads=num_kv_heads,
         )
-
-        logging.trace(f"In GPTModel._init_() leave get_language_model()", trace_type="recovery_time")
 
         if self.share_embeddings_and_output_weights:
             self.initialize_word_embeddings(
