@@ -22,7 +22,7 @@ ftfy
 gdown
 inflect
 jieba
-opencc
+opencc==1.1.6
 pangu
 rapidfuzz
 pybind11
