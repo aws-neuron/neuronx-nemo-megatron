@@ -54,6 +54,7 @@ try:
     #(TODO)getting global worldsize, change to local, assuming TP only for now
     torch.cuda.device_count = lambda : xm.xrt_world_size()
     torch.cuda.set_device = lambda x: None
+    torch.cuda.is_available = lambda : False
     HAVE_XLA=True
 except:
     HAVE_XLA=False

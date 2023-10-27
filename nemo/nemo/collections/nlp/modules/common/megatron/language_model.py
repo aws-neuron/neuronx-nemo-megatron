@@ -14,7 +14,7 @@
 
 """Transformer based language model."""
 import torch
-
+from nemo.utils import logging
 from nemo.collections.nlp.modules.common.megatron.layer_type import LayerType
 from nemo.collections.nlp.modules.common.megatron.module import MegatronModule
 from nemo.collections.nlp.modules.common.megatron.rotary_pos_embedding import RotaryEmbedding
@@ -99,6 +99,7 @@ def get_language_model(
     fp8_amax_compute_algo='most_recent',
     reduce_amax=True,
     use_emha=False,
+    position_interpolation_factor=1.0,
 ):
     """Build language model and return along with the key to save."""
 
@@ -114,6 +115,7 @@ def get_language_model(
     if scaled_init_method is None:
         scaled_init_method = scaled_init_method_normal(init_method_std, num_layers)
 
+    logging.trace(f"In get_language_model() enter TransformerLanguageModel()", trace_type="recovery_time")
     # Language model.
     language_model = TransformerLanguageModel(
         init_method=init_method,
@@ -173,7 +175,10 @@ def get_language_model(
         fp8_amax_compute_algo=fp8_amax_compute_algo,
         reduce_amax=reduce_amax,
         use_emha=use_emha,
+        position_interpolation_factor=position_interpolation_factor,
     )
+    logging.trace(f"In get_language_model() leave TransformerLanguageModel()", trace_type="recovery_time")
+
     # key used for checkpoints.
     language_model_key = 'language_model'
 
@@ -472,6 +477,7 @@ class TransformerLanguageModel(MegatronModule):
         fp8_amax_compute_algo='most_recent',
         reduce_amax=True,
         use_emha=False,
+        position_interpolation_factor=1.0,
     ):
         super(TransformerLanguageModel, self).__init__(share_token_embeddings=share_embeddings_and_output_weights)
 
@@ -490,8 +496,11 @@ class TransformerLanguageModel(MegatronModule):
         self.hidden_dropout = hidden_dropout
         self.output_layer_init_method = output_layer_init_method
         self.position_embedding_type = position_embedding_type
+        self.position_interpolation_factor = position_interpolation_factor
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
         self.sequence_parallel = sequence_parallel
+        self.rotary_percentage=rotary_percentage
+        assert 0 < rotary_percentage <= 1
 
         if kv_channels is None:
 
@@ -502,6 +511,7 @@ class TransformerLanguageModel(MegatronModule):
 
         # Embeddings.
         if self.pre_process:
+            logging.trace(f"In TransformerLanguageModel() enter Embedding()", trace_type="recovery_time")
             self.embedding = Embedding(
                 hidden_size=self.hidden_size,
                 vocab_size=self.vocab_size,
@@ -514,6 +524,7 @@ class TransformerLanguageModel(MegatronModule):
                 position_embedding_type=position_embedding_type,
                 fp32_residual_connection=fp32_residual_connection,
             )
+            logging.trace(f"In TransformerLanguageModel() leave Embedding()", trace_type="recovery_time")
             self._embedding_key = 'embedding'
         # Move Rope to core attention
         # TODO: check perf penalty vs original Nemo implementation
@@ -524,6 +535,7 @@ class TransformerLanguageModel(MegatronModule):
         #         rotary_dim = int(rotary_dim * rotary_percentage)
         #     self.rotary_pos_emb = RotaryEmbedding(rotary_dim)
         # Transformer.
+        logging.trace(f"In TransformerLanguageModel() create encoder begin", trace_type="recovery_time")
         self.encoder = ParallelTransformer(
             init_method=self.init_method,
             output_layer_init_method=self.output_layer_init_method,
@@ -573,8 +585,12 @@ class TransformerLanguageModel(MegatronModule):
             fp8_amax_compute_algo=fp8_amax_compute_algo,
             reduce_amax=reduce_amax,
             use_emha=use_emha,
-            position_embedding_type=self.position_embedding_type
+            position_embedding_type=self.position_embedding_type,
+            position_interpolation_factor=self.position_interpolation_factor,
+            max_position_embeddings=self.max_position_embeddings,
+            rotary_percentage=self.rotary_percentage,
         )
+        logging.trace(f"In TransformerLanguageModel() create encoder done", trace_type="recovery_time")
         self._encoder_key = 'encoder'
 
         # Decoder
@@ -613,6 +629,9 @@ class TransformerLanguageModel(MegatronModule):
                 activations_checkpoint_granularity=activations_checkpoint_granularity,
                 activations_checkpoint_layers_per_pipeline=activations_checkpoint_layers_per_pipeline,
                 transformer_engine=transformer_engine,
+                position_interpolation_factor=self.position_interpolation_factor,
+                max_position_embeddings=self.max_position_embeddings,
+                rotary_percentage=self.rotary_percentage,
             )
             self._decoder_key = 'decoder'
 

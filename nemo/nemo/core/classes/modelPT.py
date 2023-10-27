@@ -53,7 +53,7 @@ __all__ = ['ModelPT']
 class NLPLightningModule(LightningModule):
     def __to_tensor(self, value: Union[torch.Tensor, numbers.Number], name: str) -> Tensor:
         value = (
-            value.clone().detach() #MURANDOO
+            value.clone().detach()
             if isinstance(value, torch.Tensor)
             else torch.tensor(value)
         )

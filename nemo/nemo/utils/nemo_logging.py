@@ -74,6 +74,7 @@ class Logger(metaclass=Singleton):
         self._define_logger(capture_warnings)
         self.once_logged = set()
         self.rank = 0 if is_global_rank_zero() else "UNK"
+        self._allowed_trace_types = []
 
     def _define_logger(self, capture_warnings=True):
         """ Creates the logger if not already created. Called in init"""
@@ -367,6 +368,13 @@ class Logger(metaclass=Singleton):
         """
         if self._logger is not None and self._logger.isEnabledFor(Logger.DEBUG) and not self._logged_once(msg, mode):
             self._logger._log(Logger.DEBUG, msg, args, **kwargs)
+
+    def add_allowed_trace_type(self, trace_type):
+        self._allowed_trace_types.append(trace_type)
+
+    def trace(self, msg, trace_type, *args, mode=LogMode.EACH, **kwargs):
+        if trace_type in self._allowed_trace_types:
+            self.info(trace_type + " : " + msg)
 
     def info(self, msg, *args, mode=LogMode.EACH, **kwargs):
         """

@@ -15,9 +15,14 @@ wget -qO - https://apt.repos.neuron.amazonaws.com/GPG-PUB-KEY-AMAZON-AWS-NEURON.
 sudo apt-get update -y && sudo apt-get install -y linux-headers-$(uname -r)
 
 # Install Neuron OS packages and dependencies
-sudo apt-get install -y aws-neuronx-dkms aws-neuronx-tools python3.8-venv python3.8-dev g++ \
+sudo apt-get install -y aws-neuronx-dkms aws-neuronx-tools \
 	    aws-neuronx-collectives=2.* aws-neuronx-runtime-lib=2.*
 
 TOKEN=`curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600"` && INSTANCE_ID=$(curl -H "X-aws-ec2-metadata-token: $TOKEN" -s  http://169.254.169.254/latest/meta-data/instance-id)
-echo "instace_id:$INSTANCE_ID hostname:$(hostname)"
+echo "instance_id:$INSTANCE_ID hostname:$(hostname)"
+echo "runtime versions"
+sudo apt list | grep neuron | grep installed
+
+echo "compiler versions"
+pip list | grep neuron
 

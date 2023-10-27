@@ -20,41 +20,60 @@ from torch import einsum, nn
 __all__ = ['RotaryEmbedding', 'apply_rotary_pos_emb']
 
 
-class RotaryEmbedding(nn.Module):
-    def __init__(self, dim):
+class RotaryEmbedding(torch.nn.Module):
+    def __init__(self, 
+        dim, 
+        max_position_embeddings=4096, 
+        base=10000, 
+        device=None, 
+        position_interpolation_factor=1.0, 
+        rotary_percentage=1.0,
+        ):
         super().__init__()
-        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
-        self.register_buffer('inv_freq', inv_freq)
+        if rotary_percentage<1:
+            rot_dim = int(dim * rotary_percentage)
+        else:
+            rot_dim = dim
+        pass_dim = dim - rot_dim
+        inv_freq = 1.0 / (base ** (torch.arange(0, rot_dim, 2).float() / rot_dim))
+        self.register_buffer("inv_freq", inv_freq)
+        self.position_interpolation_factor = position_interpolation_factor
+        # Build here to make `torch.jit.trace` work.
+        self.max_seq_len_cached = max_position_embeddings
+        if pass_dim>0:
+        # first part even vector components, second part odd vector components, third part passing dimensions (without rotation)
+        # 2 * dim in dimension size + pass dimension
+            freq_all = torch.cat((self.inv_freq, self.inv_freq, torch.zeros((pass_dim,)).float()))
+        else:
+            # first part even vector components, second part odd vector components,
+            #  2 * dim in dimension size
+            freq_all = torch.cat((self.inv_freq, self.inv_freq))
+        t = torch.arange(self.max_seq_len_cached, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
+        if self.position_interpolation_factor and self.position_interpolation_factor != 1:
+            t /= self.position_interpolation_factor
+        # Different from paper, but it uses a different permutation in order to obtain the same calculation
+        emb = torch.einsum("i,j->ij", t, freq_all)
+        # emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer("cos_cached", emb.cos()[:, None, None, :], persistent=False)
+        self.register_buffer("sin_cached", emb.sin()[:, None, None, :], persistent=False)
 
-    def forward(self, max_seq_len, offset=0):
-        seq = torch.arange(max_seq_len, device=self.inv_freq.device) + offset
-        freqs = einsum('i , j -> i j', seq.type_as(self.inv_freq), self.inv_freq)
-        # first part even vector components, second part odd vector components,
-        #  2 * dim in dimension size
-        emb = torch.cat((freqs, freqs), dim=-1)
-        # emb [seq_length, .., dim]
-        return rearrange(emb, 'n d -> n 1 1 d')
+    def forward(self, x, seq_len=None):
+        return (
+            self.cos_cached[:seq_len, ...].to(dtype=x.dtype),
+            self.sin_cached[:seq_len, ...].to(dtype=x.dtype),
+        )
 
 
-def _rotate_half(x):
-    """
-    change sign so the last dimension becomes [-odd, +even]
-    """
+def rotate_half(x):
+    """Rotates half the hidden dims of the input."""
     x = rearrange(x, '... (j d) -> ... j d', j=2)
     x1, x2 = x.unbind(dim=-2)
     return torch.cat((-x2, x1), dim=-1)
 
 
-def apply_rotary_pos_emb(t, freqs):
-    """
-    input tensor t is of shape [seq_length, ..., dim]
-    rotary positional embeding tensor freqs is of shape [seq_length, ..., dim]
-    check https://kexue.fm/archives/8265 for detailed formulas
-    """
-    rot_dim = freqs.shape[-1]
-    # ideally t_pass is empty so rotary pos embedding is applied to all tensor t
-    t, t_pass = t[..., :rot_dim], t[..., rot_dim:]
-    # first part is cosine component
-    # second part is sine component, need to change signs with _rotate_half method
-    t = (t * freqs.cos()) + (_rotate_half(t) * freqs.sin())
-    return torch.cat((t, t_pass), dim=-1)
+def apply_rotary_pos_emb(q, k, cos, sin, offset: int = 0):
+    cos = cos[offset: q.shape[0] + offset, ...]
+    sin = sin[offset: q.shape[0] + offset, ...]
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed

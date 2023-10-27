@@ -99,8 +99,6 @@ except (ImportError, ModuleNotFoundError):
 
     HAVE_APEX = False
 
-USING_TORCH_VERSION2 = torch.__version__.startswith('2')
-
 from lightning_lite.utilities.data import has_iterable_dataset as new_has_iterable_dataset
 
 def has_len_all_ranks_patched(dataloader, strategy, model,) -> bool:
@@ -787,10 +785,7 @@ class NLPTrainer(Trainer):
                 if self.state.fn == TrainerFn.FITTING:
                     # restore callback states
                     self._checkpoint_connector.restore_callbacks()
-            if USING_TORCH_VERSION2:
-                torch.distributed.monitored_barrier(group=self.strategy.gloo_group)
-            else:
-                xm.rendezvous(f'load-chkpt-phase-{i}')
+            xm.rendezvous(f'load-chkpt-phase-{i}')
 
     def reset_train_dataloader(self, model: Optional["pl.LightningModule"] = None) -> None:
         """Resets the train dataloader and initialises required variables (number of batches, when to validate,
@@ -925,6 +920,7 @@ class NLPDDPStrategy(TPUSpawnStrategy):
         debug: bool = False,
         no_ddp_communication_hook: bool = False,
         megatron_amp_o2: bool=False,
+        restore_path=None,
         **_: Any,
     ) -> None:
         if not _XLA_AVAILABLE:
@@ -948,6 +944,7 @@ class NLPDDPStrategy(TPUSpawnStrategy):
         self._launched = False
         self.no_ddp_communication_hook = no_ddp_communication_hook
         self.megatron_amp_o2 = megatron_amp_o2
+        self.restore_path = restore_path
 
     def _configure_launcher(self) -> None:
         self._launcher = _NLPXLALauncher(self)
@@ -961,9 +958,7 @@ class NLPDDPStrategy(TPUSpawnStrategy):
             global_rank = xm.get_ordinal()
         if (os.environ.get("PJRT_DEVICE", None) == "NEURON"):
             import torch_xla.experimental.pjrt_backend
-            import torch_xla.experimental.pjrt as pjrt
             dist.init_process_group('xla', init_method="pjrt://", rank=global_rank)
-            self.gloo_group = dist.new_group(backend="gloo")
         else:
             dist.init_process_group('xla', rank=global_rank)
         # call PTL init ddp
@@ -1114,10 +1109,7 @@ class NLPDDPStrategy(TPUSpawnStrategy):
                     cpu_data = xm._maybe_convert_to_cpu({k: v for k, v in checkpoint.items() if k != "callbacks"}, convert=True)
                     ensure_directory_exists(filepath)
                     torch.save(cpu_data, filepath)
-                if USING_TORCH_VERSION2:
-                    torch.distributed.monitored_barrier(group=self.gloo_group)
-                else:
-                    xm.rendezvous(f'chktp-save-{tp_rank}')
+                xm.rendezvous(f'chktp-save-{tp_rank}')
 
     def load_model_state_dict(self, checkpoint: Mapping[str, Any]) -> None:
         # Release strict state dict matching when using Megatron AMP-O2 to skip matching
@@ -1177,14 +1169,18 @@ class NLPDDPStrategy(TPUSpawnStrategy):
         # PTL override to accomodate model parallel checkpoints
         filepath = inject_model_parallel_rank(filepath)
         if self.is_global_zero or app_state.data_parallel_rank == 0:
-            logging.info(f'Removing checkpoint: {filepath}')
-            self.checkpoint_io.remove_checkpoint(filepath)
-            if self.is_save_type_xser():
-                if os.path.exists(f"{filepath}.tensors"):
-                    try:
-                        shutil.rmtree(f"{filepath}.tensors")
-                    except:
-                        pass  # Swallow the FileNotFoundError
+            if not self.restore_path or filepath != inject_model_parallel_rank(self.restore_path):
+                logging.info(f'Removing checkpoint: {filepath}')
+                try:
+                    self.checkpoint_io.remove_checkpoint(filepath)
+                except:
+                    pass  # Swallow any exceptions
+                if self.is_save_type_xser():
+                    if os.path.exists(f"{filepath}.tensors"):
+                        try:
+                            shutil.rmtree(f"{filepath}.tensors")
+                        except:
+                            pass  # Swallow any exceptions
 
     @property
     def distributed_sampler_kwargs(self):
@@ -1242,7 +1238,6 @@ class NLPDDPStrategy(TPUSpawnStrategy):
         xm.mark_step()
 
         torch.distributed.all_reduce(output, op=torch.distributed.ReduceOp.SUM)
-
         if isinstance(reduce_op, str) and reduce_op.lower() in ("avg", "mean"):
             output = output / self.world_size
 
