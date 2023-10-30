@@ -22,8 +22,6 @@ source ./train_setup.sh
 
 echo "SEQ_LEN=$SEQ_LENGTH, HS=$HS, FFN_HS=$FFN_HS TP=$TP PP=$PP N_LAYERS=$N_LAYERS N_AH=$N_AH GBS=$GBS UBS=$UBS TRAIN_ITERS=$TRAIN_ITERS"
 
-LOG_PATH=logs/$SLURM_JOB_ID/$NODEID/
-mkdir -p $LOG_PATH
 
 $MAYBE_COMPILE torchrun $DISTRIBUTED_ARGS megatron_gpt_pretraining.py  \
     --config-path=conf \
@@ -74,8 +72,9 @@ $MAYBE_COMPILE torchrun $DISTRIBUTED_ARGS megatron_gpt_pretraining.py  \
     exp_manager.resume_if_exists=False \
     exp_manager.resume_ignore_no_checkpoint=False \
     exp_manager.create_checkpoint_callback=$CHECKPOINT_CALLBACK \
+    exp_manager.explicit_log_dir=$EXPLICIT_LOGDIR \
     +exp_manager.checkpoint_callback_params.train_time_interval=36000 \
-    model.use_cpu_initialization=True   2>&1  | tee  $LOG_PATH/log
+    model.use_cpu_initialization=True   2>&1  | tee -a $LOG_PATH/log
 
 # Note: to resume training using a checkpoint, please add the following configuration above, adjusting for your checkpoint path
 #    model.use_cpu_initialization=False \

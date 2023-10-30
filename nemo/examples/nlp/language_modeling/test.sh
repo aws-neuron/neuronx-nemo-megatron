@@ -71,7 +71,7 @@ $MAYBE_COMPILE torchrun $DISTRIBUTED_ARGS megatron_gpt_pretraining.py  \
     exp_manager.create_checkpoint_callback=$CHECKPOINT_CALLBACK \
     exp_manager.explicit_log_dir=$EXPLICIT_LOGDIR \
     +exp_manager.checkpoint_callback_params.train_time_interval=3600 \
-    model.use_cpu_initialization=True   2>&1  | tee  $LOG_PATH/log
+    model.use_cpu_initialization=True   2>&1  | tee -a $LOG_PATH/log
 
 # Note: to resume training using a checkpoint, please add the following configuration above, adjusting for your checkpoint path
 #    +model.load_xser=True \
