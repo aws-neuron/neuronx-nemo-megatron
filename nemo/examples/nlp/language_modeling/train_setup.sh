@@ -4,8 +4,6 @@ set -e
 
 ulimit -n 65535
 
-sudo sysctl -w net.ipv4.ip_local_reserved_ports=41000
-
 export FI_EFA_USE_DEVICE_RDMA=1
 export FI_PROVIDER=efa
 export FI_EFA_FORK_SAFE=1
@@ -13,6 +11,7 @@ export FI_EFA_FORK_SAFE=1
 if [ -v SLURM_NNODES ]
 then
     # SLURM runs
+    sudo sysctl -w net.ipv4.ip_local_reserved_ports=41000
     IPS=""
     for h in $(scontrol show hostname); do
         IPS="$IPS $(nslookup $h  | awk '/^Address: / { print $2 }')";
@@ -26,6 +25,7 @@ then
     : ${SLURM_RESTART_COUNT:=0}
     LOG_PATH=logs/$SLURM_JOB_ID/$SLURM_RESTART_COUNT/$NODEID/
     mkdir -p $LOG_PATH
+    export NEURON_COMPILE_CACHE_URL="$HOME/neuron_cache" # Place cache on shared storage to reduce redundant compilations
     # Make sure to install latest runtime
     ./setup.sh   2>&1  | tee  $LOG_PATH/setup.log
 elif [ -v OMPI_COMM_WORLD_RANK ]
@@ -39,6 +39,7 @@ then
     export EXPLICIT_LOGDIR=/shared/nemo_experiments/$POD_UID
     LOG_PATH=$EXPLICIT_LOGDIR/$NODEID/
     mkdir -p $LOG_PATH
+    export NEURON_COMPILE_CACHE_URL="/shared/neuron_cache" # Place cache on shared storage to reduce redundant compilations
 else
     # Single-node, non-SLURM, non-MPI runs
     HOSTS=(localhost)
@@ -97,7 +98,6 @@ else
     echo Incorrect Training Precision Provided
 fi
 
-export NEURON_COMPILE_CACHE_URL="$HOME/neuron_cache" # Place cache on shared storage to reduce redundant compilations
 
 
 export CREATE_TB_LOGGER=True

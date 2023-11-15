@@ -1,5 +1,6 @@
-FROM public.ecr.aws/lts/ubuntu:20.04_stable
-ARG PIP="python3.8 -m pip"
+FROM public.ecr.aws/lts/ubuntu:22.04_stable
+ARG PYTHON="python3.10"
+ARG PIP="${PYTHON} -m pip"
 ARG DEBIAN_FRONTEND=noninteractive
 
 # Neuron repos
@@ -44,8 +45,8 @@ RUN apt-get update \
     gnupg2 \
     gpg-agent \
     pciutils \
-    python3.8-full \
-    python3.8-dev \
+    ${PYTHON}-full \
+    ${PYTHON}-dev \
     cython3 \
     inetutils-ping \
     google-perftools \
@@ -79,13 +80,13 @@ RUN echo "deb $APT_REPO focal main" > /etc/apt/sources.list.d/neuron.list \
     && apt-get clean
 
 WORKDIR /
-RUN curl https://bootstrap.pypa.io/get-pip.py -o get-pip.py && python3.8 get-pip.py && python3.8 -m pip install --upgrade pip
+RUN curl https://bootstrap.pypa.io/get-pip.py -o get-pip.py && $PYTHON get-pip.py && $PIP install --upgrade pip
 RUN mkdir -p /etc/pki/tls/certs && cp /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt
 
 # PyTorch Neuron packages (2.12)
-RUN ${PIP} config set global.extra-index-url $PIP_REPO \
-    && ${PIP} install --force-reinstall torch-neuronx==1.13.1.* neuronx-cc==2.8.* \
-    && ${PIP} install --no-cache-dir -U python-etcd \
+RUN $PIP config set global.extra-index-url $PIP_REPO \
+    && $PIP install --force-reinstall torch-neuronx==1.13.1.* neuronx-cc==2.* \
+    && $PIP install --no-cache-dir -U python-etcd \
     && rm -fr /root/.cache/
 
 # Install packages and configure SSH for MPI operator in k8s
@@ -104,15 +105,15 @@ RUN echo "export PATH=/opt/aws/neuron/bin:\$PATH" >> /root/.bashrc \
 
 # Install Nemo, Apex, and related packages
 COPY ./build/ /nemo_packages
-RUN cd /nemo_packages && ${PIP} install \
-    nemo_toolkit-1.14.0-py3-none-any.whl['all'] \
-    apex-0.1-py3-none-any.whl \
-    torch==1.13.* protobuf==3.20.3 \
+COPY ./requirements.txt /nemo_packages
+RUN cd /nemo_packages \
+    && $PIP install *.whl \
+    && $PIP install -r requirements.txt torch==1.13.1 protobuf==3.20.3 \
     && rm -fr /root/.cache/
 
 # Add Nemo and allreduce examples
 COPY ./nemo/examples/ /nemo_examples
-RUN cd /usr/local/lib/python3.8/dist-packages/nemo/collections/nlp/data/language_modeling/megatron/ && make -C .
+RUN cd /usr/local/lib/${PYTHON}/dist-packages/nemo/collections/nlp/data/language_modeling/megatron/ && make -C .
 COPY ./k8s/docker/allreduce* /nemo_examples/nlp/language_modeling
 
 # nodelist_helper.py is required for MPI runs on EKS

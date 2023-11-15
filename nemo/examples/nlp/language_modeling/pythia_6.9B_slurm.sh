@@ -96,6 +96,7 @@ export GBS=256
 : ${N_LAYERS:=32}
 : ${N_AH:=32}
 : ${UBS:=2}
+: ${ACTIVATION=full}
 export FFN_HS=$(($HS*4))
 AL=1
 echo "SEQ_LEN=$SEQ_LENGTH, HS=$HS, FFN_HS=$FFN_HS TP=$TP PP=$PP N_LAYERS=$N_LAYERS N_AH=$N_AH AL=$AL GBS=$GBS UBS=$UBS"
@@ -160,7 +161,7 @@ torchrun $DISTRIBUTED_ARGS megatron_gpt_pretraining.py \
     model.optim.sched.constant_steps=0 \
     model.optim.sched.min_lr=1.2e-5 \
     model.sequence_parallel=True  \
-    model.activations_checkpoint_granularity=full \
+    model.activations_checkpoint_granularity=$ACTIVATION \
     model.activations_checkpoint_method=uniform \
     model.activations_checkpoint_num_layers=$AL \
     +model.save_xser=True \

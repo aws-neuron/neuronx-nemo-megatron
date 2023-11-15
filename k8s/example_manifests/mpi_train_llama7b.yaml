@@ -1,7 +1,7 @@
 apiVersion: kubeflow.org/v2beta1
 kind: MPIJob
 metadata:
-  name: test-mpi-compile
+  name: test-mpi-train
 spec:
   slotsPerWorker: 1
   runPolicy:
@@ -35,8 +35,7 @@ spec:
              - PATH
              - -x
              - POD_UID
-             - neuron_parallel_compile
-             - ./gpt_23b.sh
+             - ./llama_7b.sh
            initContainers:
            - name: wait-hostfilename
              image: <aws-account-id>.dkr.ecr.us-west-2.amazonaws.com/neuronx_nemo:latest

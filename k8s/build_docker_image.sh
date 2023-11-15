@@ -1,5 +1,8 @@
 #!/bin/bash
-# Build a Neuron container for running neuronx-nemo-megatron jobs on EKS
+# Build a Neuron container image for running neuronx-nemo-megatron jobs on EKS,
+# and push the image to ECR
+# This script must be run from the root of the neuronx-nemo-megatron repo
+#   Ex: ./k8s/build_docker_image.sh
 export DOCKER_BUILDKIT=1
 
 # First build the Nemo and Apex wheels
