@@ -15,7 +15,7 @@
 """GPT-2 model."""
 
 import torch
-from nemo.utils import logging
+
 from nemo.collections.nlp.modules.common.megatron.language_model import get_language_model
 from nemo.collections.nlp.modules.common.megatron.module import MegatronModule
 from nemo.collections.nlp.modules.common.megatron.utils import (
@@ -168,7 +168,6 @@ class GPTModel(MegatronModule):
         use_emha=False,
         multi_query_attention=False,
         save_logits=False,
-        position_interpolation_factor=1.0,
     ):
 
         super(GPTModel, self).__init__(share_token_embeddings=share_embeddings_and_output_weights)
@@ -193,9 +192,6 @@ class GPTModel(MegatronModule):
             if use_scaled_init_method
             else init_method_normal(init_method_std)
         )
-
-        logging.trace(f"In GPTModel._init_() enter get_language_model()", trace_type="recovery_time")
-
         self.language_model, self._language_model_key = get_language_model(
             vocab_size=vocab_size,
             hidden_size=hidden_size,
@@ -253,10 +249,7 @@ class GPTModel(MegatronModule):
             reduce_amax=reduce_amax,
             use_emha=use_emha,
             multi_query_attention=multi_query_attention,
-            position_interpolation_factor=position_interpolation_factor,
         )
-
-        logging.trace(f"In GPTModel._init_() leave get_language_model()", trace_type="recovery_time")
 
         if self.share_embeddings_and_output_weights:
             self.initialize_word_embeddings(

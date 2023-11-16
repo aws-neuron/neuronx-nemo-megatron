@@ -62,7 +62,6 @@ except (ImportError, ModuleNotFoundError):
 
     HAVE_APEX = False
 
-import torch_xla.core.xla_model as xm
 
 DSET_TYPE_BERT = 'standard_bert'
 DSET_TYPE_ICT = 'ict'
@@ -1246,7 +1245,16 @@ def get_samples_mapping(
         logging.info(
             ' > elasped time to build and save samples mapping ' '(seconds): {:4f}'.format(time.time() - start_time)
         )
-    xm.rendezvous("Building samples mapping.")
+
+    torch.distributed.barrier()
+    counts = torch.cuda.LongTensor([1])
+    torch.distributed.all_reduce(counts, group=parallel_state.get_data_parallel_group())
+    torch.distributed.all_reduce(counts, group=parallel_state.get_pipeline_model_parallel_group())
+    assert counts[0].item() == (
+        torch.distributed.get_world_size()
+        // torch.distributed.get_world_size(group=parallel_state.get_tensor_model_parallel_group())
+    )
+
     # Load indexed dataset.
     logging.info(' > loading indexed mapping from {}'.format(indexmap_filename))
     start_time = time.time()

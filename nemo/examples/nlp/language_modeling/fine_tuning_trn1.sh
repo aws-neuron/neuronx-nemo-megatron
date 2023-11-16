@@ -50,29 +50,31 @@ export NEURON_TRANSFER_WITH_STATIC_RING_OPS=""
 export MALLOC_ARENA_MAX=128
 
 export XLA_USE_BF16=1
-export NEURON_CC_FLAGS="--model-type transformer --enable-mixed-precision-accumulation --enable-experimental-O1 --distribution-strategy=nemo --cache_dir=$HOME/neuron_cache/llama/`hostname`"
+export NEURON_CC_FLAGS="--model-type transformer --enable-mixed-precision-accumulation --enable-experimental-O1 --distribution-strategy=nemo --cache_dir=$NEURON_CACHE_DIR"
 export TF_NUM_INTEROP_THREADS=8192
 
-export TRAIN_ITERS=20000
 CREATE_TB_LOGGER=True
+CHECKPOINT_CALLBACK=True
 if [ "$NEURON_EXTRACT_GRAPHS_ONLY" = "1" ]; then
     export TRAIN_ITERS=3
     CREATE_TB_LOGGER=False
+    CHECKPOINT_CALLBACK=False
 fi
 
-: ${SEQ_LENGTH:=2048}
-: ${HS:=4096}
+: ${SEQ_LENGTH:=4096}
 : ${TP:=8}
 : ${PP:=1}
-: ${N_LAYERS:=32}
-: ${N_AH:=32}
 : ${UBS:=1}
-: ${FFN_HS:=11008}
-: ${GBS:=256}
-echo "SEQ_LEN=$SEQ_LENGTH, HS=$HS, FFN_HS=$FFN_HS TP=$TP PP=$PP N_LAYERS=$N_LAYERS N_AH=$N_AH GBS=$GBS UBS=$UBS"
+: ${GBS:=512}
+echo "SEQ_LEN=$SEQ_LENGTH, HS=$HS, FFN_HS=$FFN_HS TP=$TP PP=$PP N_LAYERS=$N_LAYERS N_AH=$N_AH GBS=$GBS UBS=$UBS MIN_LR=$MIN_LR"
+echo "INIT_METHOD_STD=$INIT_METHOD_STD, HIDDEN_DROPOUT=$HIDDEN_DROPOUT, LAYERNORM_EPSILON=$LAYERNORM_EPSILON, OPTIM_NAME=$OPTIM_NAME, OPTIM_LR=$OPTIM_LR"
+echo "OPTIM_WEIGHT_DECAY=$OPTIM_WEIGHT_DECAY, OPTIM_SCHED_NAME=$OPTIM_SCHED_NAME"
+
 
 LOG_PATH=logs/$SLURM_JOB_ID/$NODEID/
 mkdir -p $LOG_PATH
+
+
 
 torchrun $DISTRIBUTED_ARGS megatron_gpt_pretraining.py  \
     --config-path=conf \
@@ -87,7 +89,7 @@ torchrun $DISTRIBUTED_ARGS megatron_gpt_pretraining.py  \
     trainer.limit_test_batches=1 \
     trainer.accumulate_grad_batches=1 \
     trainer.precision=32 \
-    model.tokenizer.type='/root/scripts/example_datasets/llamav2_weights/7b-hf' \
+    model.tokenizer.type=$PATH_TO_TOKENIZER \
     model.micro_batch_size=$UBS \
     model.global_batch_size=$GBS \
     model.tensor_model_parallel_size=$TP \
@@ -100,19 +102,19 @@ torchrun $DISTRIBUTED_ARGS megatron_gpt_pretraining.py  \
     model.num_attention_heads=$N_AH \
     model.init_method_std=0.021 \
     model.hidden_dropout=0 \
-    model.layernorm_epsilon=1e-5 \
-    model.data.data_prefix=[1.0,/root/scripts/data/books/book.jsonl-processed_text_document] \
+    model.layernorm_epsilon=$LAYERNORM_EPSILON \
+    model.data.data_prefix=[1.0,/opt/ml/code/tmp/tokenized_data_text_document] \
     model.data.num_workers=1 \
     model.data.seq_length=$SEQ_LENGTH \
-    model.data.splits_string=\'980,10,10\' \
+    model.data.splits_string=$VALIDATON_SPLIT_RATIO \
     model.optim.name=adamw \
-    model.optim.lr=3.0e-4 \
-    model.optim.betas=[0.9,0.95] \
-    model.optim.weight_decay=0.1 \
-    model.optim.sched.name=CosineAnnealing \
-    model.optim.sched.warmup_steps=10 \
-    model.optim.sched.constant_steps=0 \
-    model.optim.sched.min_lr=3.0e-5 \
+    model.optim.lr=$OPTIM_LR \
+    model.optim.betas=[$ADAM_BETA1,$ADAM_BETA2] \
+    model.optim.weight_decay=$OPTIM_WEIGHT_DECAY \
+    model.optim.sched.name=$OPTIM_SCHED_NAME \
+    model.optim.sched.warmup_steps=$OPTIM_WARMUP_STEPS \
+    model.optim.sched.constant_steps=$OPTIM_CONSTANT_STEPS \
+    model.optim.sched.min_lr=$MIN_LR \
     model.optim.capturable=True \
     model.sequence_parallel=True  \
     model.activations_checkpoint_granularity=full \
@@ -122,13 +124,11 @@ torchrun $DISTRIBUTED_ARGS megatron_gpt_pretraining.py  \
     exp_manager.create_tensorboard_logger=$CREATE_TB_LOGGER \
     exp_manager.resume_if_exists=False \
     exp_manager.resume_ignore_no_checkpoint=False \
-    exp_manager.create_checkpoint_callback=True \
+    exp_manager.create_checkpoint_callback=$CHECKPOINT_CALLBACK \
     +exp_manager.checkpoint_callback_params.train_time_interval=36000 \
-    exp_manager.checkpoint_callback_params.save_last=False \
-    model.use_cpu_initialization=True   2>&1  | tee  $LOG_PATH/log
-
-# Note: to resume training using a checkpoint, please add the following configuration above, adjusting for your checkpoint path
-    # +model.load_xser=True \
-    # +model.resume_from_checkpoint='/root/scripts/example_datasets/llamav2_weights/llama7b_hf_converted_nemo_v3//mp_rank_07/model_optim_rng.ckpt' \
-# To use mixed precision optimizer, add
-    # model.megatron_amp_O2=True \
+    exp_manager.checkpoint_callback_params.save_last=True \
+    exp_manager.exp_dir=/tmp \
+    model.use_cpu_initialization=False \
+    +model.load_xser=True \
+    model.megatron_amp_O2=$MIXED_PRECISION \
+    +model.resume_from_checkpoint=$PROCESSED_CHECKPOINTS_NEMO 2>&1  | tee  $LOG_PATH/log

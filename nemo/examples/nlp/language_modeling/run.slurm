@@ -1,6 +1,6 @@
 #!/bin/bash
+#SBATCH --exclusive
 #SBATCH --output=slurm-%x-%j.out
-#SBATCH --cpus-per-task 127
-#SBATCH --open-mode=append
+#SBATCH --cpus-per-task 96
 
 srun  --kill-on-bad-exit=1  $1

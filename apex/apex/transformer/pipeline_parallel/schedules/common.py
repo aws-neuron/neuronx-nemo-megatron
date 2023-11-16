@@ -124,19 +124,13 @@ def build_model(
         parallel_state.model_parallel_is_initialized()
         and parallel_state.get_data_parallel_rank() == 0
     ):
-        (nparams_all,nparams_cpu) = _calc_number_of_params(model)
         msg = " > number of parameters on (tensor, pipeline) model parallel rank ({}, {}): {}".format(
             parallel_state.get_tensor_model_parallel_rank(),
             parallel_state.get_pipeline_model_parallel_rank(),
-            nparams_all
+            _calc_number_of_params(model),
         )
-        if nparams_cpu == 0:
-            msg += " with no parameters on CPU."
-        else:
-            msg += " with {} paramseters on CPU, which will be copied to device.".format(nparams_cpu)
         print(msg, flush=True)
     import torch_xla.core.xla_model as xm
-    import datetime
     # GPU allocation.
 
     def copy_tensor_model_parallel_attributes_to_dict(
@@ -167,19 +161,7 @@ def build_model(
                 param
             )
 
-        if (
-            parallel_state.model_parallel_is_initialized()
-            and parallel_state.get_data_parallel_rank() == 0
-        ):
-            print(f"In apex.transformer.pipeline_parallel.build_model, enter model.to_xla_device at {datetime.datetime.now()}", flush=True)
-
         model_module.to(xm.xla_device())
-
-        if (
-            parallel_state.model_parallel_is_initialized()
-            and parallel_state.get_data_parallel_rank() == 0
-        ):
-            print(f"In apex.transformer.pipeline_parallel.build_model, leave model.to_xla_device at {datetime.datetime.now()}", flush=True)
 
         for name, param in model_module.named_parameters(recurse=True):
             copy_tensor_model_parallel_attributes_from_dict(
@@ -197,20 +179,17 @@ def build_model(
             )
             for model_module in model
         ]
-
     return model
 
 
-def _calc_number_of_params(model: List[torch.nn.Module]) -> (int,int):
+def _calc_number_of_params(model: List[torch.nn.Module]) -> int:
     assert isinstance(model, list)
-    total_all = 0
-    total_cpu = 0
-    for model_module in model:
-        for p in model_module.parameters():
-            total_all += p.nelement()
-            if str(p.device) == "cpu":
-                total_cpu += p.nelement()
-    return (total_all, total_cpu)
+    return sum(
+        [
+            sum([p.nelement() for p in model_module.parameters()])
+            for model_module in model
+        ]
+    )
 
 
 def _get_params_for_weight_decay_optimization(

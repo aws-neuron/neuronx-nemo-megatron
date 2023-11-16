@@ -204,7 +204,7 @@ def get_nmt_tokenizer(
         logging.info(
             f'Getting Megatron tokenizer for pretrained model name: {model_name}, custom vocab file: {vocab_file}, and merges file: {merges_file}'
         )
-        return get_tokenizer(tokenizer_name=model_name, vocab_file=vocab_file, merges_file=merges_file, use_fast=use_fast)
+        return get_tokenizer(tokenizer_name=model_name, vocab_file=vocab_file, merges_file=merges_file)
     elif library == 'tabular':
         return TabularTokenizer(vocab_file, delimiter=delimiter)
     else:

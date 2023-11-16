@@ -16,7 +16,7 @@
 
 try:
     from nemo.collections.nlp.models.language_modeling.megatron.gpt_model import GPTModel
-    from nemo.collections.nlp.models.language_modeling.megatron.llama_model import LlamaModel
+
     HAVE_APEX = True
 except (ImportError, ModuleNotFoundError):
     HAVE_APEX = False

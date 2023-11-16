@@ -54,7 +54,6 @@ try:
     #(TODO)getting global worldsize, change to local, assuming TP only for now
     torch.cuda.device_count = lambda : xm.xrt_world_size()
     torch.cuda.set_device = lambda x: None
-    torch.cuda.is_available = lambda : False
     HAVE_XLA=True
 except:
     HAVE_XLA=False
@@ -209,14 +208,14 @@ def fake_initialize_model_parallel(
     pipeline_model_parallel_size = min(pipeline_model_parallel_size_, world_size)
     model_parallel_size = tensor_model_parallel_size * pipeline_model_parallel_size
 
-    neuron_nemo_debug = (os.environ.get('NEURON_NEMO_DEBUG', None) == '1')
+    neuron_nemo_debug_internal = (os.environ.get('NEURON_NEMO_INTERNAL_DEBUG', None) == '1') # Internal flag, DO NOT release to customer
 
     assert (
         world_size % tensor_model_parallel_size * pipeline_model_parallel_size == 0
     ), f'world_size: {world_size} must be divisible by tensor_model_parallel_size: {tensor_model_parallel_size} times pipeline_model_parallel_size {pipeline_model_parallel_size}'
     data_parallel_size = world_size // (tensor_model_parallel_size * pipeline_model_parallel_size)
 
-    if not neuron_nemo_debug: # We do no checking for debug flag - you are expected to verify config manually if using this flag
+    if not neuron_nemo_debug_internal: # We do no checking for internal debug flag - you are expected to verify config manually if using this flag
         assert (
             tensor_model_parallel_size in [1, 8 ,32]
         ), f'tensor_model_parallel_size: {tensor_model_parallel_size} must be 1, 8, or 32.'

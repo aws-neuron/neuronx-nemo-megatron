@@ -22,7 +22,6 @@ from omegaconf.dictconfig import DictConfig
 from pytorch_lightning.plugins.precision.native_amp import NativeMixedPrecisionPlugin
 from pytorch_lightning.trainer.connectors.logger_connector.fx_validator import _FxValidator
 from pytorch_lightning.trainer.trainer import Trainer
-from torch_xla.distributed.zero_redundancy_optimizer import ZeroRedundancyOptimizer
 
 from nemo.collections.nlp.models.nlp_model import NLPModel
 from nemo.collections.nlp.modules.common.megatron.clip_grads import (
@@ -56,7 +55,7 @@ __all__ = ["MegatronBaseModel"]
 _ALLREDUCE_BUCKET_CAP_MB = 512
 ########NEURON EDIT#############
 def bucket_allreduce(tensor_list):
-    bucket_cap = int(os.getenv('BUCKET_CAP_MB', _ALLREDUCE_BUCKET_CAP_MB))*1024*1024
+    bucket_cap = int(os.getenv('BUCKET_CAP_KB', _ALLREDUCE_BUCKET_CAP_MB))*1024*1024
     # Reverse the gradients list so that we start allreduce from the last layer
     # onwards. This allows allreduce to trigger as soon as the bucket fills up and
     # overlap with backward pass.
@@ -253,10 +252,6 @@ class MegatronBaseModel(NLPModel):
     def on_train_start(self) -> None:
         super().on_train_start()
         self.init_global_step = self.trainer.global_step
-        if isinstance(self._optimizer, ZeroRedundancyOptimizer) and not self._optimizer.inited:
-            self._optimizer.init_zero()
-            xm.mark_step()
-            logging.info("Zero1 optimizer inited.")
 
     def _build_vocab(self):
         """
@@ -430,7 +425,7 @@ class MegatronBaseModel(NLPModel):
     def configure_optimizers(self):
         self.setup_optimization()
 
-     # Wrap the baseline optimizer with the optimizer class with master parameters
+        # Wrap the baseline optimizer with the optimizer class with master parameters
         if self.megatron_amp_o2 and not self.with_distributed_adam and self._optimizer is not None:
             self._optimizer = MainParamsOptimizerWrapperXLA(
                 self._optimizer,
