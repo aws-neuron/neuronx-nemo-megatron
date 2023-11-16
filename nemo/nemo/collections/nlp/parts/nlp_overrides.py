@@ -21,7 +21,6 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Dict, Generator, Iterator, List, Mapping, Optional, Sized, Union, Iterable
 from datetime import timedelta
-from functools import partial
 
 import pytorch_lightning as pl
 import torch
@@ -29,16 +28,13 @@ import torch.multiprocessing as mp
 from torch import Tensor
 from torch.nn import Module
 from torch.optim.optimizer import Optimizer
-from torch.utils.data import DataLoader
-from torch_xla.distributed.zero_redundancy_optimizer import ZeroRedundancyOptimizer
 from torchmetrics import Metric
 from lightning_lite.plugins import ClusterEnvironment, XLACheckpointIO
 from lightning_lite.plugins.environments import XLAEnvironment
-from lightning_lite.utilities.types import _PATH, Optimizable
+from lightning_lite.utilities.types import _PATH
 from lightning_lite.strategies.launchers.xla import _rank_teardown
 from lightning_utilities.core.apply_func import apply_to_collection, apply_to_collections
 from lightning_utilities.core.imports import RequirementCache
-from lightning_lite.utilities.data import _auto_add_worker_init_fn
 from lightning_lite.accelerators.tpu import _XLA_AVAILABLE
 from omegaconf import OmegaConf
 from pytorch_lightning.profilers import Profiler
@@ -52,24 +48,18 @@ from pytorch_lightning.strategies.launchers.xla import _XLALauncher
 from pytorch_lightning.trainer.trainer import Trainer
 from pytorch_lightning.utilities.exceptions import MisconfigurationException
 from pytorch_lightning.utilities.fetching import DataFetcher
-from pytorch_lightning.utilities.model_helpers import is_overridden
-from pytorch_lightning.utilities.auto_restart import _add_capture_metadata_collate
-from pytorch_lightning.utilities.imports import _fault_tolerant_training
-from pytorch_lightning.utilities.argparse import _defaults_from_env_vars
-from pytorch_lightning.utilities.rank_zero import rank_zero_warn 
 from pytorch_lightning.loops.utilities import _block_parallel_sync_behavior
+from pytorch_lightning.utilities.argparse import _defaults_from_env_vars
 from pytorch_lightning.trainer.connectors.accelerator_connector import AcceleratorConnector, _LITERAL_WARN
 from pytorch_lightning.trainer.connectors.checkpoint_connector import CheckpointConnector
 
 from pytorch_lightning.trainer import call, setup
-from pytorch_lightning.trainer.states import RunningStage, TrainerFn
-from pytorch_lightning.trainer.supporters import CombinedLoader
 from pytorch_lightning.accelerators import Accelerator
 from pytorch_lightning.callbacks import Callback, Checkpoint
 from pytorch_lightning.loggers import Logger
 from pytorch_lightning.loops import PredictionLoop, TrainingEpochLoop, TrainingBatchLoop, OptimizerLoop
 from pytorch_lightning.loops.dataloader.evaluation_loop import EvaluationLoop
-from pytorch_lightning.loops.fit_loop import FitLoop, _select_data_fetcher
+from pytorch_lightning.loops.fit_loop import FitLoop
 from pytorch_lightning.trainer.states import TrainerFn, TrainerState
 from pytorch_lightning.trainer.connectors.data_connector import DataConnector
 from pytorch_lightning.trainer.connectors.logger_connector import LoggerConnector
@@ -99,76 +89,13 @@ except (ImportError, ModuleNotFoundError):
 
     HAVE_APEX = False
 
-from lightning_lite.utilities.data import has_iterable_dataset as new_has_iterable_dataset
-
-def has_len_all_ranks_patched(dataloader, strategy, model,) -> bool:
-    """Checks if a given Dataloader has ``__len__`` method implemented i.e. if it is a finite dataloader or
-    infinite dataloader."""
-    try:
-        local_length = len(dataloader)  # type: ignore [arg-type] # we are checking with duck-typing
-        total_length = strategy.reduce(torch.tensor(local_length, device=strategy.root_device), reduce_op="sum")
-
-        if total_length == 0:
-            rank_zero_warn(
-                f"Total length of `{dataloader.__class__.__name__}` across ranks is zero."
-                " Please make sure this was your intention."
-            )
-        if total_length > 0 and local_length == 0:
-            if model.allow_zero_length_dataloader_with_multiple_devices:
-                rank_zero_warn(
-                    f"Total length of `{dataloader.__class__.__name__}` across ranks is zero, but local rank has zero"
-                    " length. Please be cautious of uneven batch length."
-                )
-                has_len = False
-            else:
-                raise MisconfigurationException(
-                    f"`{dataloader.__class__.__name__}` within local rank has zero length."
-                    " Please make sure that it returns at least 1 batch."
-                )
-        else:
-            has_len = True
-
-    except (TypeError, NotImplementedError):
-        has_len = False
-
-    # we are checking using lightning_lite, which doesn't know CombinedLoader
-    if has_len and new_has_iterable_dataset(dataloader):  # type: ignore [arg-type]
-        rank_zero_warn(
-            "Your `IterableDataset` has `__len__` defined."
-            " In combination with multi-process data loading (when num_workers > 1),"
-            " `__len__` could be inaccurate if each worker is not configured independently"
-            " to avoid having duplicate data."
-        )
-    if os.environ.get("NEURON_EXTRACT_GRAPHS_ONLY", None):
-        return True
-    return has_len
-
-class TRNPrecisionPlugin(PrecisionPlugin):
-    """Precision plugin for TPU integration."""
-
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
-
-    def optimizer_step(  # type: ignore[override]
-        self,
-        optimizer: Optimizable,
-        model: "pl.LightningModule",
-        optimizer_idx: int,
-        closure: Callable[[], Any],
-        **kwargs: Any,
-    ) -> Any:
-        """Hook to run the optimizer step."""
-        if not isinstance(optimizer, ZeroRedundancyOptimizer):
-            closure = partial(self._wrap_closure, model, optimizer, optimizer_idx, closure)
-        return optimizer.step(closure=closure, **kwargs)
-
 class _NLPXLALauncher(_XLALauncher):
     def launch(self, function: Callable, *args: Any, trainer = None, **kwargs: Any) -> Any:
         """Launches processes that run the given function in parallel.
-   
+    
         The function is allowed to have a return value. However, when all processes join, only the return value
         of worker process 0 gets returned from this `launch` method in the main process.
-   
+    
         Arguments:
             function: The entry point for all launched processes.
             *args: Optional positional arguments to be passed to the given function.
@@ -177,7 +104,7 @@ class _NLPXLALauncher(_XLALauncher):
             **rning AMI GPU PyTorch 1.13.1 (Ubuntu 20.04) 20230519
             kwargs: Optional keyword arguments to be passed to the given function.
         """
-   
+    
         if not self._strategy.cluster_environment.creates_processes_externally:
             context = mp.get_context(self._start_method)
             return_queue = context.SimpleQueue()
@@ -195,7 +122,7 @@ class _NLPXLALauncher(_XLALauncher):
             _rank_teardown(process_idx)
 
         return None
-   
+    
     def _wrapping_function(
         self,
         process_idx: int,
@@ -208,51 +135,51 @@ class _NLPXLALauncher(_XLALauncher):
     ) -> None:
         self._strategy._local_rank = process_idx
         results = function(*args, **kwargs)
-   
+    
         #### NEURON: Avoiding moving data from device to CPU
         _rank_teardown(process_idx)
 
 class _NLPResultCollection(_ResultCollection):
     def register_key(self, key: str, meta, value) -> None:
         """Create one _ResultMetric object per value.
-   
+    
         Value can be provided as a nested collection
         """
-   
+    
         def fn(v):
             metric = _ResultMetric(meta, isinstance(v, Tensor))
             ### NEURON: Do not move metrics to device, results in unnnecessary compiles
             return metric
-   
+    
         value = apply_to_collection(value, (Tensor, Metric), fn)
         if isinstance(value, dict):
             value = _ResultMetricCollection(value)
         self[key] = value
-   
+    
     def update_metrics(self, key: str, value, batch_size: int) -> None:
         def fn(result_metric, v):
             # performance: avoid calling `__call__` to avoid the checks in `torch.nn.Module._call_impl`
             ### NEURON: Do not move metrics to device, results in unnnecessary compiles
             result_metric.forward(v, batch_size)
             result_metric.has_reset = False
-   
+    
         apply_to_collections(self[key], value, _ResultMetric, fn)
 
 class NLPOptimizerLoop(OptimizerLoop):
     def _run_optimization(self, kwargs, optimizer):
         """Runs closure (train step + backward) together with optimization if necessary.
-   
+    
         Args:
             kwargs: the kwargs passed down to the hooks.
             optimizer: the current optimizer
         """
         opt_idx = kwargs.get("optimizer_idx", 0)
-   
+    
         # toggle model params
         self._run_optimization_start(opt_idx, optimizer)
-   
+    
         closure = self._make_closure(kwargs, optimizer)
-   
+    
         if (
             # when    if ( the strategy handles accumulation, we want to always call the optimizer step
             not self.trainer.strategy.handles_gradient_accumulation
@@ -265,7 +192,7 @@ class NLPOptimizerLoop(OptimizerLoop):
             # automatic_optimization=True: perform ddp sync only when performing optimizer_step
             with _block_parallel_sync_behavior(self.trainer.strategy, block=True):
                 closure()
-   
+    
         # ------------------------------
         # BACKWARD PASS
         # ------------------------------
@@ -273,9 +200,9 @@ class NLPOptimizerLoop(OptimizerLoop):
         else:
             # the `batch_idx` is optional with inter-batch parallelism
             self._optimizer_step(optimizer, opt_idx, kwargs.get("batch_idx", 0), closure)
-   
+    
         result = closure.consume_result()
-   
+    
         if result.loss is not None:
             # if no result, user decided to skip optimization
             # otherwise update running loss + reset accumulated loss
@@ -286,7 +213,7 @@ class NLPOptimizerLoop(OptimizerLoop):
             def _update_loss(trainer, loss):
                 trainer.fit_loop.epoch_loop.batch_loop._update_running_loss(loss.cpu())
             xm.add_step_closure(_update_loss, (self.trainer, result.loss.detach(), ))
-   
+    
         # untoggle model params
         self._run_optimization_end(opt_idx)
         return result
@@ -296,68 +223,26 @@ class NLPTrainingBatchLoop(TrainingBatchLoop):
         super().__init__()
         self.optimizer_loop = NLPOptimizerLoop()
 
-class NLPEvaluationLoop(EvaluationLoop):
-    # We override this class to make sure we use _NLPResultCollection 
-    # and avoid transferring results to device
-    def __init__(self, verbose: bool = True) -> None:
-        super().__init__(verbose)
-        self._results = _NLPResultCollection(training=False)
-
-    def teardown(self) -> None:
-        if self._data_fetcher is not None:
-            self._data_fetcher.teardown()
-            self._data_fetcher = None
-        self.epoch_loop.teardown()
-
-    def _on_evaluation_start(self, *args: Any, **kwargs: Any) -> None:
-        """Runs ``on_{validation/test}_start`` hooks."""
-        assert self._results is not None
-
-        hook_name = "on_test_start" if self.trainer.testing else "on_validation_start"
-        self.trainer._call_callback_hooks(hook_name, *args, **kwargs)
-        self.trainer._call_lightning_module_hook(hook_name, *args, **kwargs)
-        self.trainer._call_strategy_hook(hook_name, *args, **kwargs)
-
 class NLPTrainingEpochLoop(TrainingEpochLoop):
     def __init__(self, min_steps: Optional[int] = None, max_steps: int = -1) -> None:
         super().__init__(min_steps, max_steps)
         self.batch_loop = NLPTrainingBatchLoop()
-        self.val_loop = NLPEvaluationLoop(verbose=True)
         self._results = _NLPResultCollection(training=True)
 
-class NLPFitLoop(FitLoop):
-    # We override this class to make sure results are on CPU on run start
-    def on_run_start(self) -> None:
-        """Calls the ``on_train_start`` hook."""
-        # update the current_epoch in-case of checkpoint reload
-        if not self._iteration_based_training():
-            self.epoch_progress.current.completed = self.epoch_progress.current.processed
-
-        self.trainer.reset_train_dataloader(self.trainer.lightning_module)
-        # reload the evaluation dataloaders too for proper display in the progress bar
-        if self.epoch_loop._should_check_val_epoch():
-            self.epoch_loop.val_loop._reload_evaluation_dataloaders()
-
-        data_fetcher_cls = _select_data_fetcher(self.trainer)
-        self._data_fetcher = data_fetcher_cls(prefetch_batches=self.prefetch_batches)
-
-        self._is_fresh_start_epoch = True
-        self._results.cpu()
-
-        self.trainer._call_callback_hooks("on_train_start")
-        self.trainer._call_lightning_module_hook("on_train_start")
-        self.trainer._call_strategy_hook("on_train_start")
-
+class NLPEvaluationLoop(EvaluationLoop):
+    def __init__(self, verbose: bool = True) -> None:
+        super().__init__(verbose)
+        self._results = _NLPResultCollection(training=False)
 
 class NLPCheckpointIO(XLACheckpointIO):
     def save_checkpoint(self, checkpoint: Dict[str, Any], path, storage_options: Optional[Any] = None) -> None:
         """Save model/training states as a checkpoint file through state-dump and file-write.
-   
+    
         Args:
             checkpoint: dict containing model and trainer state
             path: write-target path
             storage_options: not used in ``XLACheckpointIO.save_checkpoint``
-   
+    
         Raises:
             TypeError:
                 If ``storage_options`` arg is passed in
@@ -373,40 +258,43 @@ class NLPCheckpointIO(XLACheckpointIO):
         if RequirementCache("omegaconf"):
             # workaround for https://github.com/pytorch/xla/issues/2773
             from omegaconf import DictConfig, ListConfig, OmegaConf
-   
+    
             checkpoint = apply_to_collection(checkpoint, (DictConfig, ListConfig), OmegaConf.to_container)
         import torch_xla.core.xla_model as xm
-   
-        ### NEURON: master_only=True since different TP workers would save the checkpoint. Note: This needs to be
+    
+        ### NEURON: master_only=True since different TP workers would save the checkpoint. Note: This needs to be 
         # rewritten inside Nemo
         xm.save({k: v for k, v in checkpoint.items() if k != "callbacks"}, path, master_only=True)
 
 class NLPCheckpointConnector(CheckpointConnector):
     def restore_loops(self) -> None:
         """Restores the loop progress from the pre-loaded checkpoint.
-   
+    
         Calls hooks on the loops to give it a chance to restore its state from the checkpoint.
         """
         if not self._loaded_checkpoint:
             return
-   
+    
         fit_loop = self.trainer.fit_loop
         pl_module = self.trainer.lightning_module
         assert pl_module is not None
     
-        global_step = self._loaded_checkpoint.get("global_step", 0)
-        epoch = self._loaded_checkpoint.get("epoch", 0)
+        if os.environ.get("BR_CHECKPOINT", None):
+            self._loaded_checkpoint["global_step"] = 0 ### NEURON: Remove this and add global_step to
+            self._loaded_checkpoint["epoch"] = 0 #### NEURON: Remove
         # set the `global_step` value for checkpoints before v1.6 without the progress tracking state.
         # it will be overwritten by the loop's state if it was also saved
         batch_loop = fit_loop.epoch_loop.batch_loop
         if pl_module.automatic_optimization:
-            batch_loop.optimizer_loop.optim_progress.optimizer.step.total.completed = global_step
+            batch_loop.optimizer_loop.optim_progress.optimizer.step.total.completed = self._loaded_checkpoint[
+                "global_step"
+            ]
         else:
-            batch_loop.manual_loop.optim_step_progress.total.completed = global_step
+            batch_loop.manual_loop.optim_step_progress.total.completed = self._loaded_checkpoint["global_step"]
     
         # set the `current_epoch` value for checkpoints before v1.6 without the progress tracking state.
         # it will be overwritten by the loop's state if it was also saved
-        fit_loop.epoch_progress.current.completed = epoch
+        fit_loop.epoch_progress.current.completed = self._loaded_checkpoint["epoch"]
     
         assert self.trainer.state.fn is not None
         state_dict = self._loaded_checkpoint.get("loops")
@@ -419,10 +307,10 @@ class NLPCheckpointConnector(CheckpointConnector):
                 self.trainer.test_loop.load_state_dict(state_dict["test_loop"])
             elif self.trainer.state.fn == TrainerFn.PREDICTING:
                 self.trainer.predict_loop.load_state_dict(state_dict["predict_loop"])
-   
+    
         if self.trainer.state.fn != TrainerFn.FITTING:
             return
-   
+    
         # crash if max_epochs is lower then the current epoch from the checkpoint
         if (
             self.trainer.max_epochs != -1
@@ -434,28 +322,6 @@ class NLPCheckpointConnector(CheckpointConnector):
                 f" but you have set Trainer(max_epochs={self.trainer.max_epochs})."
             )
 
-    def restore_optimizers_and_schedulers(self) -> None:
-        """Restores the optimizers and learning rate scheduler states from the pre-loaded checkpoint."""
-        if not self._loaded_checkpoint:
-            return
-        if self.trainer.strategy.lightning_restore_optimizer:
-            # validation
-            if "optimizer_states" not in self._loaded_checkpoint:
-                logging.warning(
-                "Trying to restore optimizer state but checkpoint contains only the model."
-                " This is probably due to `ModelCheckpoint.save_weights_only` being set to `True`."
-                )  
-                return
-            self.restore_optimizers()
-
-        if "lr_schedulers" not in self._loaded_checkpoint:
-            logging.warning(
-                "Trying to restore learning rate scheduler state but checkpoint contains only the model."
-                " This is probably due to `ModelCheckpoint.save_weights_only` being set to `True`."
-            )
-            return
-        self.restore_lr_schedulers()
-
 class NLPAcceleratorConnector(AcceleratorConnector):
     def _validate_precision_choice(self) -> None:
         """Validate the combination of choices for precision, AMP type, and accelerator."""
@@ -465,13 +331,14 @@ class NLPAcceleratorConnector(AcceleratorConnector):
                 " Please, open an issue in `https://github.com/Lightning-AI/lightning/issues`"
                 " requesting this feature."
             )
-   
+    
     def _lazy_init_strategy(self) -> None:
         """Lazily set missing attributes on the previously instantiated strategy."""
         self.strategy.accelerator = self.accelerator
         if self.precision_plugin:
             #self.strategy.precision_plugin = self.precision_plugin
-            self.strategy.precision_plugin = TRNPrecisionPlugin()
+            self.strategy.precision_plugin = PrecisionPlugin()
+            print('precision plugin:{}'.format(self.precision_plugin))
 
         if self.checkpoint_io:
             self.strategy.checkpoint_io = self.checkpoint_io
@@ -489,97 +356,6 @@ class NLPAcceleratorConnector(AcceleratorConnector):
         if hasattr(self.strategy, "set_world_ranks"):
             self.strategy.set_world_ranks()
         self.strategy._configure_launcher()
-
-class NLPDataConnector(DataConnector):
-
-    def _reset_eval_dataloader(self, mode, model):
-        """Generic method to reset a dataloader for evaluation.
-
-        Args:
-            mode: The running stage of the ``Trainer``
-            model: The ``LightningModule`` if calling this outside of the trainer scope.
-
-        Returns:
-            Tuple (num_batches, dataloaders)
-        """
-        assert mode.evaluating or mode == RunningStage.PREDICTING
-
-        # always get the loaders first so we can count how many there are
-        dataloaders = self._request_dataloader(mode)
-
-        if self.trainer.overfit_batches > 0:
-            dataloaders = self._resolve_overfit_batches(dataloaders, mode)
-
-        if not isinstance(dataloaders, list):
-            dataloaders = [dataloaders]  # type: ignore[assignment]
-
-        if any(dl is None for dl in dataloaders):
-            rank_zero_warn("One of given dataloaders is None and it will be skipped.")
-
-        for loader in dataloaders:
-            apply_to_collection(
-                loader.loaders if isinstance(loader, CombinedLoader) else loader,
-                DataLoader,
-                self._check_eval_shuffling,
-                mode=mode,
-            )
-
-        # add samplers
-        dataloaders = [self._prepare_dataloader(dl, mode=mode) for dl in dataloaders if dl is not None]
-
-        # add worker_init_fn for correct seeding in worker processes
-        apply_to_collection(
-            dataloaders, dtype=DataLoader, function=_auto_add_worker_init_fn, rank=self.trainer.global_rank
-        )
-
-        loader_num_batches: List[Union[int, float]] = []
-
-        # determine number of batches
-        module = model or self.trainer.lightning_module or self.datamodule
-        if len(dataloaders) != 0:
-            for i, dataloader in enumerate(dataloaders):
-                orig_num_batches = num_batches = (
-                    len(dataloader) if has_len_all_ranks_patched(dataloader, self.trainer.strategy, module) else float("inf")
-                )
-
-                if orig_num_batches == 0:
-                    assert isinstance(orig_num_batches, int)
-                    loader_num_batches.append(orig_num_batches)
-                    continue
-
-                self._worker_check(dataloader, f"{mode.dataloader_prefix}_dataloader {i}")
-
-                # percent or num_steps
-                limit_eval_batches = getattr(self.trainer, f"limit_{mode.dataloader_prefix}_batches")
-
-                # limit num batches either as a percent or num steps
-                if isinstance(limit_eval_batches, int):
-                    num_batches = min(orig_num_batches, limit_eval_batches)
-                elif isinstance(limit_eval_batches, float) and orig_num_batches != float("inf"):
-                    num_batches = int(orig_num_batches * limit_eval_batches)
-                elif limit_eval_batches != 1.0:
-                    raise MisconfigurationException(
-                        f"When using an `IterableDataset`, `Trainer(limit_{mode.dataloader_prefix}_batches)` must be"
-                        f" `1.0` or an int. An int specifies `num_{mode.dataloader_prefix}_batches` to use."
-                    )
-
-                if (
-                    num_batches == 0
-                    and limit_eval_batches > 0.0
-                    and isinstance(limit_eval_batches, float)
-                    and orig_num_batches != float("inf")
-                ):
-                    min_percentage = 1.0 / orig_num_batches
-                    raise MisconfigurationException(
-                        f"You requested to check {limit_eval_batches} of the `{mode.dataloader_prefix}_dataloader` but"
-                        f" {limit_eval_batches} * {orig_num_batches} < 1. Please increase the"
-                        f" `limit_{mode.dataloader_prefix}_batches` argument. Try at least"
-                        f" `limit_{mode.dataloader_prefix}_batches={min_percentage}`"
-                    )
-
-                loader_num_batches.append(num_batches)
-
-        return loader_num_batches, dataloaders
 
 
 class NLPTrainer(Trainer):
@@ -646,7 +422,7 @@ class NLPTrainer(Trainer):
             default_root_dir = os.fspath(default_root_dir)
 
         # init connectors
-        self._data_connector = NLPDataConnector(self, multiple_trainloader_mode)
+        self._data_connector = DataConnector(self, multiple_trainloader_mode)
 
         self._accelerator_connector = NLPAcceleratorConnector(
             num_processes=num_processes,
@@ -673,7 +449,7 @@ class NLPTrainer(Trainer):
         self._signal_connector = SignalConnector(self)
         self.tuner = Tuner(self)
 
-        fit_loop = NLPFitLoop(min_epochs=min_epochs, max_epochs=max_epochs)
+        fit_loop = FitLoop(min_epochs=min_epochs, max_epochs=max_epochs)
         training_epoch_loop = NLPTrainingEpochLoop(min_steps=min_steps, max_steps=max_steps)
         fit_loop.connect(epoch_loop=training_epoch_loop)
 
@@ -785,122 +561,8 @@ class NLPTrainer(Trainer):
                 if self.state.fn == TrainerFn.FITTING:
                     # restore callback states
                     self._checkpoint_connector.restore_callbacks()
+                self._checkpoint_connector._loaded_checkpoint = {}
             xm.rendezvous(f'load-chkpt-phase-{i}')
-
-    def reset_train_dataloader(self, model: Optional["pl.LightningModule"] = None) -> None:
-        """Resets the train dataloader and initialises required variables (number of batches, when to validate,
-        etc.).
-
-        Args:
-            model: The ``LightningModule`` if calling this outside of the trainer scope.
-        """
-        source = self._data_connector._train_dataloader_source
-        pl_module = model or self.lightning_module
-        has_step = is_overridden("training_step", pl_module)
-        enable_training = self.limit_train_batches > 0
-        if not (source.is_defined() and has_step and enable_training):
-            return
-
-        self.train_dataloader = self._data_connector._request_dataloader(RunningStage.TRAINING)
-
-        if self.overfit_batches > 0:
-            self.train_dataloader = self._data_connector._resolve_overfit_batches(
-                self.train_dataloader, mode=RunningStage.TRAINING
-            )
-
-        # automatically add samplers
-        self.train_dataloader = apply_to_collection(
-            self.train_dataloader,
-            (DataLoader, CombinedLoader),
-            self._data_connector._prepare_dataloader,
-            mode=RunningStage.TRAINING,
-        )
-        loaders = (
-            self.train_dataloader.loaders
-            if isinstance(self.train_dataloader, CombinedLoader)
-            else self.train_dataloader
-        )
-
-        # check the workers recursively
-        apply_to_collection(loaders, DataLoader, self._data_connector._worker_check, "train_dataloader")
-
-        # add worker_init_fn for correct seeding in worker processes
-        apply_to_collection(loaders, DataLoader, _auto_add_worker_init_fn, rank=self.global_rank)
-
-        # add collate_fn to collect metadata for fault tolerant training
-        if _fault_tolerant_training():
-            apply_to_collection(loaders, DataLoader, _add_capture_metadata_collate)
-
-        # wrap the sequence of train loaders to a CombinedLoader object for computing the num_training_batches
-        if not isinstance(self.train_dataloader, CombinedLoader):
-            self.train_dataloader = CombinedLoader(loaders, self._data_connector.multiple_trainloader_mode)
-
-        module = model or self.lightning_module or self.datamodule
-        orig_train_batches = self.num_training_batches = (
-            len(self.train_dataloader)  # type: ignore[arg-type]
-            if has_len_all_ranks_patched(self.train_dataloader, self.strategy, module)
-            else float("inf")
-        )
-        if orig_train_batches == 0:
-            return
-
-        # store epoch of dataloader reset for reload_dataloaders_every_n_epochs
-        self._last_train_dl_reload_epoch = self.current_epoch
-
-        if isinstance(self.limit_train_batches, int):
-            self.num_training_batches = min(orig_train_batches, self.limit_train_batches)
-        elif self.num_training_batches != float("inf"):
-            self.num_training_batches = int(orig_train_batches * self.limit_train_batches)
-        elif self.limit_train_batches != 1.0:
-            raise MisconfigurationException(
-                "When using an `IterableDataset`, `Trainer(limit_train_batches)` must be `1.0` or an int."
-                "An int specifies `num_training_batches` to use."
-            )
-
-        if isinstance(self.val_check_interval, int):
-            self.val_check_batch = self.val_check_interval
-            if self.val_check_batch > self.num_training_batches and self.check_val_every_n_epoch is not None:
-                raise ValueError(
-                    f"`val_check_interval` ({self.val_check_interval}) must be less than or equal "
-                    f"to the number of the training batches ({self.num_training_batches}). "
-                    "If you want to disable validation set `limit_val_batches` to 0.0 instead."
-                    "If you want to validate based on the total training batches, set `check_val_every_n_epoch=None`."
-                )
-        else:
-            if not has_len_all_ranks_patched(self.train_dataloader, self.strategy, module):
-                if self.val_check_interval == 1.0:
-                    self.val_check_batch = float("inf")
-                else:
-                    raise MisconfigurationException(
-                        "When using an IterableDataset for `train_dataloader`,"
-                        " `Trainer(val_check_interval)` must be `1.0` or an int. An int k specifies"
-                        " checking validation every k training batches."
-                    )
-            else:
-                self.val_check_batch = int(self.num_training_batches * self.val_check_interval)
-                self.val_check_batch = max(1, self.val_check_batch)
-
-        if self.loggers and self.num_training_batches < self.log_every_n_steps:
-            rank_zero_warn(
-                f"The number of training batches ({self.num_training_batches}) is smaller than the logging interval"
-                f" Trainer(log_every_n_steps={self.log_every_n_steps}). Set a lower value for log_every_n_steps if"
-                " you want to see logs for the training epoch.",
-                category=PossibleUserWarning,
-            )
-
-        if (
-            self.num_training_batches == 0
-            and self.limit_train_batches > 0.0
-            and isinstance(self.limit_train_batches, float)
-            and orig_train_batches != float("inf")
-        ):
-            min_percentage = 1.0 / orig_train_batches
-            raise MisconfigurationException(
-                f"You requested to check {self.limit_train_batches} of the `train_dataloader` but"
-                f" {self.limit_train_batches} * {orig_train_batches} < 1. Please increase the"
-                f" `limit_train_batches` argument. Try at least"
-                f" `limit_train_batches={min_percentage}`"
-            )
 
 class NLPDDPStrategy(TPUSpawnStrategy):
     """ DDP plugin for Pytorch Lightning. Needed to customize DDP for model parallel models.
@@ -920,7 +582,6 @@ class NLPDDPStrategy(TPUSpawnStrategy):
         debug: bool = False,
         no_ddp_communication_hook: bool = False,
         megatron_amp_o2: bool=False,
-        restore_path=None,
         **_: Any,
     ) -> None:
         if not _XLA_AVAILABLE:
@@ -944,7 +605,6 @@ class NLPDDPStrategy(TPUSpawnStrategy):
         self._launched = False
         self.no_ddp_communication_hook = no_ddp_communication_hook
         self.megatron_amp_o2 = megatron_amp_o2
-        self.restore_path = restore_path
 
     def _configure_launcher(self) -> None:
         self._launcher = _NLPXLALauncher(self)
@@ -956,11 +616,7 @@ class NLPDDPStrategy(TPUSpawnStrategy):
         else:
             import torch_xla.core.xla_model as xm
             global_rank = xm.get_ordinal()
-        if (os.environ.get("PJRT_DEVICE", None) == "NEURON"):
-            import torch_xla.experimental.pjrt_backend
-            dist.init_process_group('xla', init_method="pjrt://", rank=global_rank)
-        else:
-            dist.init_process_group('xla', rank=global_rank)
+        dist.init_process_group('xla', rank=global_rank)
         # call PTL init ddp
         super().setup_distributed()
 
@@ -1053,7 +709,7 @@ class NLPDDPStrategy(TPUSpawnStrategy):
                 data_parallel_size=app_state.data_parallel_size,
                 rampup_batch_size=None,
             )
-   
+    
     def is_save_type_xser(self):
         try:
             save_mode = self.lightning_module.cfg.save_xser
@@ -1109,7 +765,9 @@ class NLPDDPStrategy(TPUSpawnStrategy):
                     cpu_data = xm._maybe_convert_to_cpu({k: v for k, v in checkpoint.items() if k != "callbacks"}, convert=True)
                     ensure_directory_exists(filepath)
                     torch.save(cpu_data, filepath)
+
                 xm.rendezvous(f'chktp-save-{tp_rank}')
+        
 
     def load_model_state_dict(self, checkpoint: Mapping[str, Any]) -> None:
         # Release strict state dict matching when using Megatron AMP-O2 to skip matching
@@ -1139,48 +797,21 @@ class NLPDDPStrategy(TPUSpawnStrategy):
         torch.cuda.empty_cache()
         checkpoint_path = inject_model_parallel_rank(checkpoint_path)
         import torch_xla.utils.serialization as xser
-        import torch_xla.core.xla_model as xm
-       
-        def device_load_xser(path):
-            ref_data = torch.load(path)
-
-            def convert_fn(tensors):
-                rewritten_tensors = []
-                for t in tensors:
-                    rewritten_tensors.append(
-                    torch.load(os.path.join(path + '.tensors', 'tensor_{}.pt'.format(t.tid)))
-                    .to(device=xm.xla_device()))
-                return rewritten_tensors
-
-            def select_fn(v):
-                return type(v) == xser.TensorReference
-
-            return xm.ToXlaTensorArena(convert_fn, select_fn).transform(ref_data)
-
+        
         if self.is_load_type_xser():
-            loaded_checkpoint = device_load_xser(checkpoint_path)
-        else:
-            loaded_checkpoint = self.checkpoint_io.load_checkpoint(checkpoint_path)
-
-        return loaded_checkpoint
+            return xser.load(checkpoint_path)
+        return self.checkpoint_io.load_checkpoint(checkpoint_path)
 
     def remove_checkpoint(self, filepath: _PATH) -> None:
         app_state = AppState()
         # PTL override to accomodate model parallel checkpoints
         filepath = inject_model_parallel_rank(filepath)
         if self.is_global_zero or app_state.data_parallel_rank == 0:
-            if not self.restore_path or filepath != inject_model_parallel_rank(self.restore_path):
-                logging.info(f'Removing checkpoint: {filepath}')
-                try:
-                    self.checkpoint_io.remove_checkpoint(filepath)
-                except:
-                    pass  # Swallow any exceptions
-                if self.is_save_type_xser():
-                    if os.path.exists(f"{filepath}.tensors"):
-                        try:
-                            shutil.rmtree(f"{filepath}.tensors")
-                        except:
-                            pass  # Swallow any exceptions
+            logging.info(f'Removing checkpoint: {filepath}')
+            self.checkpoint_io.remove_checkpoint(filepath)
+            if self.is_save_type_xser():
+                if os.path.exists(f"{filepath}.tensors"):
+                    shutil.rmtree(f"{filepath}.tensors")
 
     @property
     def distributed_sampler_kwargs(self):
@@ -1206,7 +837,7 @@ class NLPDDPStrategy(TPUSpawnStrategy):
 
     def teardown(self):
         """This method is called to teardown the training process.
-   
+    
         It is the right place to release memory and free other resources.
         """
         #### Avoid copying to CPU
@@ -1215,34 +846,25 @@ class NLPDDPStrategy(TPUSpawnStrategy):
         self.accelerator.teardown()
         self.checkpoint_io.teardown()
 
+    #def optimizer_step(
+    #        self,
+    #        optimizer: Optimizer,
+    #        opt_idx: int,
+    #        closure: Callable[[], Any],
+    #        model: Optional[Union["pl.LightningModule", Module]] = None,
+    #        **kwargs: Any,
+    #) -> Any:
+    #    if self.megatron_amp_o2:
+    #        # Mixed precision optimizer step
+    #        closure_result = closure()
+    #        optimizer.step(closure=closure)
+    #        return closure_result
+    #    else:
+    #        # Single optimizer step
+    #        # Gradient averaging will be handled manually - either by Zero1 or inside model train step
+    #        # Notes this overrides the optimizer step present in the XLA Precision Plugin by Lightning
+    #        return optimizer.step(closure=closure)
 
-    # original implementation of this function would go over GRPC and hits message size limit
-    # when number of workers is > 128
-    # https://github.com/pytorch/xla/issues/1924
-
-    def reduce(
-            self, output: Union[Tensor, Any], group: Optional[Any] = None, reduce_op: Optional[Union[torch.distributed.ReduceOp, str]] = "mean",
-    ) -> Tensor:
-        if not isinstance(output, Tensor):
-            output = torch.tensor(output, device=self.root_device)
-
-        invalid_reduce_op = isinstance(reduce_op, torch.distributed.ReduceOp) and reduce_op != torch.distributed.ReduceOp.SUM
-        invalid_reduce_op_str = isinstance(reduce_op, str) and reduce_op.lower() not in ("sum", "mean", "avg")
-        if invalid_reduce_op or invalid_reduce_op_str:
-            raise ValueError(
-                "Currently, the TPUSpawnStrategy only supports `sum`, `mean`, `avg` for the reduce operation, got:"
-                f" {reduce_op}"
-            )
-
-        import torch_xla.core.xla_model as xm
-        xm.mark_step()
-
-        torch.distributed.all_reduce(output, op=torch.distributed.ReduceOp.SUM)
-        if isinstance(reduce_op, str) and reduce_op.lower() in ("avg", "mean"):
-            output = output / self.world_size
-
-        xm.mark_step()
-        return output.cpu()
 
 class NLPSaveRestoreConnector(SaveRestoreConnector):
     def __init__(self) -> None:

@@ -29,13 +29,10 @@ from nemo.core.optim.novograd import Novograd
 from nemo.utils import logging
 from nemo.utils.model_utils import maybe_update_config_version
 
-from .adamw_fp32_optim_params import AdamW_FP32OptimParams
-
 AVAILABLE_OPTIMIZERS = {
     'sgd': optim.SGD,
     'adam': optim.Adam,
     'adamw': optim.AdamW,
-    'adamw_fp32OptState': AdamW_FP32OptimParams,
     'adadelta': adadelta.Adadelta,
     'adamax': adamax.Adamax,
     'adagrad': adagrad.Adagrad,

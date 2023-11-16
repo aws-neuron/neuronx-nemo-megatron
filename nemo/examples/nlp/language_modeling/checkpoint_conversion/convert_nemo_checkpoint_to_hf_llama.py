@@ -8,6 +8,10 @@ import re
 import numpy as np
 import torch
 import torch_xla.utils.serialization as xser
+import shutil
+from transformers import LlamaForCausalLM
+from transformers_neuronx.module import save_pretrained_split
+
 
 def fix_query_key_value_ordering(param, checkpoint_version, num_splits, num_heads, hidden_size):
     # Permutes layout of param tensor to [num_splits * num_heads * hidden_size, :]
@@ -74,12 +78,6 @@ def get_checkpoints_for_pp(pp: int, path_to_checkpoints: str, PP: int=1, TP: int
 
     template = join(path_to_checkpoints, pp_str, '*.ckpt')
 
-    # take largest step saved model from the available checkpoints
-    max_step_recorded=max(
-        [int(re.match(r".*megatron_llama--step=(\d+).*ckpt$", i).group(1)) 
-        for i in glob(template)])
-    template = join(path_to_checkpoints, pp_str, f'*megatron_llama--step={max_step_recorded}*.ckpt')
-
     tp_paths = sorted(glob(template))
     return {i: xser.load(p)['state_dict'] if is_xser else torch.load(p)['state_dict'] for i, p in enumerate(tp_paths)}
 
@@ -102,8 +100,11 @@ def _get_nemo_key(k, nemo_key = 'model.language_model.'):
 def convert_checkpoint(config_file,
                        path_to_checkpoints,
                        output_path,
+                       path_to_tokenizers,
                        checkpoint_version=2.0,
-                       is_xser=False):
+                       is_xser=False,
+                       is_7b_model="False",
+                       ):
 
     with open(config_file, "r") as f:
         config = json.load(f)
@@ -190,36 +191,71 @@ def convert_checkpoint(config_file,
                 size_per_seg = hf_model[hf_key].shape[0] // 3
                 hf_model[hf_key_q], hf_model[hf_key_k], hf_model[hf_key_v] = torch.split(hf_model[hf_key], size_per_seg, dim=0)
                 hf_model.pop(hf_key)
-    
+    #if args.save_bf16:
+    for _k in hf_model:
+        hf_model[_k] = hf_model[_k].to(dtype=torch.bfloat16, device='cpu')
     path = Path(output_path)
     path.mkdir(parents=True, exist_ok=True)
     torch.save(hf_model, str(path)+"/pytorch_model.bin")
 
+    #config_file
+    shutil.copyfile(config_file, str(path)+"/config.json")
+    print("Loading the checkpoint in a Llama model.")
+    model = LlamaForCausalLM.from_pretrained(str(path), torch_dtype=torch.float16, low_cpu_mem_usage=True)
+    print("Remove the pytorch_model.bin file")
+    os.remove(str(path)+"/pytorch_model.bin")
+    
+    if is_7b_model == "True":
+        print("Model type 7B is identified. Splitting it into sub-checkpoints for deployment on inf2 instance.")
+        save_pretrained_split(model, str(path))
+    else:
+        model.save_pretrained(str(path), safe_serialization=False)
+        
+#     FILES_TO_COPY = os.listdir(path_to_tokenizers)
+#     FILES_TO_COPY = [f"{path_to_tokenizers}/{each_file}" for each_file in FILES_TO_COPY if not ((each_file.endswith("bin")) or ("PRE_COMPILED_NEURON_GRAPH_TRAIN" in each_file) or ("pre-compiled-neuron-graph" in each_file))]
+#     print(F"what are the files to copy over?? {FILES_TO_COPY}")
+    
+#     for each_file in FILES_TO_COPY:
+#         shutil.copy2(src=each_file, dst=str(path))
+
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint_version", default=2.0)
-    parser.add_argument(
-        "--path_to_checkpoints",
-        type=str,
-        help="Path to the checkpoints from creating NeMo checkpoint files using `convert_hf_checkpoint_to_nemo.py`",
-        required=True
-    )
-    parser.add_argument(
-        "--config_file",
-        type=str,
-        help="The config json file describing the pre-trained model.",
-        required=True
-    )
-    parser.add_argument(
-        "--output_path",
-        default="",
-        type=str,
-        help="output path",
-    )
-    parser.add_argument(
-        "--is_xser",
-        default=False,
-        type=bool
-    )
-    args = parser.parse_args()
-    convert_checkpoint(args.config_file, args.path_to_checkpoints, args.output_path, args.checkpoint_version, args.is_xser)
+	parser = argparse.ArgumentParser()
+	parser.add_argument("--checkpoint_version", default=2.0)
+	parser.add_argument(
+		"--path_to_checkpoints",
+		type=str,
+		help="Path to the checkpoints from creating NeMo checkpoint files using `convert_hf_checkpoint_to_nemo.py`",
+		required=True
+	)
+	parser.add_argument(
+		"--config_file",
+		type=str,
+		help="The config json file describing the pre-trained model.",
+		required=True
+	)
+	parser.add_argument(
+		"--path_to_tokenizers",
+		type=str,
+		help="Path to the tokenizers",
+		required=True
+	)
+	parser.add_argument(
+		"--output_path",
+		default="",
+		type=str,
+		help="output path",
+	)
+	parser.add_argument(
+		"--is_7b_model",
+		default="False",
+		type=str,
+		required=True,
+	)    
+    # parser.add_argument(
+	# 	"--is_xser",
+	# 	default=False,
+	# 	type=bool
+	# )
+	args = parser.parse_args()
+	convert_checkpoint(args.config_file, args.path_to_checkpoints, args.output_path, args.path_to_tokenizers, args.checkpoint_version, True, args.is_7b_model)

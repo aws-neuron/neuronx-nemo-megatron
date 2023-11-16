@@ -183,30 +183,34 @@ def convert_checkpoint(config_file,
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint_version", default=2.0)
-    parser.add_argument(
-        "--path_to_checkpoints",
-        type=str,
-        help="Path to the checkpoints from creating NeMo checkpoint files using `convert_hf_checkpoint_to_nemo.py`",
-        required=True
+	parser = argparse.ArgumentParser()
+	parser.add_argument(
+        "--checkpoint_version", default=2.0
     )
-    parser.add_argument(
-        "--config_file",
-        type=str,
-        help="The config json file describing the pre-trained model.",
-        required=True
-    )
-    parser.add_argument(
-        "--output_path",
-        default="",
-        type=str,
-        help="output path",
-    )
-    parser.add_argument(
-        "--is_xser",
-        default=False,
-        type=bool
-    )
-    args = parser.parse_args()
-    convert_checkpoint(args.config_file, args.path_to_checkpoints, args.output_path, args.checkpoint_version, args.is_xser)
+	parser.add_argument(
+		"--path_to_checkpoints",
+		type=str,
+		help="Path to the checkpoints from creating NeMo checkpoint files using `convert_hf_checkpoint_to_nemo.py`",
+        default="nemo/examples/nlp/language_modeling/nemo_experiments/megatron_llama/",
+		required=False
+	)
+	parser.add_argument(
+		"--config_file",
+		type=str,
+		help="The config json file describing the pre-trained model.",
+		required=False,
+        default="config.json"
+	)
+	parser.add_argument(
+		"--output_path",
+		default="",
+		type=str,
+		help="output path",
+	)
+    # parser.add_argument(
+    #     "--is_xser",
+	# 	default=True,
+	# 	type=bool
+	# )
+	args = parser.parse_args()
+	convert_checkpoint(args.config_file, args.path_to_checkpoints, args.output_path, args.checkpoint_version, True)

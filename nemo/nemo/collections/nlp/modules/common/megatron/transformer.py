@@ -17,10 +17,11 @@
 import math
 from contextlib import nullcontext
 from typing import Any, Callable, Optional
-import datetime
+
 import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
+
 from nemo.collections.common.parts.adapter_modules import LinearAdapterConfig
 from nemo.collections.nlp.modules.common.megatron.adapters.parallel_adapters import (
     AdapterName,
@@ -41,7 +42,7 @@ from nemo.collections.nlp.modules.common.megatron.fused_softmax import MatchedSc
 from nemo.collections.nlp.modules.common.megatron.layer_norm_1p import LayerNorm1P
 from nemo.collections.nlp.modules.common.megatron.layer_type import LayerType
 from nemo.collections.nlp.modules.common.megatron.module import MegatronModule
-from nemo.collections.nlp.modules.common.megatron.rotary_pos_embedding import RotaryEmbedding, apply_rotary_pos_emb
+# from nemo.collections.nlp.modules.common.megatron.rotary_pos_embedding import apply_rotary_pos_emb
 from nemo.collections.nlp.modules.common.megatron.utils import ApexGuardDefaults, attention_mask_func, erf_gelu
 from nemo.collections.nlp.modules.common.megatron.utils import openai_gelu as openai_gelu_func
 from nemo.core import adapter_mixins
@@ -84,6 +85,52 @@ except:
             logging.warning(
                 "Transformer Engine was not found. transformer_engine.pytorch.transformer.TransformerLayer will not work. Please see the NeMo README for installation instructions: https://github.com/NVIDIA/NeMo#megatron-gpt."
             )
+
+class RotaryEmbedding(torch.nn.Module):
+    def __init__(self, dim, max_position_embeddings=4096, base=10000, device=None):
+        super().__init__()
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer("inv_freq", inv_freq)
+
+        # Build here to make `torch.jit.trace` work.
+        self.max_seq_len_cached = max_position_embeddings
+        t = torch.arange(self.max_seq_len_cached, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
+        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+        # Different from paper, but it uses a different permutation in order to obtain the same calculation
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer("cos_cached", emb.cos()[None, None, :, :], persistent=False)
+        self.register_buffer("sin_cached", emb.sin()[None, None, :, :], persistent=False)
+
+    def forward(self, x, seq_len=None):
+        # x: [bs, num_attention_heads, seq_len, head_size]
+        # This `if` block is unlikely to be run after we build sin/cos in `__init__`. Keep the logic here just in case.
+        if seq_len > self.max_seq_len_cached:
+            self.max_seq_len_cached = seq_len
+            t = torch.arange(self.max_seq_len_cached, device=x.device, dtype=self.inv_freq.dtype)
+            freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+            # Different from paper, but it uses a different permutation in order to obtain the same calculation
+            emb = torch.cat((freqs, freqs), dim=-1).to(x.device)
+            self.register_buffer("cos_cached", emb.cos()[None, None, :, :], persistent=False)
+            self.register_buffer("sin_cached", emb.sin()[None, None, :, :], persistent=False)
+        return (
+            self.cos_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
+            self.sin_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
+        )
+
+
+def rotate_half(x):
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2:]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def apply_rotary_pos_emb(q, k, cos, sin, offset: int = 0):
+    cos = cos[..., offset: q.shape[-2] + offset, :]
+    sin = sin[..., offset: q.shape[-2] + offset, :]
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
 
 """ We use the following notation throughout this file:
      h: hidden size
@@ -147,7 +194,6 @@ class ParallelMLP(MegatronModule, adapter_mixins.AdapterModuleMixin):
         no_async_tensor_model_parallel_allreduce = (
             parallel_state.get_tensor_model_parallel_world_size() == 1 or sequence_parallel
         )
-        t0 = datetime.datetime.now()
         # Project to 4h.
         self.dense_h_to_4h = tensor_parallel.ColumnParallelLinear(
             hidden_size,
@@ -162,13 +208,10 @@ class ParallelMLP(MegatronModule, adapter_mixins.AdapterModuleMixin):
             gradient_accumulation_fusion=gradient_accumulation_fusion,
             transfer_with_static_ring=transfer_with_static_ring,
         )
-        t1 = datetime.datetime.now()
-        logging.trace(f"In ParallelMLP  create self.dense_h_to_4h. Begin: {t0} Elapsed: {(t1 - t0).total_seconds()} s.", trace_type="recovery_time")
 
         if activation in ['geglu', 'reglu', 'swiglu']:
             # Separate linear layer for *GLU activations.
             # Source: https://github.com/huggingface/transformers/blob/bee361c6f1f7704f8c688895f2f86f6e5ff84727/src/transformers/models/t5/modeling_t5.py#L292
-            t0 = datetime.datetime.now()
             self.dense_h_to_4h_2 = tensor_parallel.ColumnParallelLinear(
                 hidden_size,
                 ffn_hidden_size,  # NOTE: When using *glu, divide ffn dim by 2/3 to keep overall params the same.
@@ -182,8 +225,6 @@ class ParallelMLP(MegatronModule, adapter_mixins.AdapterModuleMixin):
                 gradient_accumulation_fusion=gradient_accumulation_fusion,
                 transfer_with_static_ring=transfer_with_static_ring,
             )
-            t1 = datetime.datetime.now()
-            logging.trace(f"In ParallelMLP create self.dense_h_to_4h_2. Begin: {t0} Elapsed: {(t1 - t0).total_seconds()} s.", trace_type="recovery_time")
 
         self.glu_activation_family = activation in ['geglu', 'reglu', 'swiglu']
         bias_activation_fusion_unavailable = activation in ['reglu', 'swiglu']
@@ -219,7 +260,6 @@ class ParallelMLP(MegatronModule, adapter_mixins.AdapterModuleMixin):
             self.activation_func = F.silu
 
         # Project back to h.
-        t0 = datetime.datetime.now()
         self.dense_4h_to_h = tensor_parallel.RowParallelLinear(
             ffn_hidden_size,
             hidden_size,
@@ -232,8 +272,6 @@ class ParallelMLP(MegatronModule, adapter_mixins.AdapterModuleMixin):
             gradient_accumulation_fusion=gradient_accumulation_fusion,
             transfer_with_static_ring=transfer_with_static_ring,
         )
-        t1 = datetime.datetime.now()
-        logging.trace(f"In ParallelMLP create self.dense_4h_to_h. Begin: {t0} Elapsed: {(t1 - t0).total_seconds()} s.", trace_type="recovery_time")
 
         # Normformer normalization
         if transformer_block_type == 'normformer':
@@ -452,10 +490,7 @@ class CoreAttention(MegatronModule):
         sequence_parallel=False,
         normalize_attention_scores=True,
         multi_query_attention=False,
-        position_embedding_type='learned_absolute',
-        position_interpolation_factor=1.0,
-        max_position_embeddings=4096,
-        rotary_percentage=1.0,
+        position_embedding_type='learned_absolute'
     ):
 
         super(CoreAttention, self).__init__()
@@ -477,8 +512,6 @@ class CoreAttention(MegatronModule):
         # This arg is been provided mostly to support weight conversion of Huggingface models. (ex: T5v1.1)
         self.normalize_attention_scores = normalize_attention_scores
         self.position_embedding_type = position_embedding_type
-        self.position_interpolation_factor = position_interpolation_factor
-        self.rotary_percentage=rotary_percentage
         if kv_channels is None:
             assert (
                 hidden_size % num_attention_heads == 0
@@ -512,11 +545,8 @@ class CoreAttention(MegatronModule):
             coeff,
         )
 
-        if self.position_embedding_type == 'rope':
-            self.rotary_emb = RotaryEmbedding(self.hidden_size_per_attention_head,
-                                              max_position_embeddings=max_position_embeddings,
-                                              position_interpolation_factor=self.position_interpolation_factor,
-                                              rotary_percentage=self.rotary_percentage)
+        if self.position_embedding_type=='rope':
+            self.rotary_emb = RotaryEmbedding(self.hidden_size_per_attention_head)
 
         # Dropout. Note that for a single iteration, this layer will generate
         # different outputs on different number of parallel partitions but
@@ -555,9 +585,19 @@ class CoreAttention(MegatronModule):
             # otherwise, only relative positional embedding takes effect
             # value_layer = apply_rotary_pos_emb(value_layer, k_pos_emb)
 
-        if self.position_embedding_type == 'rope':
-            cos, sin = self.rotary_emb(value_layer, seq_len=query_layer.shape[0])
+        if self.position_embedding_type=='rope':
+            # [sq, b, np, hn] --> [b, np, sq, hn] TODO optimize the permute of dimension back and forth
+            query_layer = query_layer.permute(1, 2, 0, 3)
+            key_layer = key_layer.permute(1, 2, 0, 3)
+            value_layer = value_layer.permute(1, 2, 0, 3)            
+
+            cos, sin = self.rotary_emb(value_layer, seq_len=query_layer.shape[2])
             query_layer, key_layer = apply_rotary_pos_emb(query_layer, key_layer, cos, sin, offset=0)
+
+            # [b, np, sq, hn] --> [sq, b, np, hn] TODO optimize the permute of dimension back and forth
+            query_layer = query_layer.permute(2, 0, 1, 3).contiguous()
+            key_layer = key_layer.permute(2, 0, 1, 3).contiguous()
+            value_layer = value_layer.permute(2, 0, 1, 3).contiguous()
 
         if self.multi_query_attention:
             # [sq, b, np, hn] -> [b, np * sq, hn]
@@ -718,9 +758,6 @@ class ParallelAttention(MegatronModule, adapter_mixins.AdapterModuleMixin):
         gradient_accumulation_fusion=False,
         normalize_attention_scores=True,
         transfer_with_static_ring=True,
-        position_interpolation_factor=1.0,
-        max_position_embeddings=4096,
-        rotary_percentage=1.0,
     ):
         super(ParallelAttention, self).__init__()
 
@@ -729,8 +766,6 @@ class ParallelAttention(MegatronModule, adapter_mixins.AdapterModuleMixin):
         self.attn_mask_type = attn_mask_type
         self.normalize_attention_scores = normalize_attention_scores
         self.position_embedding_type = position_embedding_type
-        self.position_interpolation_factor = position_interpolation_factor
-        self.rotary_percentage=rotary_percentage
         self.multi_query_attention = multi_query_attention
 
         self.megatron_legacy = megatron_legacy
@@ -758,7 +793,6 @@ class ParallelAttention(MegatronModule, adapter_mixins.AdapterModuleMixin):
 
         # Strided linear layer.
         if attention_type == AttnType.self_attn:
-            t0 = datetime.datetime.now()
             self.query_key_value = tensor_parallel.ColumnParallelLinear(
                 hidden_size,
                 3 * projection_size,
@@ -771,8 +805,6 @@ class ParallelAttention(MegatronModule, adapter_mixins.AdapterModuleMixin):
                 gradient_accumulation_fusion=gradient_accumulation_fusion,
                 transfer_with_static_ring=transfer_with_static_ring,
             )
-            t1 = datetime.datetime.now()
-            logging.trace(f"In ParallelAttention create self.query_key_value Begin: {t0} Elapsed: {(t1 - t0).total_seconds()} s", trace_type="recovery_time")
         else:
             assert attention_type == AttnType.cross_attn
             self.query = tensor_parallel.ColumnParallelLinear(
@@ -813,15 +845,10 @@ class ParallelAttention(MegatronModule, adapter_mixins.AdapterModuleMixin):
             multi_query_attention=multi_query_attention,
             sequence_parallel=sequence_parallel,
             normalize_attention_scores=normalize_attention_scores,
-            position_embedding_type=self.position_embedding_type,
-            position_interpolation_factor=self.position_interpolation_factor,
-            max_position_embeddings=max_position_embeddings,
-            rotary_percentage=self.rotary_percentage,
+            position_embedding_type=self.position_embedding_type
         )
 
-
         # Output.
-        t0 = datetime.datetime.now()
         self.dense = tensor_parallel.RowParallelLinear(
             projection_size,
             hidden_size,
@@ -834,8 +861,6 @@ class ParallelAttention(MegatronModule, adapter_mixins.AdapterModuleMixin):
             gradient_accumulation_fusion=gradient_accumulation_fusion,
             transfer_with_static_ring=transfer_with_static_ring,
         )
-        t1 = datetime.datetime.now()
-        logging.trace(f"In ParallelAttention create self.dense Begin: {t0} Elapsed: {(t1 - t0).total_seconds()} s", trace_type="recovery_time")
 
         self.headscale = headscale
         if headscale:
@@ -1117,6 +1142,7 @@ class ParallelAttention(MegatronModule, adapter_mixins.AdapterModuleMixin):
         # =================
         # Output. [sq, b, h]
         # =================
+
         output, bias = self.dense(context_layer)
 
         if get_key_value:
@@ -1351,9 +1377,6 @@ class ParallelTransformerLayer_(MegatronModule, adapter_mixins.AdapterModuleMixi
         num_moe_experts=1,
         moe_frequency=1,
         moe_dropout=0.0,
-        position_interpolation_factor=1.0,
-        max_position_embeddings=4096,
-        rotary_percentage=1.0,
     ):
         super(ParallelTransformerLayer_, self).__init__()
 
@@ -1369,8 +1392,6 @@ class ParallelTransformerLayer_(MegatronModule, adapter_mixins.AdapterModuleMixi
         self.bias = bias
         self.transformer_block_type = transformer_block_type
         self.position_embedding_type = position_embedding_type
-        self.position_interpolation_factor = position_interpolation_factor
-        self.rotary_percentage=rotary_percentage
         self.set_accepted_adapter_types([LinearAdapterConfig._target_, ParallelLinearAdapterConfig._target_])
 
         if not bias and bias_dropout_add_fusion:
@@ -1383,7 +1404,7 @@ class ParallelTransformerLayer_(MegatronModule, adapter_mixins.AdapterModuleMixi
 
         if transformer_block_type not in ['pre_ln', 'post_ln', 'normformer', 'gpt_j']:
             raise ValueError(
-                f'transformer_block_type must be either "pre_ln" or "post_ln" or "normformer" or "gpt_j", found {transformer_block_type}'
+                f'transformer_block_type must be either "pre_ln" or "post_ln" or "normformer", found {transformer_block_type}'
             )
 
         self.fp32_residual_connection = fp32_residual_connection  # if true move residual connections to fp32
@@ -1413,7 +1434,6 @@ class ParallelTransformerLayer_(MegatronModule, adapter_mixins.AdapterModuleMixi
                 self.input_layernorm = MixedFusedRMSNorm(hidden_size, layernorm_epsilon,
                     sequence_parallel_enabled=sequence_parallel)
 
-            logging.trace("In ParallelTransfomerLayer() create ParallelAttention for encoder ....", trace_type="recovery_time")
             self.self_attention = ParallelAttention(
                 init_method=init_method,
                 output_layer_init_method=output_layer_init_method,
@@ -1439,11 +1459,7 @@ class ParallelTransformerLayer_(MegatronModule, adapter_mixins.AdapterModuleMixi
                 gradient_accumulation_fusion=gradient_accumulation_fusion,
                 normalize_attention_scores=normalize_attention_scores,
                 transfer_with_static_ring=transfer_with_static_ring,
-                position_interpolation_factor=position_interpolation_factor,
-                max_position_embeddings=max_position_embeddings,
-                rotary_percentage=self.rotary_percentage,
             )
-            logging.trace("In ParallelTransfomerLayer() create ParallelAttention for encoder done", trace_type="recovery_time")
 
             if transformer_block_type == 'normformer':
                 if normalization == 'layernorm':
@@ -1490,7 +1506,6 @@ class ParallelTransformerLayer_(MegatronModule, adapter_mixins.AdapterModuleMixi
                     sequence_parallel_enabled=sequence_parallel)
 
         if self.layer_type == LayerType.decoder or self.layer_type == LayerType.retrieval_encoder:
-            logging.trace("In ParallelTransfomerLayer() create ParallelAttention for decoder ....", trace_type="recovery_time")
             self.inter_attention = ParallelAttention(
                 init_method=init_method,
                 output_layer_init_method=output_layer_init_method,
@@ -1514,8 +1529,6 @@ class ParallelTransformerLayer_(MegatronModule, adapter_mixins.AdapterModuleMixi
                 normalize_attention_scores=normalize_attention_scores,
                 transfer_with_static_ring=transfer_with_static_ring,
             )
-            logging.trace("In ParallelTransfomerLayer() create ParallelAttention for decoder done", trace_type="recovery_time")
-
             # Normformer normalization
             if transformer_block_type == 'normformer':
                 if normalization == 'layernorm':
@@ -1593,7 +1606,6 @@ class ParallelTransformerLayer_(MegatronModule, adapter_mixins.AdapterModuleMixi
 
         # MLP
         if num_moe_experts > 1 and self.layer_number % moe_frequency == 0:
-            logging.trace("In ParallelTransfomerLayer() create SwitchMLP ....", trace_type="recovery_time")
             self.mlp = SwitchMLP(
                 num_experts=num_moe_experts,
                 init_method=init_method,
@@ -1614,9 +1626,7 @@ class ParallelTransformerLayer_(MegatronModule, adapter_mixins.AdapterModuleMixi
                 gradient_accumulation_fusion=gradient_accumulation_fusion,
                 dropout=moe_dropout,
             )
-            logging.trace("In ParallelTransfomerLayer() create SwitchMLP ....", trace_type="recovery_time")
         else:
-            logging.trace("In ParallelTransfomerLayer() create ParallelMLP ....", trace_type="recovery_time")
             self.mlp = ParallelMLP(
                 init_method=init_method,
                 output_layer_init_method=output_layer_init_method,
@@ -1637,8 +1647,6 @@ class ParallelTransformerLayer_(MegatronModule, adapter_mixins.AdapterModuleMixi
                 dropout=ffn_dropout,
                 transfer_with_static_ring=transfer_with_static_ring,
             )
-            logging.trace("In ParallelTransfomerLayer() create ParallelMLP done", trace_type="recovery_time")
-
 
     def _get_bias_droput_add_func(self, transformer_block_type='pre_ln', position_after='attention'):
         """
@@ -1694,9 +1702,8 @@ class ParallelTransformerLayer_(MegatronModule, adapter_mixins.AdapterModuleMixi
             # Pre-LN: x -> LN -> MHA -> Residual -> LN -> MLP -> Residual
             # Post-LN: x -> MHA -> Residual -> LN -> MLP -> Residual -> LN
             # Normformer: x -> LN -> MHA -> LN -> Residual -> MLP (w/LN) -> Residual
-            # GPT_J: x -> LN -> MHA -> Residual -> + ->
-            #         x -> LN -> MLP      --        |
-            # See: https://github.com/EleutherAI/gpt-neox/blob/ac3d8087f1762213880523893a52329d66d2d1a9/megatron/model/transformer.py#L593
+            # gpt_j: https://github.com/EleutherAI/gpt-neox/blob/303d7be582ae1c969347c25c54f568cc122445fc/megatron/model/transformer.py#L804-L847
+            #        x = x + MHA(Input_LN(x)) + MLP(Post_LN(x))
 
             residual = hidden_states
             # Layer norm at the beginning of the transformer layer.
@@ -1705,13 +1712,9 @@ class ParallelTransformerLayer_(MegatronModule, adapter_mixins.AdapterModuleMixi
                     hidden_states = tensor_parallel.checkpoint(self.input_layernorm, False, hidden_states)
                 else:
                     hidden_states = self.input_layernorm(hidden_states)
-            elif self.transformer_block_type == 'gpt_j':
-                if self.checkpoint_layer_norm:
-                    normalization_output = tensor_parallel.checkpoint(self.post_attention_layernorm, False, hidden_states)
-                    hidden_states = tensor_parallel.checkpoint(self.input_layernorm, False, hidden_states)
-                else:
-                    normalization_output = self.post_attention_layernorm(hidden_states)
-                    hidden_states = self.input_layernorm(hidden_states)
+            elif self.transformer_block_type in ['gpt_j']:
+                normalization_output = self.post_attention_layernorm(hidden_states)
+                hidden_states = self.input_layernorm(hidden_states)
 
             # Materialize attention mask right before use
             if is_torch_tpu_available():
@@ -1780,8 +1783,6 @@ class ParallelTransformerLayer_(MegatronModule, adapter_mixins.AdapterModuleMixi
                     normalization_output = tensor_parallel.checkpoint(self.post_attention_layernorm, False, layernorm_input)
                 else:
                     normalization_output = self.post_attention_layernorm(layernorm_input)
-            elif self.transformer_block_type == 'gpt_j':
-                pass # handled above
         else:
             layernorm_input, normalization_output = hidden_states
 
@@ -1842,13 +1843,21 @@ class ParallelTransformerLayer_(MegatronModule, adapter_mixins.AdapterModuleMixi
         # MLP.
         mlp_output, mlp_bias = self.mlp(normalization_output)
 
-        residual = layernorm_input
+        if self.transformer_block_type in ['gpt_j']:
+            bias_dropout_add_func = self._get_bias_droput_add_func(
+                transformer_block_type=self.transformer_block_type, position_after='mlp'
+            )
+            # x = layernorm_input + MLP(Post_LN(x))
+            output = bias_dropout_add_func(mlp_output, mlp_bias, layernorm_input, self.hidden_dropout)
 
-        bias_dropout_add_func = self._get_bias_droput_add_func(
-            transformer_block_type=self.transformer_block_type, position_after='mlp'
-        )
+        else:
+            residual = layernorm_input
 
-        output = bias_dropout_add_func(mlp_output, mlp_bias, residual, self.hidden_dropout)
+            bias_dropout_add_func = self._get_bias_droput_add_func(
+                transformer_block_type=self.transformer_block_type, position_after='mlp'
+            )
+
+            output = bias_dropout_add_func(mlp_output, mlp_bias, residual, self.hidden_dropout)
             # print(f"Layer: {self.layer_number} MLP + Dropout + Residual checksum {output.sum()}")
 
         if self.transformer_block_type == 'post_ln':
@@ -1912,9 +1921,6 @@ class ParallelTransformerLayer(ParallelTransformerLayer_):
         num_moe_experts=1,
         moe_frequency=1,
         moe_dropout=0.0,
-        position_interpolation_factor=1.0,
-        max_position_embeddings=4096,
-        rotary_percentage=1.0,
     ):
         super(ParallelTransformerLayer, self).__init__(
             init_method=init_method,
@@ -1956,9 +1962,6 @@ class ParallelTransformerLayer(ParallelTransformerLayer_):
             num_moe_experts=num_moe_experts,
             moe_frequency=moe_frequency,
             moe_dropout=moe_dropout,
-            position_interpolation_factor=position_interpolation_factor,
-            max_position_embeddings=max_position_embeddings,
-            rotary_percentage=rotary_percentage,
         )
 
         if precision == 32:
@@ -2181,9 +2184,6 @@ class ParallelTransformer(MegatronModule):
         num_moe_experts=1,
         moe_frequency=1,
         moe_dropout=0.0,
-        position_interpolation_factor=1.0,
-        max_position_embeddings=4096,
-        rotary_percentage=1.0,
     ):
         super(ParallelTransformer, self).__init__()
 
@@ -2203,10 +2203,8 @@ class ParallelTransformer(MegatronModule):
         self.transformer_block_type = transformer_block_type
         self.layer_type = layer_type
         self.position_embedding_type = position_embedding_type
-        self.position_interpolation_factor = position_interpolation_factor
         self.multi_query_attention = multi_query_attention
-        self.max_position_embeddings=max_position_embeddings
-        self.rotary_percentage=rotary_percentage
+
         self.activations_checkpoint_method = activations_checkpoint_method
         self.activations_checkpoint_num_layers = activations_checkpoint_num_layers
         self.activations_checkpoint_granularity = activations_checkpoint_granularity
@@ -2297,7 +2295,6 @@ class ParallelTransformer(MegatronModule):
                 lt = layer_type
 
             if self.transformer_engine:
-                logging.trace(f"building AutocastTransfomerLayer {layer_number} begin", trace_type="recovery_time")
                 return AutocastTransformerLayer(
                     hidden_size=hidden_size,
                     ffn_hidden_size=ffn_hidden_size,
@@ -2324,7 +2321,6 @@ class ParallelTransformer(MegatronModule):
                     zero_centered_gamma=normalization == 'layernorm1p',
                 )
             else:
-                logging.trace(f"building ParallelTransformerLayer {layer_number} begin", trace_type="recovery_time")
                 return ParallelTransformerLayer(
                     init_method=init_method,
                     output_layer_init_method=output_layer_init_method,
@@ -2363,10 +2359,7 @@ class ParallelTransformer(MegatronModule):
                     num_moe_experts=num_moe_experts,
                     moe_frequency=moe_frequency,
                     moe_dropout=moe_dropout,
-                    position_embedding_type=self.position_embedding_type,
-                    position_interpolation_factor=self.position_interpolation_factor,
-                    max_position_embeddings=self.max_position_embeddings,
-                    rotary_percentage=self.rotary_percentage,
+                    position_embedding_type=self.position_embedding_type
                 )
 
         if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
@@ -2405,9 +2398,7 @@ class ParallelTransformer(MegatronModule):
             else:
                 offset = parallel_state.get_pipeline_model_parallel_rank() * self.num_layers
 
-        logging.trace("In ParallelTransformer(), building layers begin", trace_type="recovery_time")
         self.layers = torch.nn.ModuleList([build_layer(i + 1 + offset) for i in range(self.num_layers)])
-        logging.trace("In ParallelTransformer(), building layers done", trace_type="recovery_time")
 
         if self.post_process and self.transformer_block_type != 'post_ln':
             # Final layer norm before output.

@@ -27,7 +27,7 @@ from nemo.collections.nlp.data.language_modeling.megatron.base_dataset_utils imp
     get_datasets_weights_and_num_samples,
     get_train_valid_test_split_,
 )
-from nemo.collections.nlp.data.language_modeling.megatron.blendable_dataset import MemoryEfficientBlendableDataset
+from nemo.collections.nlp.data.language_modeling.megatron.blendable_dataset import BlendableDataset
 from nemo.collections.nlp.data.language_modeling.megatron.indexed_dataset import deallocate_indexed_dataset_memory
 from nemo.collections.nlp.data.language_modeling.megatron.indexed_dataset import make_dataset as make_indexed_dataset
 from nemo.core import Dataset
@@ -103,7 +103,7 @@ def build_dataset(cfg, trainer, data_prefix, data_impl, num_samples, seq_length,
         for i in range(len(prefixes)):
             dataset = _build_dataset(prefixes[i], datasets_num_samples[i])
             datasets.append(dataset)
-        return MemoryEfficientBlendableDataset(datasets, weights, num_samples)
+        return BlendableDataset(datasets, weights, num_samples)
 
 
 def build_train_valid_test_datasets(
@@ -214,13 +214,13 @@ def build_train_valid_test_datasets(
         # Blend.
         blending_train_dataset = None
         if train_datasets:
-            blending_train_dataset = MemoryEfficientBlendableDataset(train_datasets, weights, train_n)
+            blending_train_dataset = BlendableDataset(train_datasets, weights, train_n)
         blending_valid_dataset = None
         if valid_datasets:
-            blending_valid_dataset = MemoryEfficientBlendableDataset(valid_datasets, weights, valid_n)
+            blending_valid_dataset = BlendableDataset(valid_datasets, weights, valid_n)
         blending_test_dataset = None
         if test_datasets:
-            blending_test_dataset = MemoryEfficientBlendableDataset(test_datasets, weights, test_n)
+            blending_test_dataset = BlendableDataset(test_datasets, weights, test_n)
 
         return (blending_train_dataset, blending_valid_dataset, blending_test_dataset)
 
@@ -349,6 +349,10 @@ class GPTDataset(Dataset):
                     os.makedirs(self.index_mapping_dir)
             torch.distributed.barrier()
 
+        gloo_group = None
+        if USING_TORCH_VERSION2:
+            gloo_group = trainer.strategy.gloo_group
+
         # Build index mappings.
         self.doc_idx, self.sample_idx, self.shuffle_idx = _build_index_mappings(
             self.name,
@@ -361,6 +365,7 @@ class GPTDataset(Dataset):
             index_mapping_dir=self.index_mapping_dir,
             drop_last=drop_last,
             add_extra_token=self.add_extra_token,
+            gloo_group=gloo_group
         )
         deallocate_indexed_dataset_memory(self.indexed_dataset)
 
@@ -504,7 +509,8 @@ def _build_index_mappings(
     seed,
     index_mapping_dir: str = None,
     drop_last: bool = True,
-    add_extra_token: int = 1
+    add_extra_token: int = 1,
+    gloo_group: Optional[torch.distributed.ProcessGroup] = None
 ):
     """Build doc-idx, sample-idx, and shuffle-idx.
     doc-idx: is an array (ordered) of documents to be used in training.
@@ -555,7 +561,12 @@ def _build_index_mappings(
                 num_samples_from_epochs_minus_one = (
                     (num_epochs - 1) * tokens_per_epoch - add_extra_token
                 ) // seq_length
+                
+                print(f"num_samples_from_epochs_minus_one: {num_samples_from_epochs_minus_one} || num_epochs: {num_epochs} || tokens_per_epoch: {tokens_per_epoch} || add_extra_token: {add_extra_token} || seq_length: {seq_length}")
+                
                 last_epoch_num_samples = num_samples - num_samples_from_epochs_minus_one
+                
+                print(f"num_samples: {num_samples} ||??? ")
                 assert last_epoch_num_samples >= 0, 'last epoch number of samples should be non-negative.'
                 num_samples_per_epoch = (tokens_per_epoch - add_extra_token) // seq_length
                 assert last_epoch_num_samples < (
@@ -631,7 +642,10 @@ def _build_index_mappings(
 
     # torch.distributed.barrier()
     import torch_xla.core.xla_model as xm
-    xm.rendezvous('shuffle_idx_mapping')
+    if USING_TORCH_VERSION2:
+        torch.distributed.monitored_barrier(group=gloo_group)
+    else:
+        xm.rendezvous('shuffle_idx_mapping')
     #counts = torch.cuda.LongTensor([1])
     #torch.distributed.all_reduce(counts, group=parallel_state.get_data_parallel_group())
     #torch.distributed.all_reduce(counts, group=parallel_state.get_pipeline_model_parallel_group())

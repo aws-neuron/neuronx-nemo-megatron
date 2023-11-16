@@ -22,7 +22,6 @@ from functools import partial
 
 import numpy as np
 import torch
-import torch_xla.core.xla_model as xm
 
 from nemo.core import Dataset
 from nemo.utils import logging
@@ -108,7 +107,9 @@ class TextMemMapDataset(Dataset):
 
         if not is_ditributed or (is_ditributed and torch.distributed.get_rank() == 0):
             build_index_files(dataset_paths, newline_int, workers=self._worker, build_index_fn=build_index_fn)
-        xm.rendezvous("Building dataset")
+
+        if is_ditributed:
+            torch.distributed.barrier()
 
         logging.info(f"Loading data files")
         start_time = time.time()
@@ -311,7 +312,7 @@ def _build_memmap_index_files(newline_int, build_index_fn, fn):
 def build_index_files(dataset_paths, newline_int, workers=None, build_index_fn=_build_index_from_memdata):
     """Auxiliary method to build multiple index files"""
     if len(dataset_paths) < 1:
-        raise ValueError("files_list must contain at least one file name")
+        raise ValueError("files_list must contain at leat one file name")
 
     if workers is None:
         workers = max(1, os.cpu_count() // 2)
