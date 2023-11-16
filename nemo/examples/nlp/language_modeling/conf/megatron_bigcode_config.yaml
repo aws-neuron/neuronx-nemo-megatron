@@ -200,6 +200,108 @@ model:
     pad_samples_to_global_batch_size: False # Set to True if you want to pad the last partial batch with -1's to equal global batch size
     fim_rate: 0.5
     fim_spm_rate: 0
+
+    # Below configs only used with fine tuning
+    fine_tuning: False # Set to True to use fine-tuning dataloader instead of pretraining
+
+    chat: False # whether use chatbot data or not
+    train_ds:
+        # Example of how to specify paths to multiple datasets
+        # file_names:
+        #   - /path/to/squad.jsonl
+        #   - /path/to/mnli.jsonl
+        #   - /path/to/boolq.jsonl
+        # Example of how each dataset is formatted
+        # {'input': 'John von Neumann\nVon Neumann made fundamental contributions .... Q: What did the math of artificial viscosity do?', 'output': 'smoothed the shock transition without sacrificing basic physics'}
+      file_names:  # Path to a list of JSONL files corresponding to the source data.
+        - /path/to/file.jsonl
+      global_batch_size: ${model.global_batch_size}
+      micro_batch_size: ${model.micro_batch_size}
+      shuffle: True
+      num_workers: 1
+      memmap_workers: 1
+      pin_memory: False
+      max_seq_length: ${model.encoder_seq_length}
+      min_seq_length: 1
+      drop_last: True
+        # Example of how to specify concat_sampling_probabilities
+        # concat_sampling_probabilities:
+        #   - 0.5
+        #   - 0.25
+        #   - 0.25
+      concat_sampling_probabilities:  # When providing a list of datasets, this arg defines the sampling probabilities from each dataset when strategy='random'
+            - 1.0
+      label_key: 'output'
+      add_eos: True
+      add_sep: False
+      add_bos: False
+      truncation_field: "input" # # Can be multiple keys separated with ',' Options: keys in prompt_template
+      index_mapping_dir: null # Path to a directory to write index mapping files.
+      prompt_template: "{input} {output}" # fstring to use for assistant prompt. Example: "Q: {input}\nA: {output}"
+      hf_dataset: False # Whether to load the json file with the HuggingFace dataset. otherwise, will load the jsonl file with the JSONLMemMapDataset.
+      truncation_method: 'right' # Truncation from which position, Options: ['left', 'right']
+
+    validation_ds:
+      file_names: null # Path to a list of JSONL files corresponding to the source data. Data format is identical to train_ds.
+      names: null # Names of the corresponding datasets used to log metrics.
+      concat_sampling_probabilities: # When providing a list of datasets, this arg defines the sampling probabilities from each dataset when strategy='random'
+        - 1.0
+      global_batch_size: ${model.global_batch_size}
+      micro_batch_size: ${model.micro_batch_size}
+      shuffle: False
+      num_workers: 4
+      memmap_workers: ${model.data.train_ds.memmap_workers}
+      pin_memory: False
+      max_seq_length: ${model.encoder_seq_length}
+      min_seq_length: 1
+      drop_last: False
+      label_key: ${model.data.train_ds.label_key}
+      add_eos: ${model.data.train_ds.add_eos}
+      add_sep: ${model.data.train_ds.add_sep}
+      add_bos: ${model.data.train_ds.add_bos}
+      write_predictions_to_file: False
+      output_file_path_prefix: null # Prefix of the file to write predictions to.
+      truncation_field: ${model.data.train_ds.truncation_field} # Options: keys in prompt_template
+      index_mapping_dir: null # Path to a directory to write index mapping files.
+      prompt_template: ${model.data.train_ds.prompt_template} # fstring to use for assistant prompt. Example: "Q: {input}\nA: {output}"
+      tokens_to_generate: 32 # decide how many tokens we want to generate to evaluate performance with string metrics
+      hf_dataset: False # Whether to load the json file with the HuggingFace dataset. otherwise, will load the jsonl file with the JSONLMemMapDataset.
+      truncation_method: 'right' # Truncation from which position, Options: ['left', 'right']
+
+      metric:
+        name: "loss" # Name of the evaluation metric to use. Options: ['exact_string_match', 'loss', 'rouge', 'token_f1']
+        average: null # Average the metric over the dataset. Options: ['macro', 'micro']. Works only for 'F1', 'accuracy' etc. Refer to torchmetrics for metrics where this is supported.
+        num_classes: null
+
+    test_ds:
+      file_names: null # Path to a list of JSONL files corresponding to the source data. Data format is identical to train_ds.
+      names: null # Names of the corresponding datasets used to log metrics.
+      global_batch_size: ${model.global_batch_size}
+      micro_batch_size: ${model.micro_batch_size}
+      shuffle: False
+      num_workers: 4
+      memmap_workers: ${model.data.train_ds.memmap_workers}
+      pin_memory: True
+      max_seq_length: ${model.data.train_ds.max_seq_length}
+      min_seq_length: 1
+      drop_last: False
+      label_key: ${model.data.train_ds.label_key}
+      add_eos: ${model.data.train_ds.add_eos}
+      add_sep: ${model.data.train_ds.add_sep}
+      add_bos: ${model.data.train_ds.add_bos}
+      write_predictions_to_file: False
+      output_file_path_prefix: null # Prefix of the file to write predictions to.
+      truncation_field: ${model.data.train_ds.truncation_field} # Options: keys in prompt_template
+      index_mapping_dir: null # Path to a directory to write index mapping files.
+      prompt_template: ${model.data.train_ds.prompt_template} # fstring to use for assistant prompt. Example: "Q: {input}\nA: {output}"
+      tokens_to_generate: 32 # decide how many tokens we want to generate to evaluate performance with string metrics
+      hf_dataset: False # Whether to load the json file with the HuggingFace dataset. otherwise, will load the jsonl file with the JSONLMemMapDataset.
+      truncation_method: 'right' # Truncation from which position, Options: Options: ['left', 'right']
+
+      metric:
+        name: "loss" # Name of the evaluation metric to use. Options: ['exact_string_match', 'loss']
+        average: null # Average the metric over the dataset. Options: ['macro', 'micro']. Works only for 'F1', 'accuracy' etc. Refer to torchmetrics for metrics where this is supported.
+        num_classes: null
   # Nsys profiling options
   nsys_profile:
     enabled: False

@@ -181,9 +181,11 @@ def convert_checkpoint(p):
                 else:
                     split, key, dim, transpose = reverse_translation[k]
                     if "wte" in k and p == 0:
-                        assert tokenizer_vocab_size >= v.shape[0]
-                        x = pad_to_vocab_size_and_tp(
-                            v, tokenizer_vocab_size, TP, args.make_vocab_size_divisible_by)
+                        if tokenizer_vocab_size > v.shape[0]:
+                            x = pad_to_vocab_size_and_tp(
+                                v, tokenizer_vocab_size, TP, args.make_vocab_size_divisible_by)
+                        else:
+                            x = v
                         last_dim_size = x.shape[0]
                         tp_last_dim_size = last_dim_size // TP
                         nemo_model[key] = x[

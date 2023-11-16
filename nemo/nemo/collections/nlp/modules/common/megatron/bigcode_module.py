@@ -14,48 +14,36 @@
 # limitations under the License.
 
 """Transformer."""
-import math
 from contextlib import nullcontext
-from typing import Any, Callable, Optional
 import datetime
 import torch
-import torch.nn.functional as F
-from einops import rearrange, repeat
-from nemo.collections.common.parts.adapter_modules import LinearAdapterConfig
+from einops import rearrange
 from nemo.collections.nlp.modules.common.megatron.adapters.parallel_adapters import (
     AdapterName,
     InfusedAdapterConfig,
-    MLPInfusedAdapterConfig,
-    ParallelLinearAdapterConfig,
 )
-from nemo.collections.nlp.modules.common.megatron.fused_bias_dropout_add import (
-    bias_dropout_add,
-    bias_dropout_add_fused_inference,
-    bias_dropout_add_fused_train,
-    dropout_add,
-)
-from nemo.collections.nlp.modules.common.megatron.fused_bias_geglu import fused_bias_geglu
-from nemo.collections.nlp.modules.common.megatron.fused_bias_gelu import fused_bias_gelu
 from nemo.collections.nlp.modules.common.megatron.fused_layer_norm import get_layer_norm
-from nemo.collections.nlp.modules.common.megatron.fused_softmax import MatchedScaleMaskSoftmax
 from nemo.collections.nlp.modules.common.megatron.layer_norm_1p import LayerNorm1P
 from nemo.collections.nlp.modules.common.megatron.layer_type import LayerType
 from nemo.collections.nlp.modules.common.megatron.module import MegatronModule
-from nemo.collections.nlp.modules.common.megatron.rotary_pos_embedding import RotaryEmbedding, apply_rotary_pos_emb
-from nemo.collections.nlp.modules.common.megatron.utils import ApexGuardDefaults, attention_mask_func, erf_gelu, get_linear_layer
-from nemo.collections.nlp.modules.common.megatron.utils import openai_gelu as openai_gelu_func
+from nemo.collections.nlp.modules.common.megatron.rotary_pos_embedding import apply_rotary_pos_emb
+from nemo.collections.nlp.modules.common.megatron.utils import ApexGuardDefaults, get_linear_layer
 from nemo.core import adapter_mixins
 from nemo.utils import logging
-from transformers.utils import is_torch_tpu_available
+
+from nemo.collections.nlp.modules.common.megatron.transformer import (
+    CoreAttention,
+    ParallelTransformerLayer_,
+    AutocastTransformerLayer,
+)
+from nemo.collections.nlp.modules.common.megatron.language_model import Embedding, Pooler
 
 try:
     from apex.transformer import parallel_state, tensor_parallel
     from apex.transformer.enums import AttnMaskType, AttnType, ModelType
     from apex.transformer.utils import divide as safe_divide
-    from apex.transformer.parallel_state import get_tensor_model_parallel_world_size
     # from apex.normalization import MixedFusedRMSNorm
     from apex.transformer.layers.layer_norm import FastRMSNorm as MixedFusedRMSNorm
-    from apex.transformer.functional.fused_softmax import FusedScaleMaskSoftmax
 
     HAVE_APEX = True
 
@@ -67,7 +55,7 @@ except (ImportError, ModuleNotFoundError):
     ModelType = AttnMaskType = AttnType = LayerType = ApexGuardDefaults()
 
 try:
-    from transformer_engine.pytorch import TransformerLayer, fp8_autocast
+    from transformer_engine.pytorch import fp8_autocast
     from transformer_engine.common import recipe
     from transformer_engine.pytorch.distributed import checkpoint as te_checkpoint
 
@@ -99,648 +87,6 @@ except:
     tensor of the same size. We use the following arguments:
         hyperparameters: transformer hyperparameters
 """
-
-
-class ParallelMLP(MegatronModule, adapter_mixins.AdapterModuleMixin):
-    """MLP.
-
-    MLP will take the input with h hidden state, project it to 4*h
-    hidden dimension, perform nonlinear transformation, and project the
-    state back into h hidden dimension.
-    """
-
-    def __init__(
-        self,
-        init_method,
-        output_layer_init_method,
-        hidden_size,
-        ffn_hidden_size,
-        use_cpu_initialization=False,
-        bias_activation_fusion=True,
-        openai_gelu=False,
-        onnx_safe=False,
-        activation='gelu',
-        bias=True,
-        transformer_block_type='pre_ln',
-        normalization='layernorm',
-        layernorm_epsilon=1e-5,
-        persist_layer_norm=False,
-        sequence_parallel=False,
-        gradient_accumulation_fusion=False,
-        dropout=0.0,
-        transfer_with_static_ring=True,
-    ):
-        super(ParallelMLP, self).__init__()
-        self.activation = activation
-        self.bias = bias
-        self.transformer_block_type = transformer_block_type
-        self.normalization = normalization
-        self.layernorm_epsilon = layernorm_epsilon
-        self.persist_layer_norm = persist_layer_norm
-        self.activation = activation
-        self.dropout = dropout
-        self.set_accepted_adapter_types([MLPInfusedAdapterConfig._target_])
-
-        if activation not in ['gelu', 'geglu', 'reglu', 'swiglu']:
-            raise ValueError(
-                f"Activation {activation} not supported. Only gelu, geglu, reglu, swiglu are supported.")
-
-        no_async_tensor_model_parallel_allreduce = (
-            parallel_state.get_tensor_model_parallel_world_size() == 1 or sequence_parallel
-        )
-        t0 = datetime.datetime.now()
-        # Project to 4h.
-        self.dense_h_to_4h = tensor_parallel.ColumnParallelLinear(
-            hidden_size,
-            # NOTE: When using geglu, divide ffn dim by 2/3 to keep overall params the same.
-            ffn_hidden_size,
-            gather_output=False,
-            init_method=init_method,
-            skip_bias_add=True,
-            use_cpu_initialization=use_cpu_initialization,
-            bias=bias,
-            sequence_parallel_enabled=sequence_parallel,
-            no_async_tensor_model_parallel_allreduce=no_async_tensor_model_parallel_allreduce,
-            gradient_accumulation_fusion=gradient_accumulation_fusion,
-            transfer_with_static_ring=transfer_with_static_ring,
-        )
-        t1 = datetime.datetime.now()
-        logging.trace(
-            f"In ParallelMLP  create self.dense_h_to_4h. Begin: {t0} Elapsed: {(t1 - t0).total_seconds()} s.", trace_type="recovery_time")
-
-        if activation in ['geglu', 'reglu', 'swiglu']:
-            # Separate linear layer for *GLU activations.
-            # Source: https://github.com/huggingface/transformers/blob/bee361c6f1f7704f8c688895f2f86f6e5ff84727/src/transformers/models/t5/modeling_t5.py#L292
-            t0 = datetime.datetime.now()
-            self.dense_h_to_4h_2 = tensor_parallel.ColumnParallelLinear(
-                hidden_size,
-                # NOTE: When using *glu, divide ffn dim by 2/3 to keep overall params the same.
-                ffn_hidden_size,
-                gather_output=False,
-                init_method=init_method,
-                skip_bias_add=True,
-                use_cpu_initialization=use_cpu_initialization,
-                bias=bias,
-                sequence_parallel_enabled=sequence_parallel,
-                no_async_tensor_model_parallel_allreduce=no_async_tensor_model_parallel_allreduce,
-                gradient_accumulation_fusion=gradient_accumulation_fusion,
-                transfer_with_static_ring=transfer_with_static_ring,
-            )
-            t1 = datetime.datetime.now()
-            logging.trace(
-                f"In ParallelMLP create self.dense_h_to_4h_2. Begin: {t0} Elapsed: {(t1 - t0).total_seconds()} s.", trace_type="recovery_time")
-
-        self.glu_activation_family = activation in ['geglu', 'reglu', 'swiglu']
-        bias_activation_fusion_unavailable = activation in ['reglu', 'swiglu']
-
-        if bias_activation_fusion_unavailable and bias_activation_fusion:
-            raise ValueError(
-                f"Cannot use bias_activation_fusion with {activation} activation. Please turn bias gelu fusion off."
-            )
-
-        if self.glu_activation_family and onnx_safe and self.bias_activation_fusion:
-            raise ValueError(
-                f"Cannot use onnx_safe with specificed activation function and bias_activation_fusion : {activation} Please turn onnx safe off."
-            )
-
-        if bias_activation_fusion and not bias:
-            raise ValueError(
-                f"Cannot use bias_activation_fusion without bias terms. Please set bias=True or bias_activation_fusion=False."
-            )
-
-        self.bias_activation_fusion = bias_activation_fusion
-
-        # Give openai_gelu precedence over other activations if set, for HF compatibility. Normally this is off and shouldn't affect regular model training.
-        if openai_gelu:
-            self.activation_func = openai_gelu_func
-        elif activation in ["gelu", "geglu"]:
-            self.activation_func = F.gelu
-        elif onnx_safe:
-            self.activation_func = erf_gelu
-        elif activation == "reglu":
-            self.activation_func = F.relu
-        elif activation == "swiglu":
-            # SiLU or sigmoid linear unit is the same as swish with beta = 1 (which is what https://arxiv.org/pdf/2002.05202.pdf uses.)
-            self.activation_func = F.silu
-
-        # Project back to h.
-        t0 = datetime.datetime.now()
-        self.dense_4h_to_h = tensor_parallel.RowParallelLinear(
-            ffn_hidden_size,
-            hidden_size,
-            input_is_parallel=True,
-            init_method=output_layer_init_method,
-            skip_bias_add=True,
-            use_cpu_initialization=use_cpu_initialization,
-            bias=bias,
-            sequence_parallel_enabled=sequence_parallel,
-            gradient_accumulation_fusion=gradient_accumulation_fusion,
-            transfer_with_static_ring=transfer_with_static_ring,
-        )
-        t1 = datetime.datetime.now()
-        logging.trace(
-            f"In ParallelMLP create self.dense_4h_to_h. Begin: {t0} Elapsed: {(t1 - t0).total_seconds()} s.", trace_type="recovery_time")
-
-        # Normformer normalization
-        if transformer_block_type == 'normformer':
-            if normalization == 'layernorm':
-                self.normalization = get_layer_norm(
-                    ffn_hidden_size // get_tensor_model_parallel_world_size(), layernorm_epsilon, persist_layer_norm
-                )
-            elif normalization == 'layernorm1p':
-                self.normalization = LayerNorm1P(
-                    ffn_hidden_size // get_tensor_model_parallel_world_size(),
-                    layernorm_epsilon,
-                    sequence_parallel_enabled=sequence_parallel,
-                )
-            else:
-                self.normalization = MixedFusedRMSNorm(
-                    ffn_hidden_size // get_tensor_model_parallel_world_size(), layernorm_epsilon,
-                    sequence_parallel_enabled=sequence_parallel
-                )
-
-    def forward(self, hidden_states):
-
-        # [s, b, 4hp]
-        intermediate_parallel, bias_parallel = self.dense_h_to_4h(
-            hidden_states)
-
-        if self.glu_activation_family:
-            intermediate_parallel_2, bias_parallel_2 = self.dense_h_to_4h_2(
-                hidden_states)
-
-        if self.bias_activation_fusion:
-            if self.activation == 'gelu':
-                intermediate_parallel = fused_bias_gelu(
-                    intermediate_parallel, bias_parallel)
-            elif self.activation == 'geglu':
-                intermediate_parallel = fused_bias_geglu(
-                    intermediate_parallel, bias_parallel, intermediate_parallel_2, bias_parallel_2
-                )
-
-        elif self.activation in ['reglu', 'swiglu'] or (
-            self.glu_activation_family and not self.bias_activation_fusion
-        ):
-            if bias_parallel is not None:
-                intermediate_parallel = self.activation_func(intermediate_parallel + bias_parallel) * (
-                    intermediate_parallel_2 + bias_parallel_2
-                )
-            else:
-                intermediate_parallel = self.activation_func(
-                    intermediate_parallel) * intermediate_parallel_2
-
-        else:
-            if bias_parallel is not None:
-                intermediate_parallel = self.activation_func(
-                    intermediate_parallel + bias_parallel)
-            else:
-                intermediate_parallel = self.activation_func(
-                    intermediate_parallel)
-
-        if self.dropout > 0:
-            intermediate_parallel = F.dropout(
-                intermediate_parallel, p=self.dropout, training=self.training)
-
-        infused_adapter = self.get_from_adapter_layer(AdapterName.MLP_INFUSED)
-        if infused_adapter:
-            intermediate_parallel = infused_adapter(intermediate_parallel)
-
-        # Normformer normalization
-        if self.transformer_block_type == 'normformer':
-            intermediate_parallel = self.normalization(intermediate_parallel)
-
-        # [s, b, h]
-        output, output_bias = self.dense_4h_to_h(intermediate_parallel)
-        return output, output_bias
-
-
-class SwitchMLP(MegatronModule):
-    """Top-1 MoE
-
-    Curently supports Sinkhorn based expert routing."""
-
-    def __init__(
-        self,
-        num_experts,
-        init_method,
-        output_layer_init_method,
-        hidden_size,
-        ffn_hidden_size,
-        use_cpu_initialization=False,
-        bias_activation_fusion=True,
-        openai_gelu=False,
-        onnx_safe=False,
-        activation='gelu',
-        bias=True,
-        transformer_block_type='pre_ln',
-        normalization='layernorm',
-        layernorm_epsilon=1e-5,
-        persist_layer_norm=False,
-        sequence_parallel=False,
-        gradient_accumulation_fusion=False,
-        dropout=0.0,
-    ):
-        super(SwitchMLP, self).__init__()
-
-        self.num_experts = num_experts
-        self.route_algo = SwitchMLP.sinkhorn
-        self.router = tensor_parallel.RowParallelLinear(
-            hidden_size,
-            num_experts,
-            input_is_parallel=False,
-            init_method=init_method,
-            skip_bias_add=False,
-            use_cpu_initialization=use_cpu_initialization,
-            bias=bias,
-            sequence_parallel_enabled=sequence_parallel,
-            gradient_accumulation_fusion=gradient_accumulation_fusion,
-        )
-
-        mlp_args = {
-            'init_method': init_method,
-            'output_layer_init_method': output_layer_init_method,
-            'hidden_size': hidden_size,
-            'ffn_hidden_size': ffn_hidden_size,
-            'use_cpu_initialization': use_cpu_initialization,
-            'bias_activation_fusion': bias_activation_fusion,
-            'openai_gelu': openai_gelu,
-            'onnx_safe': onnx_safe,
-            'activation': activation,
-            'bias': bias,
-            'transformer_block_type': transformer_block_type,
-            'normalization': normalization,
-            'layernorm_epsilon': layernorm_epsilon,
-            'persist_layer_norm': persist_layer_norm,
-            'sequence_parallel': sequence_parallel,
-            'gradient_accumulation_fusion': gradient_accumulation_fusion,
-            'dropout': dropout,
-        }
-        self.experts = torch.nn.ModuleList(
-            [ParallelMLP(**mlp_args) for _ in range(num_experts)])
-
-    def forward(self, hidden_states):
-        hidden_shape = hidden_states.shape
-        route, _ = self.router(hidden_states)
-        route = route.view(-1, self.num_experts)
-        if self.training:
-            with torch.no_grad():
-                norm_route = self.route_algo(
-                    route.detach().to(dtype=torch.float32)
-                )  # explicit fp32 conversion for stability
-                _, max_ind = torch.max(norm_route, dim=1)
-            route = torch.sigmoid(route)
-            max_prob = route[torch.arange(route.size(0)), max_ind]
-        else:
-            route = torch.sigmoid(route)
-            max_prob, max_ind = torch.max(route, dim=1)
-        max_prob = torch.unsqueeze(max_prob, 1)
-
-        hidden_states = hidden_states.view(-1, hidden_shape[-1])
-
-        local_indices = (max_ind == 0).nonzero()
-        hidden = hidden_states[local_indices, :]
-        output, output_bias = self.experts[0](hidden)
-        output_bias = output_bias.expand_as(output)
-
-        output_total = torch.empty_like(hidden_states, dtype=output.dtype)
-        output_bias_total = torch.empty_like(
-            hidden_states, dtype=output_bias.dtype)
-
-        output_total[local_indices, :] = output
-        output_bias_total[local_indices, :] = output_bias
-
-        for expert_num, expert in enumerate(self.experts):
-            if expert_num == 0:
-                continue
-            local_indices = (max_ind == expert_num).nonzero()
-            hidden = hidden_states[local_indices, :]
-            output, output_bias = expert(hidden)
-            output_bias = output_bias.expand_as(output)
-            output_total[local_indices, :] = output
-            output_bias_total[local_indices, :] = output_bias
-
-        output_total = output_total * max_prob
-        output_bias_total = output_bias_total * max_prob
-        output_total = output_total.view(hidden_shape)
-        output_bias_total = output_bias_total.view(hidden_shape)
-
-        return output_total, output_bias_total
-
-    @classmethod
-    def sinkhorn(cls, cost, tol=0.0001):
-        "Megatron-LMs sinkhorn implementation"
-
-        cost = torch.exp(cost)
-        d0 = torch.ones(cost.size(0), device=cost.device, dtype=cost.dtype)
-        d1 = torch.ones(cost.size(1), device=cost.device, dtype=cost.dtype)
-
-        eps = 0.00000001
-        error = 1e9
-        d1_old = d1
-        while error > tol:
-            d0 = (1 / d0.size(0)) * 1 / (torch.sum(d1 * cost, 1) + eps)
-            d1 = (1 / d1.size(0)) * 1 / \
-                (torch.sum(d0.unsqueeze(1) * cost, 0) + eps)
-            error = torch.mean(torch.abs(d1_old - d1))
-            d1_old = d1
-        return d1 * cost * d0.unsqueeze(1)
-
-
-class Embedding(MegatronModule):
-    """Language model embeddings.
-
-    Arguments:
-        hidden_size: hidden size
-        vocab_size: vocabulary size
-        max_sequence_length: maximum size of sequence. This
-                             is used for positional embedding
-        embedding_dropout_prob: dropout probability for embeddings
-        init_method: weight initialization method
-        num_tokentypes: size of the token-type embeddings. 0 value
-                        will ignore this embedding
-        use_cpu_initialization: whether to initialize the weights in CPU
-        position_embedding_type: position embedding type determines whether we instantiate a learnable position embedding table.
-    """
-
-    def __init__(
-        self,
-        hidden_size,
-        vocab_size,
-        max_sequence_length,
-        embedding_dropout_prob,
-        init_method,
-        num_tokentypes=0,
-        use_cpu_initialization=False,
-        fp32_residual_connection=False,
-        sequence_parallel=False,
-        position_embedding_type='learned_absolute',
-        transpose_batch_sequence=True,
-    ):
-        super(Embedding, self).__init__()
-
-        self.hidden_size = hidden_size
-        self.init_method = init_method
-        self.num_tokentypes = num_tokentypes
-        self.position_embedding_type = position_embedding_type
-        self.transpose_batch_sequence = transpose_batch_sequence
-
-        # Word embeddings (parallel).
-        self.word_embeddings = tensor_parallel.VocabParallelEmbedding(
-            vocab_size, self.hidden_size, init_method=self.init_method, use_cpu_initialization=use_cpu_initialization,
-        )
-        self._word_embeddings_key = 'word_embeddings'
-
-        if self.position_embedding_type == 'learned_absolute':
-            # Position embedding (serial).
-            self.position_embeddings = torch.nn.Embedding(
-                max_sequence_length, self.hidden_size)
-            self._position_embeddings_key = 'position_embeddings'
-            # Initialize the position embeddings.
-            self.init_method(self.position_embeddings.weight)
-
-        # Token type embedding.
-        # Add this as an optional field that can be added through
-        # method call so we can load a pretrain model without
-        # token types and add them as needed.
-        self._tokentype_embeddings_key = 'tokentype_embeddings'
-        if self.num_tokentypes > 0:
-            self.tokentype_embeddings = torch.nn.Embedding(
-                self.num_tokentypes, self.hidden_size)
-            # Initialize the token-type embeddings.
-            self.init_method(self.tokentype_embeddings.weight)
-        else:
-            self.tokentype_embeddings = None
-
-        self.fp32_residual_connection = fp32_residual_connection
-        self.sequence_parallel = sequence_parallel
-
-        # Embeddings dropout
-        self.embedding_dropout = torch.nn.Dropout(embedding_dropout_prob)
-
-    def zero_parameters(self):
-        """Zero out all parameters in embedding."""
-        self.word_embeddings.weight.data.fill_(0)
-        self.word_embeddings.weight.shared = True
-        if self.position_embedding_type == 'learned_absolute':
-            self.position_embeddings.weight.data.fill_(0)
-            self.position_embeddings.weight.shared = True
-        if self.num_tokentypes > 0:
-            self.tokentype_embeddings.weight.data.fill_(0)
-            self.tokentype_embeddings.weight.shared = True
-
-    def add_tokentype_embeddings(self, num_tokentypes):
-        """Add token-type embedding. This function is provided so we can add
-        token-type embeddings in case the pretrained model does not have it.
-        This allows us to load the model normally and then add this embedding.
-        """
-        if self.tokentype_embeddings is not None:
-            raise Exception('tokentype embeddings is already initialized')
-        if torch.distributed.get_rank() == 0:
-            print('adding embedding for {} tokentypes'.format(
-                num_tokentypes), flush=True)
-        self.num_tokentypes = num_tokentypes
-        self.tokentype_embeddings = torch.nn.Embedding(
-            num_tokentypes, self.hidden_size)
-        # Initialize the token-type embeddings.
-        self.init_method(self.tokentype_embeddings.weight)
-
-    def forward(self, input_ids, position_ids=None, token_type_ids=None):
-        # Embeddings.
-        words_embeddings = self.word_embeddings(input_ids)
-        if self.position_embedding_type == 'learned_absolute':
-            assert position_ids is not None
-            position_embeddings = self.position_embeddings(position_ids)
-            embeddings = words_embeddings + position_embeddings
-        else:
-            embeddings = words_embeddings
-        if token_type_ids is not None:
-            assert self.tokentype_embeddings is not None
-            embeddings = embeddings + self.tokentype_embeddings(token_type_ids)
-        else:
-            assert self.tokentype_embeddings is None
-
-        # Data format change to avoid explicit tranposes : [b s h] --> [s b h].
-        if self.transpose_batch_sequence:
-            embeddings = embeddings.transpose(0, 1).contiguous()
-
-        # If the input flag for fp32 residual connection is set, convert for float.
-        if self.fp32_residual_connection:
-            embeddings = embeddings.float()
-
-        # Dropout.
-        if self.sequence_parallel:
-            embeddings = tensor_parallel.mappings.scatter_to_sequence_parallel_region(
-                embeddings)
-            with tensor_parallel.random.get_xla_rng_tracker().fork():
-                embeddings = self.embedding_dropout(embeddings)
-        else:
-            embeddings = self.embedding_dropout(embeddings)
-
-        return embeddings
-
-    def state_dict_for_save_checkpoint(self, destination=None, prefix='', keep_vars=False):
-        """For easy load."""
-
-        state_dict_ = {}
-        state_dict_[self._word_embeddings_key] = self.word_embeddings.state_dict(
-            destination, prefix, keep_vars)
-        if self.position_embedding_type == 'learned_absolute':
-            state_dict_[self._position_embeddings_key] = self.position_embeddings.state_dict(
-                destination, prefix, keep_vars
-            )
-        if self.num_tokentypes > 0:
-            state_dict_[self._tokentype_embeddings_key] = self.tokentype_embeddings.state_dict(
-                destination, prefix, keep_vars
-            )
-
-        return state_dict_
-
-    def load_state_dict(self, state_dict, strict=True):
-        """Customized load."""
-
-        # Word embedding.
-        if self._word_embeddings_key in state_dict:
-            state_dict_ = state_dict[self._word_embeddings_key]
-        else:
-            # for backward compatibility.
-            state_dict_ = {}
-            for key in state_dict.keys():
-                if 'word_embeddings' in key:
-                    state_dict_[key.split('word_embeddings.')[
-                        1]] = state_dict[key]
-        self.word_embeddings.load_state_dict(state_dict_, strict=strict)
-
-        if self.position_embedding_type == 'learned_absolute':
-            # Position embedding.
-            if self._position_embeddings_key in state_dict:
-                state_dict_ = state_dict[self._position_embeddings_key]
-            else:
-                # for backward compatibility.
-                state_dict_ = {}
-                for key in state_dict.keys():
-                    if 'position_embeddings' in key:
-                        state_dict_[key.split('position_embeddings.')[
-                            1]] = state_dict[key]
-            self.position_embeddings.load_state_dict(
-                state_dict_, strict=strict)
-
-        # Tokentype embedding.
-        if self.num_tokentypes > 0:
-            state_dict_ = {}
-            if self._tokentype_embeddings_key in state_dict:
-                state_dict_ = state_dict[self._tokentype_embeddings_key]
-            else:
-                # for backward compatibility.
-                for key in state_dict.keys():
-                    if 'tokentype_embeddings' in key:
-                        state_dict_[key.split('tokentype_embeddings.')[
-                            1]] = state_dict[key]
-            if len(state_dict_.keys()) > 0:
-                self.tokentype_embeddings.load_state_dict(
-                    state_dict_, strict=strict)
-            else:
-                print(
-                    '***WARNING*** expected tokentype embeddings in the ' 'checkpoint but could not find it',
-                    flush=True,
-                )
-
-
-class CoreAttention(MegatronModule):
-    """ Region where selective activation recomputation is applied.
-        See Figure 3. in Reducing Activation Recomputation in Large Transformer Models
-        https://arxiv.org/pdf/2205.05198.pdf for more details.
-
-    """
-
-    def __init__(
-        self,
-        layer_number,
-        num_attention_heads,
-        hidden_size,
-        attention_type=AttnType.self_attn,
-        attn_mask_type=AttnMaskType.padding,
-        precision=16,
-        apply_query_key_layer_scaling=True,
-        kv_channels=None,
-        masked_softmax_fusion=True,
-        attention_dropout=0.1,
-        sequence_parallel=False,
-        normalize_attention_scores=True,
-        multi_query_attention=False,
-        position_embedding_type='learned_absolute',
-        position_interpolation_factor=1.0,
-        max_position_embeddings=4096,
-        rotary_percentage=1.0,
-    ):
-
-        super(CoreAttention, self).__init__()
-
-        self.precision = precision
-        self.fp16 = precision == 16
-        self.bf16 = precision == 'bf16'
-        self.multi_query_attention = multi_query_attention
-
-        self.apply_query_key_layer_scaling = apply_query_key_layer_scaling
-        self.attention_softmax_in_fp32 = False
-        if self.apply_query_key_layer_scaling:
-            self.attention_softmax_in_fp32 = True
-        self.layer_number = max(1, layer_number)
-        self.attention_type = attention_type
-        self.attn_mask_type = attn_mask_type
-        self.sequence_parallel = sequence_parallel
-        # If True, will scale attention scores by 1 / sqrt(hidden_size_per_attention_head).
-        # This arg is been provided mostly to support weight conversion of Huggingface models. (ex: T5v1.1)
-        self.normalize_attention_scores = normalize_attention_scores
-        self.position_embedding_type = position_embedding_type
-        self.position_interpolation_factor = position_interpolation_factor
-        self.rotary_percentage = rotary_percentage
-        if kv_channels is None:
-            assert (
-                hidden_size % num_attention_heads == 0
-            ), 'hidden_size must be divisible by num_attention_heads if kv_channels is None'
-            kv_channels = hidden_size // num_attention_heads
-
-        projection_size = kv_channels * num_attention_heads
-
-        # Per attention head and per partition values.
-        world_size = parallel_state.get_tensor_model_parallel_world_size()
-        self.hidden_size_per_partition = safe_divide(
-            projection_size, world_size)
-        self.hidden_size_per_attention_head = safe_divide(
-            projection_size, num_attention_heads)
-        self.num_attention_heads_per_partition = safe_divide(
-            num_attention_heads, world_size)
-        self.num_attention_heads_partition_offset = (
-            self.num_attention_heads_per_partition *
-            parallel_state.get_tensor_model_parallel_rank()
-        )
-
-        coeff = None
-        self.norm_factor = math.sqrt(self.hidden_size_per_attention_head)
-        if self.apply_query_key_layer_scaling:
-            coeff = self.layer_number
-            self.norm_factor *= coeff
-
-        self.scale_mask_softmax = FusedScaleMaskSoftmax(
-            self.fp16,
-            self.bf16,
-            self.attn_mask_type,
-            masked_softmax_fusion,
-            attention_mask_func,
-            self.attention_softmax_in_fp32,
-            coeff,
-        )
-
-        if self.position_embedding_type == 'rope':
-            self.rotary_emb = RotaryEmbedding(self.hidden_size_per_attention_head,
-                                              max_position_embeddings=max_position_embeddings,
-                                              position_interpolation_factor=self.position_interpolation_factor,
-                                              rotary_percentage=self.rotary_percentage)
-
-        # Dropout. Note that for a single iteration, this layer will generate
-        # different outputs on different number of parallel partitions but
-        # on average it should not be partition dependent.
-        self.attention_dropout = torch.nn.Dropout(attention_dropout)
 
 
 class MultiQueryCoreAttention(CoreAttention):
@@ -896,7 +242,7 @@ class MultiQueryCoreAttention(CoreAttention):
         return context_layer
 
 
-class ParallelAttention(MegatronModule, adapter_mixins.AdapterModuleMixin):
+class ParallelAttentionBigCode(MegatronModule, adapter_mixins.AdapterModuleMixin):
     """Parallel self-attention layer abstract class.
 
     Self-attention layer takes input with size [s, b, h]
@@ -933,7 +279,7 @@ class ParallelAttention(MegatronModule, adapter_mixins.AdapterModuleMixin):
         max_position_embeddings=4096,
         rotary_percentage=1.0,
     ):
-        super(ParallelAttention, self).__init__()
+        super(ParallelAttentionBigCode, self).__init__()
         self.sequence_parallel = sequence_parallel
         self.layer_number = max(1, layer_number)
         self.attention_type = attention_type
@@ -1373,7 +719,7 @@ class ParallelAttention(MegatronModule, adapter_mixins.AdapterModuleMixin):
         return output, bias
 
 
-class ParallelTransformerLayer_(MegatronModule, adapter_mixins.AdapterModuleMixin):
+class ParallelTransformerLayerBigCode_(ParallelTransformerLayer_):
     """A single transformer layer.
 
     Transformer layer takes input with size [s, b, h] and returns an
@@ -1425,448 +771,86 @@ class ParallelTransformerLayer_(MegatronModule, adapter_mixins.AdapterModuleMixi
         max_position_embeddings=4096,
         rotary_percentage=1.0,
     ):
-        super(ParallelTransformerLayer_, self).__init__()
-
-        if kv_channels is None:
-            assert (
-                hidden_size % num_attention_heads == 0
-            ), 'hidden_size must be divisible by num_attention_heads if kv_channels is None'
-            kv_channels = hidden_size // num_attention_heads
-
-        self.layer_number = layer_number
-        self.layer_type = layer_type
-        self.sequence_parallel = sequence_parallel
-        self.bias = bias
-        self.transformer_block_type = transformer_block_type
-        self.position_embedding_type = position_embedding_type
-        self.position_interpolation_factor = position_interpolation_factor
-        self.rotary_percentage = rotary_percentage
-        self.set_accepted_adapter_types(
-            [LinearAdapterConfig._target_, ParallelLinearAdapterConfig._target_])
-
-        if not bias and bias_dropout_add_fusion:
-            raise ValueError(
-                'bias_dropout_add_fusion=True requires bias=True, found bias=False. Either set both to True or both to False.'
-            )
-
-        if normalization not in ['layernorm', 'layernorm1p', 'rmsnorm']:
-            raise ValueError(
-                f'normalization must be "layernorm", "layernorm1p" or "rmsnorm", found {normalization}')
-
-        if transformer_block_type not in ['pre_ln', 'post_ln', 'normformer', 'gpt_j']:
-            raise ValueError(
-                f'transformer_block_type must be either "pre_ln" or "post_ln" or "normformer" or "gpt_j", found {transformer_block_type}'
-            )
-
-        # if true move residual connections to fp32
-        self.fp32_residual_connection = fp32_residual_connection
-        self.hidden_dropout = hidden_dropout
-        self.attention_dropout = attention_dropout
-        # if true, enable bias dropout fusion
-        self.bias_dropout_add_fusion = bias_dropout_add_fusion
-
-        self.checkpoint_layer_norm = (
-            activations_checkpoint_granularity == 'selective'
-        )  # transformer engine forward allows for more granular selective checkpointing
-        # For now do not transfer with static ring
-        transfer_with_static_ring = not self.checkpoint_layer_norm
-        # when selective enabled to avoid memory pressure
-
-        # Self attention.
-        # retrieval_decoder_after_self_attn skips the self attention
-        if self.layer_type != LayerType.retrieval_decoder_after_self_attn:
-            # Layernorm on the input data.
-            if normalization == 'layernorm':
-                self.input_layernorm = get_layer_norm(
-                    hidden_size, layernorm_epsilon, persist_layer_norm, sequence_parallel
-                )
-            elif normalization == 'layernorm1p':
-                self.input_layernorm = LayerNorm1P(
-                    hidden_size, layernorm_epsilon, sequence_parallel_enabled=sequence_parallel
-                )
-            else:
-                self.input_layernorm = MixedFusedRMSNorm(hidden_size, layernorm_epsilon,
-                                                         sequence_parallel_enabled=sequence_parallel)
-
-            logging.trace(
-                "In ParallelTransfomerLayer() create ParallelAttention for encoder ....", trace_type="recovery_time")
-            self.self_attention = ParallelAttention(
-                init_method=init_method,
-                output_layer_init_method=output_layer_init_method,
-                layer_number=layer_number,
-                num_attention_heads=num_attention_heads,
-                hidden_size=hidden_size,
-                attention_type=AttnType.self_attn,
-                attn_mask_type=self_attn_mask_type,
-                precision=precision,
-                apply_query_key_layer_scaling=apply_query_key_layer_scaling,
-                kv_channels=kv_channels,
-                use_cpu_initialization=use_cpu_initialization,
-                masked_softmax_fusion=masked_softmax_fusion,
-                attention_dropout=attention_dropout,
-                multi_query_attention=multi_query_attention,
-                layer_type=layer_type,
-                megatron_legacy=megatron_legacy,
-                bias=bias,
-                headscale=headscale,
-                activations_checkpoint_granularity=activations_checkpoint_granularity,
-                position_embedding_type=position_embedding_type,
-                sequence_parallel=sequence_parallel,
-                gradient_accumulation_fusion=gradient_accumulation_fusion,
-                normalize_attention_scores=normalize_attention_scores,
-                transfer_with_static_ring=transfer_with_static_ring,
-                position_interpolation_factor=position_interpolation_factor,
-                max_position_embeddings=max_position_embeddings,
-                rotary_percentage=self.rotary_percentage,
-            )
-            logging.trace(
-                "In ParallelTransfomerLayer() create ParallelAttention for encoder done", trace_type="recovery_time")
-
-            if transformer_block_type == 'normformer':
-                if normalization == 'layernorm':
-                    self.post_attention_normformer_norm = get_layer_norm(
-                        hidden_size, layernorm_epsilon, persist_layer_norm
-                    )
-                else:
-                    self.post_attention_normformer_norm = MixedFusedRMSNorm(hidden_size, layernorm_epsilon,
-                                                                            sequence_parallel_enabled=sequence_parallel)
-
-            if self.layer_type != LayerType.decoder_pre_mlp or self.transformer_block_type != 'post_ln':
-                #  the post_attention_layernorm is used for layermorm after mlp
-                # don't need it for decoder_pre_mlp and post_ln
-                if normalization == 'layernorm':
-                    self.post_attention_layernorm = get_layer_norm(
-                        hidden_size, layernorm_epsilon, persist_layer_norm, sequence_parallel
-                    )
-                elif normalization == 'layernorm1p':
-                    self.post_attention_layernorm = LayerNorm1P(
-                        hidden_size, layernorm_epsilon, sequence_parallel_enabled=sequence_parallel
-                    )
-                else:
-                    self.post_attention_layernorm = MixedFusedRMSNorm(hidden_size, layernorm_epsilon,
-                                                                      sequence_parallel_enabled=sequence_parallel)
-
-        if self.layer_type == LayerType.decoder_pre_mlp:
-            # skip MLP and cross attention
-            return
-
-        # the post_attention_layernorm is used for layermorm after mlp
-        # need it for post_ln
-        if self.layer_type == LayerType.retrieval_decoder_after_self_attn and self.transformer_block_type == 'post_ln':
-            # Layernorm on the attention output
-            if normalization == 'layernorm':
-                self.post_attention_layernorm = get_layer_norm(
-                    hidden_size, layernorm_epsilon, persist_layer_norm, sequence_parallel
-                )
-            elif normalization == 'layernorm1p':
-                self.post_attention_layernorm = LayerNorm1P(
-                    hidden_size, layernorm_epsilon, sequence_parallel_enabled=sequence_parallel
-                )
-            else:
-                self.post_attention_layernorm = MixedFusedRMSNorm(hidden_size, layernorm_epsilon,
-                                                                  sequence_parallel_enabled=sequence_parallel)
-
-        if self.layer_type in [LayerType.decoder,  LayerType.retrieval_encoder, LayerType.retrieval_decoder, LayerType.retrieval_decoder_after_self_attn]:
-            raise ValueError(f'Layer {self.layer_type} not supported')
-
-        # MLP
-        if num_moe_experts > 1 and self.layer_number % moe_frequency == 0:
-            logging.trace(
-                "In ParallelTransfomerLayer() create SwitchMLP ....", trace_type="recovery_time")
-            self.mlp = SwitchMLP(
-                num_experts=num_moe_experts,
-                init_method=init_method,
-                output_layer_init_method=output_layer_init_method,
-                hidden_size=hidden_size,
-                ffn_hidden_size=ffn_hidden_size,
-                use_cpu_initialization=use_cpu_initialization,
-                bias_activation_fusion=bias_activation_fusion,
-                openai_gelu=openai_gelu,
-                onnx_safe=onnx_safe,
-                activation=activation,
-                bias=bias,
-                transformer_block_type=transformer_block_type,
-                normalization=normalization,
-                layernorm_epsilon=layernorm_epsilon,
-                persist_layer_norm=persist_layer_norm,
-                sequence_parallel=sequence_parallel,
-                gradient_accumulation_fusion=gradient_accumulation_fusion,
-                dropout=moe_dropout,
-            )
-            logging.trace(
-                "In ParallelTransfomerLayer() create SwitchMLP ....", trace_type="recovery_time")
-        else:
-            logging.trace(
-                "In ParallelTransfomerLayer() create ParallelMLP ....", trace_type="recovery_time")
-            self.mlp = ParallelMLP(
-                init_method=init_method,
-                output_layer_init_method=output_layer_init_method,
-                hidden_size=hidden_size,
-                ffn_hidden_size=ffn_hidden_size,
-                use_cpu_initialization=use_cpu_initialization,
-                bias_activation_fusion=bias_activation_fusion,
-                openai_gelu=openai_gelu,
-                onnx_safe=onnx_safe,
-                activation=activation,
-                bias=bias,
-                transformer_block_type=transformer_block_type,
-                normalization=normalization,
-                layernorm_epsilon=layernorm_epsilon,
-                persist_layer_norm=persist_layer_norm,
-                sequence_parallel=sequence_parallel,
-                gradient_accumulation_fusion=gradient_accumulation_fusion,
-                dropout=ffn_dropout,
-                transfer_with_static_ring=transfer_with_static_ring,
-            )
-            logging.trace(
-                "In ParallelTransfomerLayer() create ParallelMLP done", trace_type="recovery_time")
-
-    def _get_bias_droput_add_func(self, transformer_block_type='pre_ln', position_after='attention'):
-        """
-        Returns a function that potentially fuses the dropout and bias addition.
-
-        This function is particularly helpful for the normformer architecture that does not the fused kernel after attention layers, but can after the MLP.
-        """
-        # Normformer activations at this point have no bias vector since they've gone through another normalization layer.
-        if transformer_block_type == 'normformer' and position_after == 'attention':
-            bias_dropout_add_func = get_dropout_add(self.training)
-        # Bias dropout add fused kernel
-        elif self.bias and self.bias_dropout_add_fusion:
-            if self.training:
-                bias_dropout_add_func = bias_dropout_add_fused_train
-            else:
-                bias_dropout_add_func = bias_dropout_add_fused_inference
-        # Bias dropout add non-fused kernel
-        elif self.bias and not self.bias_dropout_add_fusion:
-            bias_dropout_add_func = get_bias_dropout_add(self.training)
-        # Dropout add non-fused kernel for a model without bias terms.
-        else:
-            bias_dropout_add_func = get_dropout_add(self.training)
-
-        return bias_dropout_add_func
-
-    def forward(
-        self,
-        hidden_states,
-        attention_mask,
-        encoder_output=None,
-        enc_dec_attn_mask=None,
-        layer_past=None,
-        get_key_value=False,
-        set_inference_key_value_memory=False,
-        inference_max_sequence_len=None,
-        # list of positional embedding tensors, first one self attention, second one and third one are for cross attention (q, k)
-        rotary_pos_emb=None,
-        self_attention_relative_position_bias=None,
-        cross_attention_relative_position_bias=None,
-        checkpoint_core_attention=False,
-    ):
-        # Self attention.
-        if rotary_pos_emb is not None:
-            # self attention pos_emb is (q, q)
-            self_attention_pos_emb = (rotary_pos_emb[0], rotary_pos_emb[0])
-            cross_attention_pos_emb = (rotary_pos_emb[1], rotary_pos_emb[2])
-        else:
-            self_attention_pos_emb = None
-            cross_attention_pos_emb = None
-
-        if self.layer_type != LayerType.retrieval_decoder_after_self_attn:
-            # hidden_states: [b, s, h]
-
-            # Pre-LN: x -> LN -> MHA -> Residual -> LN -> MLP -> Residual
-            # Post-LN: x -> MHA -> Residual -> LN -> MLP -> Residual -> LN
-            # Normformer: x -> LN -> MHA -> LN -> Residual -> MLP (w/LN) -> Residual
-            # GPT_J: x -> LN -> MHA -> Residual -> + ->
-            #         x -> LN -> MLP      --        |
-            # See: https://github.com/EleutherAI/gpt-neox/blob/ac3d8087f1762213880523893a52329d66d2d1a9/megatron/model/transformer.py#L593
-
-            residual = hidden_states
-            # Layer norm at the beginning of the transformer layer.
-            if self.transformer_block_type in ['pre_ln', 'normformer']:
-                if self.checkpoint_layer_norm:
-                    hidden_states = tensor_parallel.checkpoint(
-                        self.input_layernorm, False, hidden_states)
-                else:
-                    hidden_states = self.input_layernorm(hidden_states)
-            elif self.transformer_block_type == 'gpt_j':
-                if self.checkpoint_layer_norm:
-                    normalization_output = tensor_parallel.checkpoint(
-                        self.post_attention_layernorm, False, hidden_states)
-                    hidden_states = tensor_parallel.checkpoint(
-                        self.input_layernorm, False, hidden_states)
-                else:
-                    normalization_output = self.post_attention_layernorm(
-                        hidden_states)
-                    hidden_states = self.input_layernorm(hidden_states)
-
-            # Materialize attention mask right before use
-            if is_torch_tpu_available():
-                seq_len = hidden_states.shape[0]  # See above [b, *s*, h] shape
-                if self.sequence_parallel:
-                    seq_len *= parallel_state.get_tensor_model_parallel_world_size()
-                attention_mask = torch.triu(torch.ones(
-                    (1, 1, seq_len, seq_len), device='xla'), diagonal=1).bool()
-
-            attention_output, attention_bias = self.self_attention(
-                hidden_states,
-                attention_mask,
-                layer_past=layer_past,
-                get_key_value=get_key_value,
-                set_inference_key_value_memory=set_inference_key_value_memory,
-                inference_max_sequence_len=inference_max_sequence_len,
-                rotary_pos_emb=self_attention_pos_emb,
-                relative_position_bias=self_attention_relative_position_bias,
-                checkpoint_core_attention=checkpoint_core_attention,
-            )
-
-            if get_key_value:
-                attention_output, presents = attention_output
-
-            # If normformer, apply norm on the output of the self attention.
-            if self.transformer_block_type == 'normformer':
-                # Normformer normalization
-                attention_output = (
-                    attention_output + attention_bias if attention_bias is not None else attention_output
-                )
-                attention_output = self.post_attention_normformer_norm(
-                    attention_output)
-                attention_bias = None
-
-            # jit scripting for a nn.module (with dropout) is not
-            # trigerring the fusion kernel. For now, we use two
-            # different nn.functional routines to account for varying
-            # dropout semantics during training and inference phases.
-
-            bias_dropout_add_func = self._get_bias_droput_add_func(
-                transformer_block_type=self.transformer_block_type, position_after='attention'
-            )
-            if attention_bias is not None:
-                attention_bias = attention_bias.expand_as(residual)
-
-            layernorm_input = bias_dropout_add_func(
-                attention_output, attention_bias, residual, self.hidden_dropout)
-            # print(f"Layer: {self.layer_number} Attention checksum {layernorm_input.sum()}")
-
-            if self.is_adapter_available():
-                adapter_1 = self.get_from_adapter_layer(
-                    AdapterName.PRE_ATTN_ADAPTER)
-                if adapter_1:
-                    strategy = adapter_1.adapter_strategy
-                    layernorm_input = self.forward_single_enabled_adapter_(
-                        layernorm_input,
-                        adapter_1,
-                        adapter_name=AdapterName.PRE_ATTN_ADAPTER,
-                        adapter_strategy=strategy,
-                    )
-
-            # Post-LN normalization after residual
-            if self.transformer_block_type == 'post_ln':
-                normalization_output = self.input_layernorm(layernorm_input)
-                layernorm_input = normalization_output
-            elif self.transformer_block_type in ['pre_ln', 'normformer']:
-                # Layer norm post the self attention.
-                if self.checkpoint_layer_norm:
-                    normalization_output = tensor_parallel.checkpoint(
-                        self.post_attention_layernorm, False, layernorm_input)
-                else:
-                    normalization_output = self.post_attention_layernorm(
-                        layernorm_input)
-            elif self.transformer_block_type == 'gpt_j':
-                pass  # handled above
-        else:
-            layernorm_input, normalization_output = hidden_states
-
-        if self.layer_type == LayerType.decoder_pre_mlp:
-            return layernorm_input, normalization_output
-
-        if (
-            self.layer_type == LayerType.decoder
-            or self.layer_type == LayerType.retrieval_decoder
-            or self.layer_type == LayerType.retrieval_encoder
-            or self.layer_type == LayerType.retrieval_decoder_after_self_attn
-        ):
-            if (
-                self.layer_type == LayerType.retrieval_decoder
-                or self.layer_type == LayerType.retrieval_decoder_after_self_attn
-            ):
-                attention_output, attention_bias = self.inter_attention(
-                    normalization_output,
-                    enc_dec_attn_mask,
-                    encoder_output=encoder_output,
-                    rotary_pos_emb=cross_attention_pos_emb,
-                    set_inference_key_value_memory=set_inference_key_value_memory,
-                    inference_max_sequence_len=inference_max_sequence_len,
-                    checkpoint_core_attention=checkpoint_core_attention,
-                )
-            else:
-
-                attention_output, attention_bias = self.inter_attention(
-                    normalization_output,
-                    enc_dec_attn_mask,
-                    encoder_output=encoder_output,
-                    rotary_pos_emb=cross_attention_pos_emb,
-                    relative_position_bias=cross_attention_relative_position_bias,
-                    checkpoint_core_attention=checkpoint_core_attention,
-                )
-
-            # If normformer, apply norm on the output of the self attention.
-            if self.transformer_block_type == 'normformer':
-                # Normformer normalization
-                attention_output = (
-                    attention_output + attention_bias if attention_bias is not None else attention_output
-                )
-                attention_output = self.post_inter_attention_normformer_norm(
-                    attention_output)
-                attention_bias = None
-
-            residual = layernorm_input
-
-            bias_dropout_add_func = self._get_bias_droput_add_func(
-                transformer_block_type=self.transformer_block_type, position_after='attention'
-            )
-
-            layernorm_input = bias_dropout_add_func(
-                attention_output, attention_bias, residual, self.hidden_dropout)
-            # print(f"Layer: {self.layer_number} Cross-Attention checksum {layernorm_input.sum()}")
-            normalization_output = self.post_inter_attention_layernorm(
-                layernorm_input)
-            # Post-LN normalization after residual
-            if self.transformer_block_type == 'post_ln':
-                layernorm_input = normalization_output
-        # MLP.
-        mlp_output, mlp_bias = self.mlp(normalization_output)
-
-        residual = layernorm_input
-
-        bias_dropout_add_func = self._get_bias_droput_add_func(
-            transformer_block_type=self.transformer_block_type, position_after='mlp'
+        super(ParallelTransformerLayerBigCode_, self).__init__(
+            init_method=init_method,
+            output_layer_init_method=output_layer_init_method,
+            layer_number=layer_number,
+            hidden_size=hidden_size,
+            ffn_hidden_size=ffn_hidden_size,
+            num_attention_heads=num_attention_heads,
+            layer_type=layer_type,
+            self_attn_mask_type=self_attn_mask_type,
+            fp32_residual_connection=fp32_residual_connection,
+            precision=precision,
+            apply_query_key_layer_scaling=apply_query_key_layer_scaling,
+            kv_channels=kv_channels,
+            layernorm_epsilon=layernorm_epsilon,
+            hidden_dropout=hidden_dropout,
+            bias_dropout_add_fusion=bias_dropout_add_fusion,
+            persist_layer_norm=persist_layer_norm,
+            use_cpu_initialization=use_cpu_initialization,
+            bias_activation_fusion=bias_activation_fusion,
+            openai_gelu=openai_gelu,
+            onnx_safe=onnx_safe,
+            masked_softmax_fusion=masked_softmax_fusion,
+            attention_dropout=attention_dropout,
+            ffn_dropout=ffn_dropout,
+            activation=activation,
+            megatron_legacy=megatron_legacy,
+            bias=bias,
+            chunk_size=chunk_size,
+            normalization=normalization,
+            transformer_block_type=transformer_block_type,
+            position_embedding_type=position_embedding_type,
+            multi_query_attention=multi_query_attention,
+            headscale=headscale,
+            activations_checkpoint_granularity=activations_checkpoint_granularity,
+            sequence_parallel=sequence_parallel,
+            gradient_accumulation_fusion=gradient_accumulation_fusion,
+            normalize_attention_scores=normalize_attention_scores,
+            num_moe_experts=num_moe_experts,
+            moe_frequency=moe_frequency,
+            moe_dropout=moe_dropout,
+            position_interpolation_factor=position_interpolation_factor,
+            max_position_embeddings=max_position_embeddings,
+            rotary_percentage=rotary_percentage,
         )
 
-        output = bias_dropout_add_func(
-            mlp_output, mlp_bias, residual, self.hidden_dropout)
-        # print(f"Layer: {self.layer_number} MLP + Dropout + Residual checksum {output.sum()}")
+        transfer_with_static_ring = not self.checkpoint_layer_norm
+        logging.trace(
+            "In ParallelTransformerLayerBigCode() create ParallelAttention for encoder ....", trace_type="recovery_time")
+        self.self_attention = ParallelAttentionBigCode(
+            init_method=init_method,
+            output_layer_init_method=output_layer_init_method,
+            layer_number=layer_number,
+            num_attention_heads=num_attention_heads,
+            hidden_size=hidden_size,
+            attention_type=AttnType.self_attn,
+            attn_mask_type=self_attn_mask_type,
+            precision=precision,
+            apply_query_key_layer_scaling=apply_query_key_layer_scaling,
+            kv_channels=kv_channels,
+            use_cpu_initialization=use_cpu_initialization,
+            masked_softmax_fusion=masked_softmax_fusion,
+            attention_dropout=attention_dropout,
+            multi_query_attention=multi_query_attention,
+            layer_type=layer_type,
+            megatron_legacy=megatron_legacy,
+            bias=bias,
+            headscale=headscale,
+            activations_checkpoint_granularity=activations_checkpoint_granularity,
+            position_embedding_type=position_embedding_type,
+            sequence_parallel=sequence_parallel,
+            gradient_accumulation_fusion=gradient_accumulation_fusion,
+            normalize_attention_scores=normalize_attention_scores,
+            transfer_with_static_ring=transfer_with_static_ring,
+            position_interpolation_factor=position_interpolation_factor,
+            max_position_embeddings=max_position_embeddings,
+            rotary_percentage=self.rotary_percentage,
+        )
 
-        if self.transformer_block_type == 'post_ln':
-            output = self.post_attention_layernorm(output)
 
-        if get_key_value:
-            output = [output, presents]
-
-        if (
-            self.is_adapter_available()
-        ):  # TODO: (@adithyre) was able to move adapter_2 back to the end of the transformer after ptl 1.7 update.
-            adapter_2 = self.get_from_adapter_layer(
-                AdapterName.POST_ATTN_ADAPTER)
-            if adapter_2:
-                strategy = adapter_2.adapter_strategy
-                output = self.forward_single_enabled_adapter_(
-                    output, adapter_2, adapter_name=AdapterName.POST_ATTN_ADAPTER, adapter_strategy=strategy
-                )
-
-        return output
-
-
-class ParallelTransformerLayer(ParallelTransformerLayer_):
+class ParallelTransformerLayerBigCode(ParallelTransformerLayerBigCode_):
     def __init__(
         self,
         init_method,
@@ -1912,7 +896,7 @@ class ParallelTransformerLayer(ParallelTransformerLayer_):
         max_position_embeddings=4096,
         rotary_percentage=1.0,
     ):
-        super(ParallelTransformerLayer, self).__init__(
+        super(ParallelTransformerLayerBigCode, self).__init__(
             init_method=init_method,
             output_layer_init_method=output_layer_init_method,
             layer_number=layer_number,
@@ -2013,110 +997,7 @@ class ParallelTransformerLayer(ParallelTransformerLayer_):
             )
 
 
-class AutocastTransformerLayer(TransformerLayer):
-    def __init__(
-        self,
-        hidden_size: int,
-        ffn_hidden_size: int,
-        layernorm_epsilon: float,
-        num_attention_heads: int,
-        init_method: Callable,
-        output_layer_init_method: Callable,
-        hidden_dropout: float,
-        attention_dropout: float,
-        layer_number: Optional[int] = None,
-        kv_channels: Optional[int] = None,
-        self_attn_mask_type: str = "causal",
-        tp_group: Optional[Any] = None,
-        tp_size: int = 1,
-        params_dtype: torch.dtype = torch.float32,
-        get_rng_state_tracker: Optional[Callable] = None,
-        fuse_wgrad_accumulation: bool = False,
-        apply_query_key_layer_scaling: bool = True,
-        attention_softmax_in_fp32: bool = False,
-        seq_length: Optional[int] = None,
-        micro_batch_size: Optional[int] = None,
-        sequence_parallel: bool = False,
-        apply_residual_connection_post_layernorm: bool = False,
-        output_layernorm: bool = False,
-        layer_type: str = "encoder",
-        drop_path_rate: float = 0,
-        use_emha: bool = False,
-        autocast_dtype: Any = 16,
-    ) -> None:
-        super().__init__(
-            hidden_size=hidden_size,
-            ffn_hidden_size=ffn_hidden_size,
-            layernorm_epsilon=layernorm_epsilon,
-            num_attention_heads=num_attention_heads,
-            init_method=init_method,
-            output_layer_init_method=output_layer_init_method,
-            hidden_dropout=hidden_dropout,
-            attention_dropout=attention_dropout,
-            layer_number=layer_number,
-            kv_channels=kv_channels,
-            self_attn_mask_type=self_attn_mask_type,
-            tp_group=tp_group,
-            tp_size=tp_size,
-            params_dtype=params_dtype,
-            get_rng_state_tracker=get_rng_state_tracker,
-            fuse_wgrad_accumulation=fuse_wgrad_accumulation,
-            apply_query_key_layer_scaling=apply_query_key_layer_scaling,
-            attention_softmax_in_fp32=attention_softmax_in_fp32,
-            seq_length=seq_length,
-            micro_batch_size=micro_batch_size,
-            sequence_parallel=sequence_parallel,
-            apply_residual_connection_post_layernorm=apply_residual_connection_post_layernorm,
-            output_layernorm=output_layernorm,
-            layer_type=layer_type,
-            drop_path_rate=drop_path_rate,
-            set_parallel_mode=tp_size > 1,
-            fuse_qkv_params=True,
-        )
-        # use_emha=use_emha,
-
-        if autocast_dtype == 32:
-            self.dtype = torch.float32
-        elif autocast_dtype == 16:
-            self.dtype = torch.float16
-        elif autocast_dtype == 'bf16':
-            self.dtype = torch.bfloat16
-        else:
-            raise ValueError
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor,
-        encoder_output: Optional[torch.Tensor] = None,
-        enc_dec_attn_mask: Optional[torch.Tensor] = None,
-        inference_params: Optional[Any] = None,
-        is_first_microbatch: Optional[bool] = None,
-        checkpoint_core_attention: Optional[bool] = False,
-    ) -> torch.Tensor:
-        if self.dtype == torch.float32:
-            return super().forward(
-                hidden_states,
-                attention_mask,
-                encoder_output=encoder_output,
-                enc_dec_attn_mask=enc_dec_attn_mask,
-                inference_params=inference_params,
-                is_first_microbatch=is_first_microbatch,
-                checkpoint_core_attention=checkpoint_core_attention,
-            )
-        with torch.autocast(device_type="cuda", dtype=self.dtype):
-            return super().forward(
-                hidden_states,
-                attention_mask,
-                encoder_output=encoder_output,
-                enc_dec_attn_mask=enc_dec_attn_mask,
-                inference_params=inference_params,
-                is_first_microbatch=is_first_microbatch,
-                checkpoint_core_attention=checkpoint_core_attention,
-            )
-
-
-class ParallelTransformer(MegatronModule):
+class ParallelTransformerBigCode(MegatronModule):
     """Transformer class."""
 
     def __init__(
@@ -2181,7 +1062,7 @@ class ParallelTransformer(MegatronModule):
         max_position_embeddings=4096,
         rotary_percentage=1.0,
     ):
-        super(ParallelTransformer, self).__init__()
+        super(ParallelTransformerBigCode, self).__init__()
 
         if kv_channels is None:
             assert (
@@ -2325,8 +1206,8 @@ class ParallelTransformer(MegatronModule):
                 )
             else:
                 logging.trace(
-                    f"building ParallelTransformerLayer {layer_number} begin", trace_type="recovery_time")
-                return ParallelTransformerLayer(
+                    f"building ParallelTransformerLayerBigCode {layer_number} begin", trace_type="recovery_time")
+                return ParallelTransformerLayerBigCode(
                     init_method=init_method,
                     output_layer_init_method=output_layer_init_method,
                     layer_number=layer_number + layer_number_offset,
@@ -2409,10 +1290,10 @@ class ParallelTransformer(MegatronModule):
                 offset = parallel_state.get_pipeline_model_parallel_rank() * self.num_layers
 
         logging.trace(
-            "In ParallelTransformer(), building layers begin", trace_type="recovery_time")
+            "In ParallelTransformerBigCode(), building layers begin", trace_type="recovery_time")
         self.layers = torch.nn.ModuleList(
             [build_layer(i + 1 + offset) for i in range(self.num_layers)])
-        logging.trace("In ParallelTransformer(), building layers done",
+        logging.trace("In ParallelTransformerBigCode(), building layers done",
                       trace_type="recovery_time")
 
         if self.post_process and self.transformer_block_type != 'post_ln':
@@ -2821,7 +1702,7 @@ class ParallelTransformer(MegatronModule):
         return output
 
 
-class TransformerLanguageModel(MegatronModule):
+class TransformerLanguageModelBigCode(MegatronModule):
     """Transformer language model.
 
     Arguments:
@@ -2894,7 +1775,7 @@ class TransformerLanguageModel(MegatronModule):
         use_emha=False,
         position_interpolation_factor=1.0,
     ):
-        super(TransformerLanguageModel, self).__init__(
+        super(TransformerLanguageModelBigCode, self).__init__(
             share_token_embeddings=share_embeddings_and_output_weights)
 
         self.pre_process = pre_process
@@ -2928,7 +1809,7 @@ class TransformerLanguageModel(MegatronModule):
         # Embeddings.
         if self.pre_process:
             logging.trace(
-                f"In TransformerLanguageModel() enter Embedding()", trace_type="recovery_time")
+                f"In TransformerLanguageModelBigCode() enter Embedding()", trace_type="recovery_time")
             self.embedding = Embedding(
                 hidden_size=self.hidden_size,
                 vocab_size=self.vocab_size,
@@ -2942,7 +1823,7 @@ class TransformerLanguageModel(MegatronModule):
                 fp32_residual_connection=fp32_residual_connection,
             )
             logging.trace(
-                f"In TransformerLanguageModel() leave Embedding()", trace_type="recovery_time")
+                f"In TransformerLanguageModelBigCode() leave Embedding()", trace_type="recovery_time")
             self._embedding_key = 'embedding'
         # Move Rope to core attention
         # TODO: check perf penalty vs original Nemo implementation
@@ -2954,8 +1835,8 @@ class TransformerLanguageModel(MegatronModule):
         #     self.rotary_pos_emb = RotaryEmbedding(rotary_dim)
         # Transformer.
         logging.trace(
-            f"In TransformerLanguageModel() create encoder begin", trace_type="recovery_time")
-        self.encoder = ParallelTransformer(
+            f"In TransformerLanguageModelBigCode() create encoder begin", trace_type="recovery_time")
+        self.encoder = ParallelTransformerBigCode(
             init_method=self.init_method,
             output_layer_init_method=self.output_layer_init_method,
             num_layers=self.num_layers,
@@ -3010,50 +1891,13 @@ class TransformerLanguageModel(MegatronModule):
             rotary_percentage=self.rotary_percentage,
         )
         logging.trace(
-            f"In TransformerLanguageModel() create encoder done", trace_type="recovery_time")
+            f"In TransformerLanguageModelBigCode() create encoder done", trace_type="recovery_time")
         self._encoder_key = 'encoder'
 
         # Decoder
         if self.add_decoder:
-            self.decoder = ParallelTransformer(
-                layer_type=LayerType.decoder,
-                self_attn_mask_type=self.decoder_attn_mask_type,
-                init_method=self.init_method,
-                output_layer_init_method=self.output_layer_init_method,
-                num_layers=self.num_layers,
-                hidden_size=self.hidden_size,
-                num_attention_heads=num_attention_heads,
-                apply_query_key_layer_scaling=apply_query_key_layer_scaling,
-                kv_channels=kv_channels,
-                ffn_hidden_size=ffn_hidden_size,
-                pre_process=self.pre_process,
-                post_process=self.post_process,
-                precision=precision,
-                fp32_residual_connection=fp32_residual_connection,
-                activations_checkpoint_method=activations_checkpoint_method,
-                activations_checkpoint_num_layers=activations_checkpoint_num_layers,
-                normalization=normalization,
-                layernorm_epsilon=layernorm_epsilon,
-                hidden_dropout=hidden_dropout,
-                attention_dropout=attention_dropout,
-                use_cpu_initialization=use_cpu_initialization,
-                bias_activation_fusion=bias_activation_fusion,
-                bias_dropout_add_fusion=bias_dropout_add_fusion,
-                masked_softmax_fusion=masked_softmax_fusion,
-                gradient_accumulation_fusion=gradient_accumulation_fusion,
-                persist_layer_norm=persist_layer_norm,
-                openai_gelu=openai_gelu,
-                onnx_safe=onnx_safe,
-                megatron_legacy=megatron_legacy,
-                sequence_parallel=sequence_parallel,
-                activations_checkpoint_granularity=activations_checkpoint_granularity,
-                activations_checkpoint_layers_per_pipeline=activations_checkpoint_layers_per_pipeline,
-                transformer_engine=transformer_engine,
-                position_interpolation_factor=self.position_interpolation_factor,
-                max_position_embeddings=self.max_position_embeddings,
-                rotary_percentage=self.rotary_percentage,
-            )
-            self._decoder_key = 'decoder'
+            raise ValueError(
+                'Decoder not available for TransformerLanguageModelBigCode')
 
         if self.post_process:
             # Pooler.
@@ -3352,10 +2196,10 @@ def get_bigcode_language_model(
         scaled_init_method = scaled_init_method_normal(
             init_method_std, num_layers)
 
-    logging.trace(f"In get_language_model() enter TransformerLanguageModel()",
+    logging.trace(f"In get_language_model() enter TransformerLanguageModelBigCode()",
                   trace_type="recovery_time")
     # Language model.
-    language_model = TransformerLanguageModel(
+    language_model = TransformerLanguageModelBigCode(
         init_method=init_method,
         output_layer_init_method=scaled_init_method,
         encoder_attn_mask_type=encoder_attn_mask_type,
@@ -3414,25 +2258,10 @@ def get_bigcode_language_model(
         use_emha=use_emha,
         position_interpolation_factor=position_interpolation_factor,
     )
-    logging.trace(f"In get_language_model() leave TransformerLanguageModel()",
+    logging.trace(f"In get_language_model() leave TransformerLanguageModelBigCode()",
                   trace_type="recovery_time")
 
     # key used for checkpoints.
     language_model_key = 'language_model'
 
     return language_model, language_model_key
-
-
-def get_dropout_add(training):
-    def _dropout_add(x, bias, residual, prob):
-        assert bias is None
-        return dropout_add(x, bias, residual, prob, training)
-
-    return _dropout_add
-
-
-def get_bias_dropout_add(training):
-    def _bias_dropout_add(x, bias, residual, prob):
-        return bias_dropout_add(x, bias, residual, prob, training)
-
-    return _bias_dropout_add
