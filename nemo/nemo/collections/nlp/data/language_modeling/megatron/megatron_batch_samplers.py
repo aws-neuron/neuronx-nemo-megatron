@@ -76,8 +76,6 @@ class BaseMegatronBatchSampler:
         # Sanity checks.
         if total_samples <= 0:
             raise RuntimeError("no sample to consume: {}".format(total_samples))
-        if consumed_samples >= total_samples:
-            raise RuntimeError("no samples left to consume: {}, {}".format(consumed_samples, total_samples))
         if micro_batch_size <= 0:
             raise RuntimeError(f"micro_batch_size size must be greater than 0, but {micro_batch_size}")
         if data_parallel_size <= 0:
@@ -96,6 +94,7 @@ class BaseMegatronBatchSampler:
         self.data_parallel_size: int = data_parallel_size
         self.drop_last: bool = drop_last
         self.pad_samples_to_global_batch_size = pad_samples_to_global_batch_size
+        self.first_epoch = True
 
         self.update_global_batch_size(global_batch_size)
 
@@ -127,7 +126,7 @@ class BaseMegatronBatchSampler:
             When `rampup_batch_size` is enabled, the return value can be not exactly precise.
 
         """
-        num_available_samples: int = self.total_samples - self.consumed_samples
+        num_available_samples: int = self.total_samples
         if self.drop_last:
             return num_available_samples // self.global_batch_size
         else:
@@ -147,7 +146,9 @@ class MegatronPretrainingBatchSampler(BaseMegatronBatchSampler):
     def __iter__(self):
         batch = []
         # Last batch will be dropped if drop_last is not set False
-        for idx in range(self.consumed_samples, self.total_samples):
+        if not self.first_epoch:
+            self.consumed_samples = 0
+        for idx in range(self.consumed_samples % self.total_samples, self.total_samples):
             batch.append(idx)
             if len(batch) == self._global_batch_size:
                 # start_idx, end_idx = self.get_start_end_idx()
@@ -158,6 +159,7 @@ class MegatronPretrainingBatchSampler(BaseMegatronBatchSampler):
                 yield indices
                 # yield batch[start_idx:end_idx]
                 batch = []
+        self.first_epoch = False
 
         # Check the last partial batch and see drop_last is set
         if len(batch) > 0 and not self.drop_last:

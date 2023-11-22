@@ -58,6 +58,7 @@ def get_language_model(
     pre_process=True,
     post_process=True,
     init_method_std=0.02,
+    resume_from_checkpoint=False,
     use_cpu_initialization=False,
     hidden_dropout=0.1,
     attention_dropout=0.1,
@@ -135,6 +136,7 @@ def get_language_model(
         add_pooler=add_pooler,
         pre_process=pre_process,
         post_process=post_process,
+        resume_from_checkpoint=resume_from_checkpoint,
         use_cpu_initialization=use_cpu_initialization,
         hidden_dropout=hidden_dropout,
         attention_dropout=attention_dropout,
@@ -229,6 +231,7 @@ class Embedding(MegatronModule):
         init_method: weight initialization method
         num_tokentypes: size of the token-type embeddings. 0 value
                         will ignore this embedding
+        resume_from_checkpoint: whether the training was resuming from a checkpoint. If so, then no need to initialize the weights
         use_cpu_initialization: whether to initialize the weights in CPU
         position_embedding_type: position embedding type determines whether we instantiate a learnable position embedding table.
     """
@@ -241,6 +244,7 @@ class Embedding(MegatronModule):
         embedding_dropout_prob,
         init_method,
         num_tokentypes=0,
+        resume_from_checkpoint=False,
         use_cpu_initialization=False,
         fp32_residual_connection=False,
         sequence_parallel=False,
@@ -248,7 +252,6 @@ class Embedding(MegatronModule):
         transpose_batch_sequence=True,
     ):
         super(Embedding, self).__init__()
-
         self.hidden_size = hidden_size
         self.init_method = init_method
         self.num_tokentypes = num_tokentypes
@@ -257,7 +260,9 @@ class Embedding(MegatronModule):
 
         # Word embeddings (parallel).
         self.word_embeddings = tensor_parallel.VocabParallelEmbedding(
-            vocab_size, self.hidden_size, init_method=self.init_method, use_cpu_initialization=use_cpu_initialization,
+            vocab_size, self.hidden_size, init_method=self.init_method,
+            resume_from_checkpoint=resume_from_checkpoint,
+            use_cpu_initialization=use_cpu_initialization,
         )
         self._word_embeddings_key = 'word_embeddings'
 
@@ -437,6 +442,7 @@ class TransformerLanguageModel(MegatronModule):
         add_pooler=False,
         pre_process=True,
         post_process=True,
+        resume_from_checkpoint=False,
         use_cpu_initialization=False,
         hidden_dropout=0.1,
         attention_dropout=0.1,
@@ -518,6 +524,7 @@ class TransformerLanguageModel(MegatronModule):
                 max_sequence_length=self.max_position_embeddings,
                 init_method=self.init_method,
                 num_tokentypes=self.num_tokentypes,
+                resume_from_checkpoint=resume_from_checkpoint,
                 use_cpu_initialization=use_cpu_initialization,
                 embedding_dropout_prob=self.hidden_dropout,
                 sequence_parallel=sequence_parallel,
@@ -535,7 +542,7 @@ class TransformerLanguageModel(MegatronModule):
         #         rotary_dim = int(rotary_dim * rotary_percentage)
         #     self.rotary_pos_emb = RotaryEmbedding(rotary_dim)
         # Transformer.
-        logging.trace(f"In TransformerLanguageModel() create encoder begin", trace_type="recovery_time")
+        logging.trace(f"In TransformerLanguageModel() create encoder with resume={resume_from_checkpoint} begin", trace_type="recovery_time")
         self.encoder = ParallelTransformer(
             init_method=self.init_method,
             output_layer_init_method=self.output_layer_init_method,
@@ -557,6 +564,7 @@ class TransformerLanguageModel(MegatronModule):
             hidden_dropout=hidden_dropout,
             attention_dropout=attention_dropout,
             ffn_dropout=ffn_dropout,
+            resume_from_checkpoint=resume_from_checkpoint,
             use_cpu_initialization=use_cpu_initialization,
             persist_layer_norm=persist_layer_norm,
             openai_gelu=openai_gelu,

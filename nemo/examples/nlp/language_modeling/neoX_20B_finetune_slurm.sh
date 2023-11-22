@@ -62,19 +62,19 @@ training_precision="bf16SR"
 if [[ $training_precision == "bf16SR" ]];then
     echo using BF16 SR
     export XLA_USE_BF16=1
-    export NEURON_CC_FLAGS="--model-type transformer --distribution-strategy=nemo --enable-mixed-precision-accumulation"
+    export NEURON_CC_FLAGS="--model-type transformer --distribution-strategy=llm-training --enable-mixed-precision-accumulation"
     OPTIM_NAME=adamw
     megatron_amp_O2=false
 elif [[ $training_precision == "megatron_amp_O2" ]]; then
     echo using megatron_amp_O2
     export XLA_DOWNCAST_BF16=1
-    export NEURON_CC_FLAGS="--model-type transformer --distribution-strategy=nemo --enable-mixed-precision-accumulation"
+    export NEURON_CC_FLAGS="--model-type transformer --distribution-strategy=llm-training --enable-mixed-precision-accumulation"
     OPTIM_NAME=adamw
     megatron_amp_O2=true
 elif [[ $training_precision == "fp32_OptStates" ]]; then
     echo using FP32 Optimizer States
     export XLA_DOWNCAST_BF16=1
-    export NEURON_CC_FLAGS="--model-type transformer --distribution-strategy=nemo --enable-mixed-precision-accumulation"
+    export NEURON_CC_FLAGS="--model-type transformer --distribution-strategy=llm-training --enable-mixed-precision-accumulation"
     OPTIM_NAME=adamw_fp32OptState
     megatron_amp_O2=false
 else

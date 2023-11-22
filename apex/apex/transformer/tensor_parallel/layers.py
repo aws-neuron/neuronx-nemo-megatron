@@ -197,6 +197,7 @@ class VocabParallelEmbedding(torch.nn.Module):
         init_method=init.xavier_normal_,
         *,
         params_dtype: torch.dtype=torch.float32,
+        resume_from_checkpoint: bool = False,
         use_cpu_initialization: bool = False,
     ):
         super().__init__()
@@ -224,8 +225,22 @@ class VocabParallelEmbedding(torch.nn.Module):
             self.vocab_end_index - self.vocab_start_index
         )
 
-        # Allocate weights and initialize.
-        if use_cpu_initialization:
+        # Allocate weights and initialize if necessary
+        if resume_from_checkpoint:
+            # resume from checkpoint does not need initialize, so always allocate memory on device
+            self.weight = Parameter(
+                torch.empty(
+                    self.num_embeddings_per_partition,
+                    self.embedding_dim,
+                    device=torch.cuda.current_device(),
+                    dtype=params_dtype,
+                    requires_grad=True
+                )
+            )
+            set_tensor_model_parallel_attributes(
+                tensor=self.weight, is_parallel=True, dim=0, stride=1
+            )
+        elif use_cpu_initialization:
             self.weight = Parameter(
                 torch.empty(
                     self.num_embeddings_per_partition,
@@ -490,6 +505,7 @@ class ColumnParallelLinear(torch.nn.Module):
     Keyword Arguments:
         no_async_tensor_model_parallel_allreduce:
         params_dtype:
+        resume_from_checkpoint: if True, do not initialize (so use_cpu_initialization will have no effect)
         use_cpu_initialization:
         gradient_accumulation_fusion:
         accumulation_in_fp16:
@@ -509,6 +525,7 @@ class ColumnParallelLinear(torch.nn.Module):
         *,
         no_async_tensor_model_parallel_allreduce=False,
         params_dtype=torch.float32,
+        resume_from_checkpoint=False,
         use_cpu_initialization=False,
         gradient_accumulation_fusion=False,
         accumulation_in_fp16: bool = False,
@@ -530,8 +547,21 @@ class ColumnParallelLinear(torch.nn.Module):
         # Parameters.
         # Note: torch.nn.functional.linear performs XA^T + b and as a result
         # we allocate the transpose.
-        # Initialize weight.
-        if use_cpu_initialization:
+        # Initialize weight if necessary
+        if resume_from_checkpoint:
+            self.weight = Parameter(
+                torch.empty(
+                    self.output_size_per_partition,
+                    self.input_size,
+                    device=torch.cuda.current_device(),
+                    dtype=params_dtype,
+                    requires_grad=True
+                )
+            )
+            set_tensor_model_parallel_attributes(
+                tensor=self.weight, is_parallel=True, dim=0, stride=stride
+            )
+        elif use_cpu_initialization:
             self.weight = Parameter(
                 torch.empty(self.output_size_per_partition, self.input_size, dtype=params_dtype)
             )
@@ -682,6 +712,7 @@ class RowParallelLinear(torch.nn.Module):
                        adding bias but instead return it.
     Keyword Arguments:
         params_dtype:
+        resume_from_checkpoint: if True, do not initialize, only allocate memory on device (hence use_cpu_initialization will have no effect)
         use_cpu_initialization:
         gradient_accumulation_fusion:
         accumulation_in_fp16:
@@ -700,6 +731,7 @@ class RowParallelLinear(torch.nn.Module):
         skip_bias_add=False,
         *,
         params_dtype=torch.float32,
+        resume_from_checkpoint=False,
         use_cpu_initialization=False,
         gradient_accumulation_fusion=False,
         accumulation_in_fp16: bool = False,
@@ -726,8 +758,21 @@ class RowParallelLinear(torch.nn.Module):
         # Parameters.
         # Note: torch.nn.functional.linear performs XA^T + b and as a result
         # we allocate the transpose.
-        # Initialize weight.
-        if use_cpu_initialization:
+        # Initialize weight if necessary
+        if resume_from_checkpoint:
+            self.weight = Parameter(
+                torch.empty(
+                    self.output_size,
+                    self.input_size_per_partition,
+                    device=torch.cuda.current_device(),
+                    dtype=params_dtype,
+                    requires_grad=True
+                )
+            )
+            set_tensor_model_parallel_attributes(
+                tensor=self.weight, is_parallel=True, dim=1, stride=stride
+            )
+        elif use_cpu_initialization:
             self.weight = Parameter(
                 torch.empty(
                     self.output_size, self.input_size_per_partition, dtype=params_dtype

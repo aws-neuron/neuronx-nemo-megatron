@@ -12,6 +12,9 @@ if [ -v SLURM_NNODES ]
 then
     # SLURM runs
     sudo sysctl -w net.ipv4.ip_local_reserved_ports=41000
+    if which lctl >/dev/null 2>&1; then
+        sudo lctl set_param 'osc.*.max_dirty_mb=64' # Cap max space each connection to FSx reserves so we avoid OODs
+    fi
     IPS=""
     for h in $(scontrol show hostname); do
         IPS="$IPS $(nslookup $h  | awk '/^Address: / { print $2 }')";
@@ -56,7 +59,7 @@ export PROCESSES_PER_NODE=32
 export MASTER_ADDR=${HOSTS[0]}
 export MASTER_PORT=41000
 
-export NEURON_RT_EXEC_TIMEOUT=10
+export NEURON_RT_EXEC_TIMEOUT=100
 export DISTRIBUTED_ARGS="--nproc_per_node $PROCESSES_PER_NODE --nnodes $NTASKS --node_rank $NODEID --master_addr $MASTER_ADDR --master_port $MASTER_PORT"
 echo $DISTRIBUTED_ARGS
 
@@ -79,19 +82,19 @@ training_precision="bf16SR"
 if [[ $training_precision == "bf16SR" ]];then
     echo using BF16 SR
     export XLA_USE_BF16=1
-    export NEURON_CC_FLAGS="--model-type transformer --distribution-strategy=nemo --enable-mixed-precision-accumulation"
+    export NEURON_CC_FLAGS="--model-type transformer --distribution-strategy=llm-training --enable-mixed-precision-accumulation"
     export OPTIM_NAME=adamw
     export megatron_amp_O2=false
 elif [[ $training_precision == "megatron_amp_O2" ]]; then
     echo using megatron_amp_O2
     export XLA_DOWNCAST_BF16=1
-    export NEURON_CC_FLAGS="--model-type transformer --distribution-strategy=nemo --enable-mixed-precision-accumulation"
+    export NEURON_CC_FLAGS="--model-type transformer --distribution-strategy=llm-training --enable-mixed-precision-accumulation"
     export OPTIM_NAME=adamw
     export megatron_amp_O2=true
 elif [[ $training_precision == "fp32_OptStates" ]]; then
     echo using FP32 Optimizer States
     export XLA_DOWNCAST_BF16=1
-    export NEURON_CC_FLAGS="--model-type transformer --distribution-strategy=nemo --enable-mixed-precision-accumulation"
+    export NEURON_CC_FLAGS="--model-type transformer --distribution-strategy=llm-training --enable-mixed-precision-accumulation"
     export OPTIM_NAME=adamw_fp32OptState
     export megatron_amp_O2=false
 else
@@ -106,7 +109,7 @@ export CHECKPOINT_CALLBACK=True
 if [ "$COMPILE" = "1" ]; then
     echo "compiling only run"
     MAYBE_COMPILE="neuron_parallel_compile"
-    export TRAIN_ITERS=3
+    export TRAIN_ITERS=4
     CREATE_TB_LOGGER=False
     CHECKPOINT_CALLBACK=False
 fi

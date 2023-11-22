@@ -207,6 +207,7 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
             init_method_std=self.cfg.get('init_method_std', 0.02),
             use_scaled_init_method=self.cfg.get('use_scaled_init_method', True),
             fp16_lm_cross_entropy=self.cfg.get('fp16_lm_cross_entropy', False),
+            resume_from_checkpoint=self.trainer.is_resuming_from_checkpoint(),
             use_cpu_initialization=self.cfg.get('use_cpu_initialization', False),
             hidden_dropout=self.cfg.get('hidden_dropout', 0.1),
             attention_dropout=self.cfg.get('attention_dropout', 0.0),
@@ -999,7 +1000,7 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
         if stage == 'predict':
             return
         elif self.cfg.data.get("fine_tuning", False):
-            self.build_sft_dataets()
+            self.build_sft_datasets()
             self.setup_training_data(self.cfg.data)
             self.setup_validation_data(self.cfg.data)
             self.setup_test_data(self.cfg.data)
@@ -1025,7 +1026,7 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
 
         logging.trace(f"Leave MegatronGPTModel.setup()", trace_type="recovery_time")
 
-    def build_sft_dataets(self):
+    def build_sft_datasets(self):
         if self.trainer.limit_val_batches > 1.0 and isinstance(self.trainer.limit_val_batches, float):
             raise ValueError("limit_val_batches must be an integer or float less than or equal to 1.0.")
 
