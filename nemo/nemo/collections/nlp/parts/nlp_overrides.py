@@ -350,7 +350,23 @@ class NLPFitLoop(FitLoop):
 
 
 class NLPCheckpointIO(XLACheckpointIO):
-    def save_checkpoint(self, checkpoint: Dict[str, Any], path, storage_options: Optional[Any] = None) -> None:
+
+    def load_checkpoint(self, checkpoint_path: _PATH, load_type_xser: bool) -> Dict[str, Any]:
+        """ PTL override to accomodate model parallel checkpoints """
+        checkpoint_path = inject_model_parallel_rank(checkpoint_path)
+        from .serialization import load
+
+        if load_type_xser:
+            loaded_checkpoint = load(checkpoint_path, parallel_state.get_data_parallel_rank(),
+                                     parallel_state.get_data_parallel_group())
+        else:
+            loaded_checkpoint = super().load_checkpoint(checkpoint_path)
+
+        return loaded_checkpoint
+
+    def save_checkpoint(
+        self, checkpoint: Dict[str, Any], filepath: _PATH, save_type_xser: bool, storage_options: Optional[Any] = None
+    ) -> None:
         """Save model/training states as a checkpoint file through state-dump and file-write.
    
         Args:
@@ -368,18 +384,47 @@ class NLPCheckpointIO(XLACheckpointIO):
                 f" is not supported for `{self.__class__.__name__}`. Please implement your custom `CheckpointIO`"
                 " to define how you'd like to use `storage_options`."
             )
-        fs = get_filesystem(path)
-        fs.makedirs(os.path.dirname(path), exist_ok=True)
+        app_state = AppState()
+        # PTL override to accomodate model parallel checkpoints
+        def ensure_directory_exists(filename):
+            """Build filename's path if it does not already exists."""
+            dirname = os.path.dirname(filename)
+            if not os.path.exists(dirname):
+                os.makedirs(dirname)
+
+        import torch_xla.utils.serialization as xser
+        import torch_xla.core.xla_model as xm
+        # PTL override to accomodate model parallel checkpoints
+        filepath = inject_model_parallel_rank(filepath)
         if RequirementCache("omegaconf"):
             # workaround for https://github.com/pytorch/xla/issues/2773
             from omegaconf import DictConfig, ListConfig, OmegaConf
-   
+
             checkpoint = apply_to_collection(checkpoint, (DictConfig, ListConfig), OmegaConf.to_container)
-        import torch_xla.core.xla_model as xm
-   
-        ### NEURON: master_only=True since different TP workers would save the checkpoint. Note: This needs to be
-        # rewritten inside Nemo
-        xm.save({k: v for k, v in checkpoint.items() if k != "callbacks"}, path, master_only=True)
+        master_only = app_state.data_parallel_rank == 0
+        if master_only:
+            ensure_directory_exists(filepath)
+        try:
+            save_bf16 = self.lightning_module.cfg.save_bf16
+        except:
+            save_bf16 = False
+        from .serialization import save
+        if save_type_xser:
+            save({k: v for k, v in checkpoint.items() if k != "callbacks"}, filepath, parallel_state.get_data_parallel_rank()==0, 
+                    parallel_state.get_data_parallel_rank(), parallel_state.get_data_parallel_world_size())
+        else:
+            for tp_rank in range(0, parallel_state.get_tensor_model_parallel_world_size()):
+                my_tp_rank = parallel_state.get_tensor_model_parallel_rank()
+                if save_bf16:
+                    checkpoint = cast_all(checkpoint, from_dtype=torch.float32, to_dtype=torch.bfloat16)
+                should_write_data = True if parallel_state.get_data_parallel_rank() == 0 and my_tp_rank == tp_rank else False
+
+                #Staggering save checkpoints
+                if should_write_data:
+                    cpu_data = xm._maybe_convert_to_cpu({k: v for k, v in checkpoint.items() if k != "callbacks"}, convert=True)
+                    ensure_directory_exists(filepath)
+                    torch.save(cpu_data, filepath)
+                xm.rendezvous(f'chktp-save-{tp_rank}')
 
 class NLPCheckpointConnector(CheckpointConnector):
     def restore_loops(self) -> None:
@@ -669,6 +714,7 @@ class NLPTrainer(Trainer):
         )
         self._logger_connector = LoggerConnector(self)
         self._callback_connector = CallbackConnector(self)
+        self._resume_from_checkpoint = resume_from_checkpoint
         self._checkpoint_connector = NLPCheckpointConnector(self, resume_from_checkpoint)
         self._signal_connector = SignalConnector(self)
         self.tuner = Tuner(self)
@@ -775,17 +821,16 @@ class NLPTrainer(Trainer):
 
     def _restore_modules_and_callbacks(self, checkpoint_path: Optional[_PATH] = None) -> None:
         import torch_xla.core.xla_model as xm
-        for i in range(0, parallel_state.get_data_parallel_world_size()):
-            if parallel_state.get_data_parallel_rank() == i:
-                # restore modules after setup
-                self._checkpoint_connector.resume_start(checkpoint_path)
-                self._checkpoint_connector._restore_quantization_callbacks()
-                self._checkpoint_connector.restore_model()
-                self._checkpoint_connector.restore_datamodule()
-                if self.state.fn == TrainerFn.FITTING:
-                    # restore callback states
-                    self._checkpoint_connector.restore_callbacks()
-            xm.rendezvous(f'load-chkpt-phase-{i}')
+        self._checkpoint_connector.resume_start(checkpoint_path)
+        self._checkpoint_connector._restore_quantization_callbacks()
+        self._checkpoint_connector.restore_model()
+        self._checkpoint_connector.restore_datamodule()
+        if self.state.fn == TrainerFn.FITTING:
+            # restore callback states
+            self._checkpoint_connector.restore_callbacks()
+
+    def is_resuming_from_checkpoint(self):
+        return self._resume_from_checkpoint is not None
 
     def reset_train_dataloader(self, model: Optional["pl.LightningModule"] = None) -> None:
         """Resets the train dataloader and initialises required variables (number of batches, when to validate,
@@ -1061,6 +1106,11 @@ class NLPDDPStrategy(TPUSpawnStrategy):
             save_mode = False
         return save_mode
 
+    def save_checkpoint(
+        self, checkpoint: Dict[str, Any], filepath: _PATH, storage_options: Optional[Any] = None
+    ) -> None:
+        self.checkpoint_io.save_checkpoint(checkpoint, filepath, self.is_save_type_xser())
+
     def is_load_type_xser(self):
         try:
             load_xser_mode = self.lightning_module.cfg.load_xser
@@ -1068,48 +1118,8 @@ class NLPDDPStrategy(TPUSpawnStrategy):
             load_xser_mode = False
         return load_xser_mode
 
-    def save_checkpoint(
-        self, checkpoint: Dict[str, Any], filepath: _PATH, storage_options: Optional[Any] = None
-    ) -> None:
-        app_state = AppState()
-        # PTL override to accomodate model parallel checkpoints
-        def ensure_directory_exists(filename):
-            """Build filename's path if it does not already exists."""
-            dirname = os.path.dirname(filename)
-            if not os.path.exists(dirname):
-                os.makedirs(dirname)
-
-        import torch_xla.utils.serialization as xser
-        import torch_xla.core.xla_model as xm
-        # PTL override to accomodate model parallel checkpoints
-        filepath = inject_model_parallel_rank(filepath)
-        if RequirementCache("omegaconf"):
-            # workaround for https://github.com/pytorch/xla/issues/2773
-            from omegaconf import DictConfig, ListConfig, OmegaConf
-
-            checkpoint = apply_to_collection(checkpoint, (DictConfig, ListConfig), OmegaConf.to_container)
-        master_only = app_state.data_parallel_rank == 0
-        if master_only:
-            ensure_directory_exists(filepath)
-        try:
-            save_bf16 = self.lightning_module.cfg.save_bf16
-        except:
-            save_bf16 = False
-        if self.is_save_type_xser():
-            xser.save({k: v for k, v in checkpoint.items() if k != "callbacks"}, filepath, (not master_only), global_master=True)
-        else:
-            for tp_rank in range(0, parallel_state.get_tensor_model_parallel_world_size()):
-                my_tp_rank = parallel_state.get_tensor_model_parallel_rank()
-                if save_bf16:
-                    checkpoint = cast_all(checkpoint, from_dtype=torch.float32, to_dtype=torch.bfloat16)
-                should_write_data = True if parallel_state.get_data_parallel_rank() == 0 and my_tp_rank == tp_rank else False
-
-                #Staggering save checkpoints
-                if should_write_data:
-                    cpu_data = xm._maybe_convert_to_cpu({k: v for k, v in checkpoint.items() if k != "callbacks"}, convert=True)
-                    ensure_directory_exists(filepath)
-                    torch.save(cpu_data, filepath)
-                xm.rendezvous(f'chktp-save-{tp_rank}')
+    def load_checkpoint(self, checkpoint_path: _PATH) -> Dict[str, Any]:
+        return self.checkpoint_io.load_checkpoint(checkpoint_path, self.is_load_type_xser())
 
     def load_model_state_dict(self, checkpoint: Mapping[str, Any]) -> None:
         # Release strict state dict matching when using Megatron AMP-O2 to skip matching
@@ -1132,37 +1142,6 @@ class NLPDDPStrategy(TPUSpawnStrategy):
                 checkpoint['state_dict'] = new_state_dict
 
         self.lightning_module.load_state_dict(checkpoint["state_dict"])
-
-    def load_checkpoint(self, checkpoint_path: _PATH) -> Dict[str, Any]:
-        """ PTL override to accomodate model parallel checkpoints """
-        # TODO: move to CheckpointIO
-        torch.cuda.empty_cache()
-        checkpoint_path = inject_model_parallel_rank(checkpoint_path)
-        import torch_xla.utils.serialization as xser
-        import torch_xla.core.xla_model as xm
-       
-        def device_load_xser(path):
-            ref_data = torch.load(path)
-
-            def convert_fn(tensors):
-                rewritten_tensors = []
-                for t in tensors:
-                    rewritten_tensors.append(
-                    torch.load(os.path.join(path + '.tensors', 'tensor_{}.pt'.format(t.tid)))
-                    .to(device=xm.xla_device()))
-                return rewritten_tensors
-
-            def select_fn(v):
-                return type(v) == xser.TensorReference
-
-            return xm.ToXlaTensorArena(convert_fn, select_fn).transform(ref_data)
-
-        if self.is_load_type_xser():
-            loaded_checkpoint = device_load_xser(checkpoint_path)
-        else:
-            loaded_checkpoint = self.checkpoint_io.load_checkpoint(checkpoint_path)
-
-        return loaded_checkpoint
 
     def remove_checkpoint(self, filepath: _PATH) -> None:
         app_state = AppState()

@@ -115,6 +115,7 @@ class ParallelMLP(MegatronModule, adapter_mixins.AdapterModuleMixin):
         output_layer_init_method,
         hidden_size,
         ffn_hidden_size,
+        resume_from_checkpoint=False,
         use_cpu_initialization=False,
         bias_activation_fusion=True,
         openai_gelu=False,
@@ -155,6 +156,7 @@ class ParallelMLP(MegatronModule, adapter_mixins.AdapterModuleMixin):
             gather_output=False,
             init_method=init_method,
             skip_bias_add=True,
+            resume_from_checkpoint=resume_from_checkpoint,
             use_cpu_initialization=use_cpu_initialization,
             bias=bias,
             sequence_parallel_enabled=sequence_parallel,
@@ -175,6 +177,7 @@ class ParallelMLP(MegatronModule, adapter_mixins.AdapterModuleMixin):
                 gather_output=False,
                 init_method=init_method,
                 skip_bias_add=True,
+                resume_from_checkpoint=resume_from_checkpoint,
                 use_cpu_initialization=use_cpu_initialization,
                 bias=bias,
                 sequence_parallel_enabled=sequence_parallel,
@@ -226,6 +229,7 @@ class ParallelMLP(MegatronModule, adapter_mixins.AdapterModuleMixin):
             input_is_parallel=True,
             init_method=output_layer_init_method,
             skip_bias_add=True,
+            resume_from_checkpoint=resume_from_checkpoint,
             use_cpu_initialization=use_cpu_initialization,
             bias=bias,
             sequence_parallel_enabled=sequence_parallel,
@@ -233,7 +237,7 @@ class ParallelMLP(MegatronModule, adapter_mixins.AdapterModuleMixin):
             transfer_with_static_ring=transfer_with_static_ring,
         )
         t1 = datetime.datetime.now()
-        logging.trace(f"In ParallelMLP create self.dense_4h_to_h. Begin: {t0} Elapsed: {(t1 - t0).total_seconds()} s.", trace_type="recovery_time")
+        logging.trace(f"In ParallelMLP create self.dense_4h_to_h with resume={resume_from_checkpoint} Begin: {t0} Elapsed: {(t1 - t0).total_seconds()} s.", trace_type="recovery_time")
 
         # Normformer normalization
         if transformer_block_type == 'normformer':
@@ -704,6 +708,7 @@ class ParallelAttention(MegatronModule, adapter_mixins.AdapterModuleMixin):
         precision=16,
         apply_query_key_layer_scaling=True,
         kv_channels=None,
+        resume_from_checkpoint=False,
         use_cpu_initialization=False,
         masked_softmax_fusion=True,
         attention_dropout=0.1,
@@ -764,6 +769,7 @@ class ParallelAttention(MegatronModule, adapter_mixins.AdapterModuleMixin):
                 3 * projection_size,
                 gather_output=False,
                 init_method=init_method,
+                resume_from_checkpoint=resume_from_checkpoint,
                 use_cpu_initialization=use_cpu_initialization,
                 bias=bias,
                 sequence_parallel_enabled=sequence_parallel,
@@ -828,6 +834,7 @@ class ParallelAttention(MegatronModule, adapter_mixins.AdapterModuleMixin):
             input_is_parallel=True,
             init_method=output_layer_init_method,
             skip_bias_add=True,
+            resume_from_checkpoint=resume_from_checkpoint,
             use_cpu_initialization=use_cpu_initialization,
             bias=bias,
             sequence_parallel_enabled=sequence_parallel,
@@ -1327,6 +1334,7 @@ class ParallelTransformerLayer_(MegatronModule, adapter_mixins.AdapterModuleMixi
         layernorm_epsilon=1e-5,
         hidden_dropout=0.1,
         persist_layer_norm=False,
+        resume_from_checkpoint=False,
         use_cpu_initialization=False,
         bias_activation_fusion=True,
         bias_dropout_add_fusion=True,
@@ -1425,6 +1433,7 @@ class ParallelTransformerLayer_(MegatronModule, adapter_mixins.AdapterModuleMixi
                 precision=precision,
                 apply_query_key_layer_scaling=apply_query_key_layer_scaling,
                 kv_channels=kv_channels,
+                resume_from_checkpoint=resume_from_checkpoint,
                 use_cpu_initialization=use_cpu_initialization,
                 masked_softmax_fusion=masked_softmax_fusion,
                 attention_dropout=attention_dropout,
@@ -1490,7 +1499,7 @@ class ParallelTransformerLayer_(MegatronModule, adapter_mixins.AdapterModuleMixi
                     sequence_parallel_enabled=sequence_parallel)
 
         if self.layer_type == LayerType.decoder or self.layer_type == LayerType.retrieval_encoder:
-            logging.trace("In ParallelTransfomerLayer() create ParallelAttention for decoder ....", trace_type="recovery_time")
+            logging.trace(f"In ParallelTransfomerLayer() create ParallelAttention for decoder with resume being {resume_from_checkpoint} ....", trace_type="recovery_time")
             self.inter_attention = ParallelAttention(
                 init_method=init_method,
                 output_layer_init_method=output_layer_init_method,
@@ -1503,6 +1512,7 @@ class ParallelTransformerLayer_(MegatronModule, adapter_mixins.AdapterModuleMixi
                 apply_query_key_layer_scaling=apply_query_key_layer_scaling,
                 kv_channels=kv_channels,
                 multi_query_attention=multi_query_attention,
+                resume_from_checkpoint=resume_from_checkpoint,
                 use_cpu_initialization=use_cpu_initialization,
                 masked_softmax_fusion=masked_softmax_fusion,
                 attention_dropout=attention_dropout,
@@ -1616,12 +1626,13 @@ class ParallelTransformerLayer_(MegatronModule, adapter_mixins.AdapterModuleMixi
             )
             logging.trace("In ParallelTransfomerLayer() create SwitchMLP ....", trace_type="recovery_time")
         else:
-            logging.trace("In ParallelTransfomerLayer() create ParallelMLP ....", trace_type="recovery_time")
+            logging.trace(f"In ParallelTransfomerLayer() create ParallelMLP with resume being {resume_from_checkpoint}....", trace_type="recovery_time")
             self.mlp = ParallelMLP(
                 init_method=init_method,
                 output_layer_init_method=output_layer_init_method,
                 hidden_size=hidden_size,
                 ffn_hidden_size=ffn_hidden_size,
+                resume_from_checkpoint=resume_from_checkpoint,
                 use_cpu_initialization=use_cpu_initialization,
                 bias_activation_fusion=bias_activation_fusion,
                 openai_gelu=openai_gelu,
@@ -1889,6 +1900,7 @@ class ParallelTransformerLayer(ParallelTransformerLayer_):
         hidden_dropout=0.1,
         bias_dropout_add_fusion=True,
         persist_layer_norm=False,
+        resume_from_checkpoint=False,
         use_cpu_initialization=False,
         bias_activation_fusion=True,
         openai_gelu=False,
@@ -1933,6 +1945,7 @@ class ParallelTransformerLayer(ParallelTransformerLayer_):
             hidden_dropout=hidden_dropout,
             bias_dropout_add_fusion=bias_dropout_add_fusion,
             persist_layer_norm=persist_layer_norm,
+            resume_from_checkpoint=resume_from_checkpoint,
             use_cpu_initialization=use_cpu_initialization,
             bias_activation_fusion=bias_activation_fusion,
             openai_gelu=openai_gelu,
@@ -2145,6 +2158,7 @@ class ParallelTransformer(MegatronModule):
         hidden_dropout=0.1,
         attention_dropout=0.1,
         ffn_dropout=0.0,
+        resume_from_checkpoint=False,
         use_cpu_initialization=False,
         bias_activation_fusion=True,
         bias_dropout_add_fusion=True,
@@ -2324,7 +2338,7 @@ class ParallelTransformer(MegatronModule):
                     zero_centered_gamma=normalization == 'layernorm1p',
                 )
             else:
-                logging.trace(f"building ParallelTransformerLayer {layer_number} begin", trace_type="recovery_time")
+                logging.trace(f"building ParallelTransformerLayer {layer_number} begin with resume being {resume_from_checkpoint}", trace_type="recovery_time")
                 return ParallelTransformerLayer(
                     init_method=init_method,
                     output_layer_init_method=output_layer_init_method,
@@ -2342,6 +2356,7 @@ class ParallelTransformer(MegatronModule):
                     hidden_dropout=hidden_dropout,
                     attention_dropout=attention_dropout,
                     ffn_dropout=ffn_dropout,
+                    resume_from_checkpoint=resume_from_checkpoint,
                     use_cpu_initialization=use_cpu_initialization,
                     bias_activation_fusion=bias_activation_fusion,
                     bias_dropout_add_fusion=bias_dropout_add_fusion,
@@ -2405,7 +2420,7 @@ class ParallelTransformer(MegatronModule):
             else:
                 offset = parallel_state.get_pipeline_model_parallel_rank() * self.num_layers
 
-        logging.trace("In ParallelTransformer(), building layers begin", trace_type="recovery_time")
+        logging.trace("In ParallelTransformer(), building layers with resume being {resume_from_checkpoint} begin", trace_type="recovery_time")
         self.layers = torch.nn.ModuleList([build_layer(i + 1 + offset) for i in range(self.num_layers)])
         logging.trace("In ParallelTransformer(), building layers done", trace_type="recovery_time")
 

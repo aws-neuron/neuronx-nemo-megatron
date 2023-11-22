@@ -9,7 +9,7 @@ export N_AH=64
 export FFN_HS=28672
 export GBS=512
 export KV_HEADS=8
-export TRAIN_ITERS=20000
+: ${TRAIN_ITERS:=20000}
 
 export INIT_METHOD_STD=0.02
 export LAYERNORM_EPSILON=1e-5

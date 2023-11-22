@@ -12,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""GPT-2 model."""
+"""Falcon-7B model."""
 
 import torch
-from nemo.utils import logging
-from nemo.collections.nlp.modules.common.megatron.language_model import get_language_model
+
+from nemo.collections.nlp.modules.common.megatron.falcon_module import get_falcon_language_model
 from nemo.collections.nlp.modules.common.megatron.module import MegatronModule
 from nemo.collections.nlp.modules.common.megatron.utils import (
     ApexGuardDefaults,
@@ -56,7 +56,7 @@ def post_language_model_processing(
         else:
             logits = None
             if return_logits:
-                logits = output.clone()
+                logits = lm_output.clone()
             if fp16_lm_cross_entropy:
                 assert lm_output.dtype == torch.half
                 loss = tensor_parallel.vocab_parallel_cross_entropy(lm_output, labels)
@@ -107,8 +107,8 @@ def post_language_model_processing(
         return loss, logits
 
 
-class GPTModel(MegatronModule):
-    """GPT-2 Language model."""
+class FalconModel(MegatronModule):
+    """Falcon Language model."""
 
     def __init__(
         self,
@@ -127,7 +127,6 @@ class GPTModel(MegatronModule):
         init_method_std=0.02,
         use_scaled_init_method=True,
         fp16_lm_cross_entropy=False,
-        resume_from_checkpoint=False,
         use_cpu_initialization=False,
         hidden_dropout=0.1,
         attention_dropout=0.1,
@@ -148,7 +147,7 @@ class GPTModel(MegatronModule):
         headscale=False,
         transformer_block_type='pre_ln',
         normalize_attention_scores=True,
-        position_embedding_type='learned_absolute',
+        position_embedding_type='rope',
         rotary_percentage=1.0,
         attention_type='multihead',
         share_embeddings_and_output_weights=True,
@@ -169,10 +168,9 @@ class GPTModel(MegatronModule):
         use_emha=False,
         multi_query_attention=False,
         save_logits=False,
-        position_interpolation_factor=1.0,
     ):
 
-        super(GPTModel, self).__init__(share_token_embeddings=share_embeddings_and_output_weights)
+        super(FalconModel, self).__init__(share_token_embeddings=share_embeddings_and_output_weights)
 
         self.parallel_output = parallel_output
         self.pre_process = pre_process
@@ -194,10 +192,7 @@ class GPTModel(MegatronModule):
             if use_scaled_init_method
             else init_method_normal(init_method_std)
         )
-
-        logging.trace(f"In GPTModel._init_() enter get_language_model()", trace_type="recovery_time")
-
-        self.language_model, self._language_model_key = get_language_model(
+        self.language_model, self._language_model_key = get_falcon_language_model(
             vocab_size=vocab_size,
             hidden_size=hidden_size,
             hidden_dropout=hidden_dropout,
@@ -217,7 +212,6 @@ class GPTModel(MegatronModule):
             pre_process=self.pre_process,
             post_process=self.post_process,
             init_method_std=init_method_std,
-            resume_from_checkpoint=resume_from_checkpoint,
             use_cpu_initialization=use_cpu_initialization,
             precision=precision,
             fp32_residual_connection=fp32_residual_connection,
@@ -255,10 +249,7 @@ class GPTModel(MegatronModule):
             reduce_amax=reduce_amax,
             use_emha=use_emha,
             multi_query_attention=multi_query_attention,
-            position_interpolation_factor=position_interpolation_factor,
         )
-
-        logging.trace(f"In GPTModel._init_() leave get_language_model()", trace_type="recovery_time")
 
         if self.share_embeddings_and_output_weights:
             self.initialize_word_embeddings(
