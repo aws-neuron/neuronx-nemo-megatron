@@ -78,7 +78,7 @@ model:
   activation: 'swiglu' # ['swiglu', 'gelu']
   transformer_block_type: 'pre_ln' # ['pre_ln', 'post_ln', 'normformer', 'gpt_j'] https://github.com/EleutherAI/gpt-neox/blob/303d7be582ae1c969347c25c54f568cc122445fc/megatron/model/transformer.py#L804-L847
   has_bias: False
-  has_bias_qkv: False
+  has_bias_qkv: True
 
   tokenizer:
     library: 'huggingface'
