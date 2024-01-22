@@ -710,6 +710,7 @@ class ParallelAttention(MegatronModule, adapter_mixins.AdapterModuleMixin):
         layer_type=None,
         megatron_legacy=False,
         bias=True,
+        bias_qkv=True,
         headscale=False,
         position_embedding_type='learned_absolute',
         multi_query_attention=False,
@@ -765,7 +766,7 @@ class ParallelAttention(MegatronModule, adapter_mixins.AdapterModuleMixin):
                 gather_output=False,
                 init_method=init_method,
                 use_cpu_initialization=use_cpu_initialization,
-                bias=bias,
+                bias=bias_qkv,
                 sequence_parallel_enabled=sequence_parallel,
                 no_async_tensor_model_parallel_allreduce=no_async_tensor_model_parallel_allreduce,
                 gradient_accumulation_fusion=gradient_accumulation_fusion,
@@ -780,7 +781,7 @@ class ParallelAttention(MegatronModule, adapter_mixins.AdapterModuleMixin):
                 projection_size,
                 gather_output=False,
                 init_method=init_method,
-                bias=bias,
+                bias=bias_qkv,
                 sequence_parallel_enabled=sequence_parallel,
                 no_async_tensor_model_parallel_allreduce=no_async_tensor_model_parallel_allreduce,
                 gradient_accumulation_fusion=gradient_accumulation_fusion,
@@ -792,7 +793,7 @@ class ParallelAttention(MegatronModule, adapter_mixins.AdapterModuleMixin):
                 2 * projection_size,
                 gather_output=False,
                 init_method=init_method,
-                bias=bias,
+                bias=bias_qkv,
                 sequence_parallel_enabled=sequence_parallel,
                 no_async_tensor_model_parallel_allreduce=no_async_tensor_model_parallel_allreduce,
                 gradient_accumulation_fusion=gradient_accumulation_fusion,
@@ -1339,6 +1340,7 @@ class ParallelTransformerLayer_(MegatronModule, adapter_mixins.AdapterModuleMixi
         activation='gelu',
         megatron_legacy=False,
         bias=True,
+        bias_qkv=True,
         chunk_size=64,
         normalization='layernorm',
         transformer_block_type='pre_ln',
@@ -1367,6 +1369,7 @@ class ParallelTransformerLayer_(MegatronModule, adapter_mixins.AdapterModuleMixi
         self.layer_type = layer_type
         self.sequence_parallel = sequence_parallel
         self.bias = bias
+        self.bias_qkv = bias_qkv
         self.transformer_block_type = transformer_block_type
         self.position_embedding_type = position_embedding_type
         self.position_interpolation_factor = position_interpolation_factor
@@ -1432,6 +1435,7 @@ class ParallelTransformerLayer_(MegatronModule, adapter_mixins.AdapterModuleMixi
                 layer_type=layer_type,
                 megatron_legacy=megatron_legacy,
                 bias=bias,
+                bias_qkv=bias_qkv,
                 headscale=headscale,
                 activations_checkpoint_granularity=activations_checkpoint_granularity,
                 position_embedding_type=position_embedding_type,
@@ -1899,6 +1903,7 @@ class ParallelTransformerLayer(ParallelTransformerLayer_):
         activation='gelu',
         megatron_legacy=False,
         bias=True,
+        bias_qkv=True,
         chunk_size=64,
         normalization='layernorm',
         transformer_block_type='pre_ln',
@@ -1943,6 +1948,7 @@ class ParallelTransformerLayer(ParallelTransformerLayer_):
             activation=activation,
             megatron_legacy=megatron_legacy,
             bias=bias,
+            bias_qkv=bias_qkv,
             chunk_size=chunk_size,
             normalization=normalization,
             transformer_block_type=transformer_block_type,
@@ -2157,6 +2163,7 @@ class ParallelTransformer(MegatronModule):
         model_type=ModelType.encoder_or_decoder,
         megatron_legacy=False,
         bias=True,
+        bias_qkv=True,
         chunk_size=64,
         normalization='layernorm',
         transformer_block_type='pre_ln',
@@ -2353,6 +2360,7 @@ class ParallelTransformer(MegatronModule):
                     activation=activation,
                     megatron_legacy=megatron_legacy,
                     bias=bias,
+                    bias_qkv=bias_qkv,
                     chunk_size=chunk_size,
                     normalization=normalization,
                     transformer_block_type=transformer_block_type,

@@ -8,8 +8,10 @@ scikit-learn
 setuptools==59.5.0
 tensorboard
 text-unidecode
+tiktoken
 torch
 tqdm>=4.41.0
+transformers>=4.32.0
 wget
 wrapt
 pytorch-lightning==1.8.6

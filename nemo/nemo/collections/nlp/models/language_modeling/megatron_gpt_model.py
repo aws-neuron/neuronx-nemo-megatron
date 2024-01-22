@@ -229,6 +229,7 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
             rotary_percentage=self.cfg.get('rotary_percentage', 1.0),
             activation=self.cfg.get('activation', 'gelu'),
             bias=self.cfg.get('has_bias', True),
+            bias_qkv=self.cfg.get('has_bias_qkv', True),
             transformer_block_type=self.cfg.get('transformer_block_type','pre_ln'),
             masked_softmax_fusion=self.cfg.get('masked_softmax_fusion', True),
             gradient_accumulation_fusion=self.cfg.get('gradient_accumulation_fusion', False),
