@@ -96,7 +96,7 @@ def _gather_along_last_dim(input_: torch.Tensor) -> torch.Tensor:
     tensor_list = [torch.empty_like(input_) for _ in range(world_size)]
     tensor_list[rank] = input_
     output = xm.all_gather(input_, groups=get_tensor_model_parallel_group()._mesh, pin_layout=False)
-    for i, slice in enumerate(torch.split(output, input_tensor.shape[0])):
+    for i, slice in enumerate(torch.split(output, input_.shape[0])):
         with torch.no_grad():
             tensor_list[i].copy_(slice)
 

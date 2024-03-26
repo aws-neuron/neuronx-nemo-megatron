@@ -253,7 +253,7 @@ class ModelPT(NLPLightningModule, Model):
         """
         # set global vars in AppState
         app_state = AppState()
-
+        self.zero_use_master_weight = cfg.get('zero_use_master_weight', False)
         # Convert config to a DictConfig
         cfg = model_utils.convert_model_config_to_dict_config(cfg)
 
@@ -768,6 +768,7 @@ class ModelPT(NLPLightningModule, Model):
             if wrap_with_zero:
                 optimizer = ZeroRedundancyOptimizer(self._optimizer_param_groups,
                                                     optim.AVAILABLE_OPTIMIZERS[optimizer_name],
+                                                    optimizer_dtype=torch.double if self.zero_use_master_weight else torch.float32,
                                                     pin_layout=False,
                                                     grad_clipping=self.trainer.gradient_clip_val is not None and self.trainer.gradient_clip_val != 0,
                                                     max_norm=self.trainer.gradient_clip_val,

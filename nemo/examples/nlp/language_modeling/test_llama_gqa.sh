@@ -25,7 +25,7 @@ echo "SEQ_LEN=$SEQ_LENGTH, HS=$HS, FFN_HS=$FFN_HS TP=$TP PP=$PP N_LAYERS=$N_LAYE
 LOG_PATH=logs/$SLURM_JOB_ID/$NODEID/
 mkdir -p $LOG_PATH
 
-$MAYBE_COMPILE torchrun $DISTRIBUTED_ARGS megatron_llama_pretraining.py  \
+$MAYBE_COMPILE torchrun $DISTRIBUTED_ARGS megatron_gpt_pretraining.py  \
     --config-path=conf \
     --config-name=megatron_llama_70b_config \
     trainer.devices=$PROCESSES_PER_NODE \
@@ -71,7 +71,10 @@ $MAYBE_COMPILE torchrun $DISTRIBUTED_ARGS megatron_llama_pretraining.py  \
     model.activations_checkpoint_granularity=full \
     model.activations_checkpoint_method=uniform \
     model.activations_checkpoint_num_layers=1 \
+    model.wrap_with_zero=$wrap_with_zero \
+    model.zero_use_master_weight=$zero_use_master_weight \
     +model.save_xser=True \
+    +model.load_xser=True \
     exp_manager.create_tensorboard_logger=$CREATE_TB_LOGGER \
     exp_manager.resume_if_exists=False \
     exp_manager.resume_ignore_no_checkpoint=False \
@@ -81,8 +84,7 @@ $MAYBE_COMPILE torchrun $DISTRIBUTED_ARGS megatron_llama_pretraining.py  \
     model.use_cpu_initialization=True   2>&1  | tee  $LOG_PATH/log
 
 # Note: to resume training using a checkpoint, please add the following configuration above, adjusting for your checkpoint path
-    # model.use_cpu_initialization=False \
-    # +model.load_xser=True \
+    
     # +model.resume_from_checkpoint='/root/scripts/example_datasets/llamav2_weights/llama7b_hf_converted_nemo_v3//mp_rank_07/model_optim_rng.ckpt' \
 # To use mixed precision optimizer, add
     # model.megatron_amp_O2=True \
