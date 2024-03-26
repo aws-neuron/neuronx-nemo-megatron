@@ -15,9 +15,6 @@
 # TODO (mkozuki): Replace assert with RuntimeError.
 # TODO (mkozuki): Sort the functions in the same order of megatron/mpu/initialize.py
 """Model and data parallel groups."""
-
-import os
-
 from typing import Tuple, Optional
 import warnings
 
@@ -170,8 +167,6 @@ def initialize_model_parallel(
             "> initializing data parallel with size {}".format(data_parallel_size)
         )
 
-    compress_rg = int(os.getenv('NEURON_EXPERIMENTAL_COMPRESS_RG', '0'))
-
     num_tensor_model_parallel_groups: int = world_size // tensor_model_parallel_size
     num_pipeline_model_parallel_groups: int = world_size // pipeline_model_parallel_size
     num_data_parallel_groups: int = world_size // data_parallel_size
@@ -242,8 +237,6 @@ def initialize_model_parallel(
         )
         all_tensor_parallel_group_ranks.append(ranks)
     _TENSOR_MODEL_PARALLEL_GROUP_SPMD = all_tensor_parallel_group_ranks
-    if compress_rg:
-        _TENSOR_MODEL_PARALLEL_GROUP_SPMD = [all_tensor_parallel_group_ranks[0]]
     for ranks in all_tensor_parallel_group_ranks:
         pg_options = {'xla_pg_options' : {'mesh' : _TENSOR_MODEL_PARALLEL_GROUP_SPMD}}
         if rank in ranks:

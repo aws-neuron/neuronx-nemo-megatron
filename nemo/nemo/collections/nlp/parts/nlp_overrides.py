@@ -16,7 +16,6 @@ import itertools
 import os
 import shutil
 import tempfile
-import concurrent.futures
 from collections import defaultdict
 from contextlib import contextmanager
 from pathlib import Path
@@ -31,7 +30,6 @@ from torch import Tensor
 from torch.nn import Module
 from torch.optim.optimizer import Optimizer
 from torch.utils.data import DataLoader
-import torch_xla.core.xla_model as xm
 from torch_xla.distributed.zero_redundancy_optimizer import ZeroRedundancyOptimizer
 from torchmetrics import Metric
 from lightning_lite.plugins import ClusterEnvironment, XLACheckpointIO
@@ -59,7 +57,6 @@ from pytorch_lightning.utilities.auto_restart import _add_capture_metadata_colla
 from pytorch_lightning.utilities.imports import _fault_tolerant_training
 from pytorch_lightning.utilities.argparse import _defaults_from_env_vars
 from pytorch_lightning.utilities.rank_zero import rank_zero_warn 
-from pytorch_lightning.utilities.warnings import PossibleUserWarning
 from pytorch_lightning.loops.utilities import _block_parallel_sync_behavior
 from pytorch_lightning.trainer.connectors.accelerator_connector import AcceleratorConnector, _LITERAL_WARN
 from pytorch_lightning.trainer.connectors.checkpoint_connector import CheckpointConnector
@@ -287,8 +284,8 @@ class NLPOptimizerLoop(OptimizerLoop):
             # NEURON: Copying loss to cpu as part of step_closure
             import torch_xla.core.xla_model as xm
             def _update_loss(trainer, loss):
-                trainer.fit_loop.epoch_loop.batch_loop._update_running_loss(loss.detach().cpu())
-            xm.add_step_closure(_update_loss, (self.trainer, result.loss, ))
+                trainer.fit_loop.epoch_loop.batch_loop._update_running_loss(loss.cpu())
+            xm.add_step_closure(_update_loss, (self.trainer, result.loss.detach(), ))
    
         # untoggle model params
         self._run_optimization_end(opt_idx)
@@ -352,230 +349,8 @@ class NLPFitLoop(FitLoop):
         self.trainer._call_strategy_hook("on_train_start")
 
 
-def _create_zero1_optimizer_states_directory(checkpoint_filepath: str, dp_rank: int):
-    dirname = os.path.dirname(checkpoint_filepath)
-    dirname = os.path.join(dirname, "optim")
-    if not os.path.exists(dirname):
-        xm.rendezvous("ensure all worker process enter this branch")
-        if dp_rank == 0:
-            os.makedirs(dirname)
-        xm.rendezvous("make directory for optimizer states")
-        dirname = os.path.join(dirname, "dp_rank_{:03d}".format(dp_rank))
-        os.makedirs(dirname)
-
-
-def _get_zero1_optimizer_states_filepath(checkpoint_filepath: str, dp_rank: int):
-    dirname = os.path.dirname(checkpoint_filepath)
-    basename = os.path.basename(checkpoint_filepath)
-    dirname = os.path.join(dirname, "optim")
-    dirname = os.path.join(dirname, "dp_rank_{:03d}".format(dp_rank))
-    return os.path.join(dirname, basename.replace("ckpt", "optimizer_states"))
-
-
-def _remove_checkpoint_impl(checkpoint_filepath):
-    dp_rank = parallel_state.get_data_parallel_rank()
-    if dp_rank == 0:
-        if os.path.exists(checkpoint_filepath):
-            try:
-                os.unlink(checkpoint_filepath)
-            except:
-                # swallow any exception
-                pass
-
-        if os.path.exists(f"{checkpoint_filepath}.tensors"):
-            try:
-                shutil.rmtree(f"{checkpoint_filepath}.tensors")
-            except:
-                # swallow any exception
-                pass
-
-    optimizer_states_filepath = _get_zero1_optimizer_states_filepath(checkpoint_filepath, dp_rank)
-    if os.path.exists(optimizer_states_filepath):
-        try:
-            os.unlink(optimizer_states_filepath)
-        except:
-            pass
-
-    if os.path.exists(optimizer_states_filepath + ".tensors"):
-        try:
-            shutil.rmtree(optimizer_states_filepath + ".tensors")
-        except:
-            pass
-
-
-def _bulk_save(items):
-    for tensor, path in items:
-        torch.save(tensor, path)
-
-class NLPCheckpointIOState:
-    '''
-    class to store state of checkpoint saving
-    '''
-
-    def __init__(self, async_save: bool):
-        '''
-        async_save : whether to use asynchronous checkpoint saving. Default no
-       '''
-        self._async_save = async_save
-        self._current_tag = None
-
-        if self._async_save:
-            self._executor = concurrent.futures.ProcessPoolExecutor(max_workers=1)
-            self._save_items : list[(torch.Tensor, src)] = list()
-            self._save_tasks : list[concurrent.future] = list()
-            self._remove_paths : list[str] = list()
-            self._remove_tasks : dict[str : concurrent.future] = dict()
-
-    def begin(self, tag: str):
-        '''
-            begin to save a checkpoint. All processes must call this function, even if the process
-            will not write data.
-        '''
-        if torch.distributed.get_rank() == 0:
-            method = "Asynchronous" if self._async_save else "Synchronous"
-            logging.info(f"{method} saving of checkpoint {tag} began")
-
-        if not self._async_save:
-            self._current_tag = tag
-            return
-
-        if self._current_tag is not None:
-            self.wait_save() # wait the previous round of save to finish.
-
-        self._current_tag = tag
-
-    def add_save_task(self, tensor, path: str):
-        if self._async_save:
-            self._save_items.append( (tensor, path) )
-        else:
-            torch.save(tensor, path)
-
-    def end(self):
-        if self._async_save:
-            if len(self._save_items) > 0:
-                self._save_tasks.append(self._executor.submit(_bulk_save, self._save_items))
-                if torch.distributed.get_rank() == 0:
-                    logging.info(f"Async saving of checkpoint {self._current_tag} requested")
-        else:
-            # this rendezous point ensures the entire checkpoint has been saved (not just the local portion).
-            # It prevents the pre-mature deletion of previous checkpoint because user will call add_remove_task()
-            # to delete previous checkpoint upon return of this function,
-            # Async saving does not need this rendezvous point, because when async saving is used,
-            # add_remove_task() does not remove file, it only put the file in a queue
-            xm.rendezvous("Synchronous saving of scheckpoint done")
-            logging.info(f"Synchronous saving of checkpoint {self._current_tag} completed")
-
-    def add_remove_task(self, filepath):
-        if self._async_save:
-            self._remove_paths.append(filepath)
-            logging.info(f"Previous checkpoint {os.path.basename(filepath)} will be removed after {self._current_tag} is fully saved")
-        else:
-            logging.info(f"Removing previous checkpoint {os.path.basename(filepath)}")
-            _remove_checkpoint_impl(filepath)
-            logging.info(f"Previous checkpoint {os.path.basename(filepath)} successfully removed")
-
-    def wait_save(self):
-        if len(self._save_tasks) > 0:
-            done, _ = concurrent.futures.wait(self._save_tasks)
-            for f in done:
-                if f.exception():
-                    raise f.exception()
-            self._save_tasks = []
-            self._save_items = []
-
-        # This rendezvous point ensures the entire checkpoint has been saved
-        # It prevent use from prematurely removing previous checkpoint.
-        xm.rendezvous(f"Async saving checkpoint done")
-        if torch.distributed.get_rank() == 0:
-            logging.info(f"Async saving of checkpoint {self._current_tag} completed")
-
-        if len(self._remove_paths) == 0:
-            logging.info(f"No previous checkpoints to remove.")
-        else:
-            # for each successful saved checkpoint, remove one previous checkpoint
-            path = self._remove_paths[0]
-            self._remove_tasks[path] = self._executor.submit(_remove_checkpoint_impl, path)
-            del self._remove_paths[0]
-            logging.info(f"Async removal of checkpoint {os.path.basename(path)} requested.")
-
-        finished = []
-        for path, task in self._remove_tasks.items():
-            if task.done():
-                logging.info(f"Async removal of checkpoint {os.path.basename(path)} completed.")
-                finished.append(path)
-
-        for path in finished:
-            del self._remove_tasks[path]
-
-    def wait_all(self):
-        logging.info("Finish the works for asynchronous checkpoint")
-        if not self._async_save:
-            return
-
-        self.wait_save()
-
-        for path in self._remove_paths:
-            self._remove_tasks[path] = self._executor.submit(_remove_checkpoint_impl, path)
-        self._remove_paths = []
-
-        for path, task in self._remove_tasks.items():
-            done, _ = concurrent.futures.wait([task])
-            assert len(done) == 1
-            done = list(done)[0]
-            if done.exception():
-                raise done.exception()
-            logging.info(f"Async removal of checkpoint {os.path.basename(path)} completed")
-
-
-
 class NLPCheckpointIO(XLACheckpointIO):
-    def __init__(self, async_save=False):
-         super().__init__()
-         self._iostate = NLPCheckpointIOState(async_save)
-
-    def load_checkpoint(self, checkpoint_path: _PATH, load_type_xser: bool) -> Dict[str, Any]:
-        """ PTL override to accomodate model parallel checkpoints """
-        checkpoint_path = inject_model_parallel_rank(checkpoint_path)
-        from .serialization import load
-
-        if load_type_xser:
-            loaded_checkpoint = load(checkpoint_path, parallel_state.get_data_parallel_rank(),
-                                     parallel_state.get_data_parallel_world_size(),
-                                     parallel_state.get_data_parallel_group())
-        else:
-            loaded_checkpoint = super().load_checkpoint(checkpoint_path)
-
-        if self._is_checkpoint_using_zero1_optimizer(loaded_checkpoint):
-            optimizer_states_filepath = _get_zero1_optimizer_states_filepath(checkpoint_path, parallel_state.get_data_parallel_rank())
-            if not os.path.exists(optimizer_states_filepath):
-                raise RuntimeError("When loading zero1 optimizer states, the file {optimizer_states_filepath} is missing")
-
-            if load_type_xser:
-                optimizer_states = load(optimizer_states_filepath)
-            else:
-                optimizer_states = torch.load(optimizer_states_filepath).to_xla_device()
-
-            self._add_optimizer_states_to_checkpoint(loaded_checkpoint, optimizer_states)
-
-        return loaded_checkpoint
-
-    def _exclude_callbacks_from_checkpoint(self, checkpoint: Dict[str, Any]):
-        return {k: v for k, v in checkpoint.items() if k != "callbacks"}
-
-    def _is_checkpoint_using_zero1_optimizer(self, checkpoint: Dict[str, Any]):
-        return checkpoint.get('hyper_parameters', {}).get('cfg', {}).get('wrap_with_zero', False)
-
-    def _add_optimizer_states_to_checkpoint(self, checkpoint: Dict[str, Any], optimizer_states: Dict[str, Any]):
-        checkpoint["optimizer_states"] = optimizer_states
-
-    def _remove_optimizer_states_from_checkpoint(self, checkpoint: Dict[str, Any]):
-        optimizer_states = checkpoint["optimizer_states"]
-        del checkpoint["optimizer_states"]
-        return optimizer_states
-
-    def save_checkpoint(
-        self, checkpoint: Dict[str, Any], filepath: _PATH, save_type_xser: bool, storage_options: Optional[Any] = None
-    ) -> None:
+    def save_checkpoint(self, checkpoint: Dict[str, Any], path, storage_options: Optional[Any] = None) -> None:
         """Save model/training states as a checkpoint file through state-dump and file-write.
    
         Args:
@@ -593,75 +368,18 @@ class NLPCheckpointIO(XLACheckpointIO):
                 f" is not supported for `{self.__class__.__name__}`. Please implement your custom `CheckpointIO`"
                 " to define how you'd like to use `storage_options`."
             )
-        app_state = AppState()
-        # PTL override to accomodate model parallel checkpoints
-        def ensure_directory_exists(filename):
-            """Build filename's path if it does not already exists."""
-            dirname = os.path.dirname(filename)
-            if not os.path.exists(dirname):
-                os.makedirs(dirname)
-
-        import torch_xla.utils.serialization as xser
-        import torch_xla.core.xla_model as xm
-        # PTL override to accomodate model parallel checkpoints
-        filepath = inject_model_parallel_rank(filepath)
+        fs = get_filesystem(path)
+        fs.makedirs(os.path.dirname(path), exist_ok=True)
         if RequirementCache("omegaconf"):
             # workaround for https://github.com/pytorch/xla/issues/2773
             from omegaconf import DictConfig, ListConfig, OmegaConf
-
+   
             checkpoint = apply_to_collection(checkpoint, (DictConfig, ListConfig), OmegaConf.to_container)
-        master_only = app_state.data_parallel_rank == 0
-        if master_only:
-            ensure_directory_exists(filepath)
-        try:
-            save_bf16 = self.lightning_module.cfg.save_bf16
-        except:
-            save_bf16 = False
-        from .serialization import save
-
-        self._iostate.begin(os.path.basename(filepath))
-        checkpoint = self._exclude_callbacks_from_checkpoint(checkpoint)
-        if self._is_checkpoint_using_zero1_optimizer(checkpoint):
-            # when zero1 optimizer is used. each worker process has unique optimizer state
-            # therefore need to be saved separately
-            optimizer_states = self._remove_optimizer_states_from_checkpoint(checkpoint)
-            _create_zero1_optimizer_states_directory(filepath, parallel_state.get_data_parallel_rank())
-            optimizer_states_filepath = _get_zero1_optimizer_states_filepath(filepath, parallel_state.get_data_parallel_rank())
-        else:
-            optimizer_states = None
-
-        if save_type_xser:
-            save(checkpoint, filepath, parallel_state.get_data_parallel_rank()==0,
-                 parallel_state.get_data_parallel_rank(), parallel_state.get_data_parallel_world_size(), self._iostate)
-            if optimizer_states:
-                save(optimizer_states, optimizer_states_filepath, True, 0, 1, self._iostate)
-        else:
-            for tp_rank in range(0, parallel_state.get_tensor_model_parallel_world_size()):
-                my_tp_rank = parallel_state.get_tensor_model_parallel_rank()
-                if save_bf16:
-                    checkpoint = cast_all(checkpoint, from_dtype=torch.float32, to_dtype=torch.bfloat16)
-                    if optimizer_states:
-                        optimizer_states = cast_all(optimizer_states, from_dtype=torch.float32, to_dtype=torch.bfloat16)
-
-                should_write_checkpoint = True if parallel_state.get_data_parallel_rank() == 0 and my_tp_rank == tp_rank else False
-
-                #Staggering save checkpoints
-                if should_write_checkpoint:
-                    cpu_data = xm._maybe_convert_to_cpu(checkpoint, convert=True)
-                    ensure_directory_exists(filepath)
-                    self._iostate.add_save_task(cpu_data, filepath)
-
-                if optimizer_states and my_tp_rank == tp_rank:
-                    optimizer_states_cpu_data = xm._maybe_convert_to_cpu(optimizer_states, convert=True)
-                    self._iostate.add_save_task(optimizer_states_cpu_data, optimizer_states_filepath)
-
-        self._iostate.end()
-
-    def remove_checkpoint(self, filepath: _PATH, save_type_xser: bool) -> None:
-        self._iostate.add_remove_task(filepath)
-
-    def teardown(self):
-        self._iostate.wait_all()
+        import torch_xla.core.xla_model as xm
+   
+        ### NEURON: master_only=True since different TP workers would save the checkpoint. Note: This needs to be
+        # rewritten inside Nemo
+        xm.save({k: v for k, v in checkpoint.items() if k != "callbacks"}, path, master_only=True)
 
 class NLPCheckpointConnector(CheckpointConnector):
     def restore_loops(self) -> None:
@@ -951,7 +669,6 @@ class NLPTrainer(Trainer):
         )
         self._logger_connector = LoggerConnector(self)
         self._callback_connector = CallbackConnector(self)
-        self._resume_from_checkpoint = resume_from_checkpoint
         self._checkpoint_connector = NLPCheckpointConnector(self, resume_from_checkpoint)
         self._signal_connector = SignalConnector(self)
         self.tuner = Tuner(self)
@@ -1058,16 +775,17 @@ class NLPTrainer(Trainer):
 
     def _restore_modules_and_callbacks(self, checkpoint_path: Optional[_PATH] = None) -> None:
         import torch_xla.core.xla_model as xm
-        self._checkpoint_connector.resume_start(checkpoint_path)
-        self._checkpoint_connector._restore_quantization_callbacks()
-        self._checkpoint_connector.restore_model()
-        self._checkpoint_connector.restore_datamodule()
-        if self.state.fn == TrainerFn.FITTING:
-            # restore callback states
-            self._checkpoint_connector.restore_callbacks()
-
-    def is_resuming_from_checkpoint(self):
-        return self._resume_from_checkpoint is not None
+        for i in range(0, parallel_state.get_data_parallel_world_size()):
+            if parallel_state.get_data_parallel_rank() == i:
+                # restore modules after setup
+                self._checkpoint_connector.resume_start(checkpoint_path)
+                self._checkpoint_connector._restore_quantization_callbacks()
+                self._checkpoint_connector.restore_model()
+                self._checkpoint_connector.restore_datamodule()
+                if self.state.fn == TrainerFn.FITTING:
+                    # restore callback states
+                    self._checkpoint_connector.restore_callbacks()
+            xm.rendezvous(f'load-chkpt-phase-{i}')
 
     def reset_train_dataloader(self, model: Optional["pl.LightningModule"] = None) -> None:
         """Resets the train dataloader and initialises required variables (number of batches, when to validate,
@@ -1238,7 +956,7 @@ class NLPDDPStrategy(TPUSpawnStrategy):
         else:
             import torch_xla.core.xla_model as xm
             global_rank = xm.get_ordinal()
-        if (torch.__version__.startswith('2.0')):
+        if (os.environ.get("PJRT_DEVICE", None) == "NEURON"):
             import torch_xla.experimental.pjrt_backend
             dist.init_process_group('xla', init_method="pjrt://", rank=global_rank)
         else:
@@ -1343,12 +1061,6 @@ class NLPDDPStrategy(TPUSpawnStrategy):
             save_mode = False
         return save_mode
 
-    def save_checkpoint(
-        self, checkpoint: Dict[str, Any], filepath: _PATH, storage_options: Optional[Any] = None
-    ) -> None:
-        xm.mark_step()
-        self.checkpoint_io.save_checkpoint(checkpoint, filepath, self.is_save_type_xser())
-
     def is_load_type_xser(self):
         try:
             load_xser_mode = self.lightning_module.cfg.load_xser
@@ -1356,8 +1068,48 @@ class NLPDDPStrategy(TPUSpawnStrategy):
             load_xser_mode = False
         return load_xser_mode
 
-    def load_checkpoint(self, checkpoint_path: _PATH) -> Dict[str, Any]:
-        return self.checkpoint_io.load_checkpoint(checkpoint_path, self.is_load_type_xser())
+    def save_checkpoint(
+        self, checkpoint: Dict[str, Any], filepath: _PATH, storage_options: Optional[Any] = None
+    ) -> None:
+        app_state = AppState()
+        # PTL override to accomodate model parallel checkpoints
+        def ensure_directory_exists(filename):
+            """Build filename's path if it does not already exists."""
+            dirname = os.path.dirname(filename)
+            if not os.path.exists(dirname):
+                os.makedirs(dirname)
+
+        import torch_xla.utils.serialization as xser
+        import torch_xla.core.xla_model as xm
+        # PTL override to accomodate model parallel checkpoints
+        filepath = inject_model_parallel_rank(filepath)
+        if RequirementCache("omegaconf"):
+            # workaround for https://github.com/pytorch/xla/issues/2773
+            from omegaconf import DictConfig, ListConfig, OmegaConf
+
+            checkpoint = apply_to_collection(checkpoint, (DictConfig, ListConfig), OmegaConf.to_container)
+        master_only = app_state.data_parallel_rank == 0
+        if master_only:
+            ensure_directory_exists(filepath)
+        try:
+            save_bf16 = self.lightning_module.cfg.save_bf16
+        except:
+            save_bf16 = False
+        if self.is_save_type_xser():
+            xser.save({k: v for k, v in checkpoint.items() if k != "callbacks"}, filepath, (not master_only), global_master=True)
+        else:
+            for tp_rank in range(0, parallel_state.get_tensor_model_parallel_world_size()):
+                my_tp_rank = parallel_state.get_tensor_model_parallel_rank()
+                if save_bf16:
+                    checkpoint = cast_all(checkpoint, from_dtype=torch.float32, to_dtype=torch.bfloat16)
+                should_write_data = True if parallel_state.get_data_parallel_rank() == 0 and my_tp_rank == tp_rank else False
+
+                #Staggering save checkpoints
+                if should_write_data:
+                    cpu_data = xm._maybe_convert_to_cpu({k: v for k, v in checkpoint.items() if k != "callbacks"}, convert=True)
+                    ensure_directory_exists(filepath)
+                    torch.save(cpu_data, filepath)
+                xm.rendezvous(f'chktp-save-{tp_rank}')
 
     def load_model_state_dict(self, checkpoint: Mapping[str, Any]) -> None:
         # Release strict state dict matching when using Megatron AMP-O2 to skip matching
@@ -1379,49 +1131,57 @@ class NLPDDPStrategy(TPUSpawnStrategy):
                     new_state_dict[new_key] = checkpoint['state_dict'][key]
                 checkpoint['state_dict'] = new_state_dict
 
-        load_result = self.lightning_module.load_state_dict(checkpoint["state_dict"], strict=False)
+        self.lightning_module.load_state_dict(checkpoint["state_dict"])
 
-        # Print out the unexpected keys
-        if load_result.unexpected_keys:
-            logging.warning(f"Warning: Unexpected keys in state dictionary: {', '.join(load_result.unexpected_keys)}")
+    def load_checkpoint(self, checkpoint_path: _PATH) -> Dict[str, Any]:
+        """ PTL override to accomodate model parallel checkpoints """
+        # TODO: move to CheckpointIO
+        torch.cuda.empty_cache()
+        checkpoint_path = inject_model_parallel_rank(checkpoint_path)
+        import torch_xla.utils.serialization as xser
+        import torch_xla.core.xla_model as xm
+       
+        def device_load_xser(path):
+            ref_data = torch.load(path)
 
-        # Filter out 'inv_freq' from the missing keys - as it is created from scratch
-        real_missing_keys = [
-            k for k in load_result.missing_keys if not any(
-                key_pattern in k for key_pattern in self._key_patterns_to_be_ignored()
-            )
-        ]
+            def convert_fn(tensors):
+                rewritten_tensors = []
+                for t in tensors:
+                    rewritten_tensors.append(
+                    torch.load(os.path.join(path + '.tensors', 'tensor_{}.pt'.format(t.tid)))
+                    .to(device=xm.xla_device()))
+                return rewritten_tensors
 
-        # Print out the real missing keys and throw an exception if there are any
-        if real_missing_keys:
-            logging.error(f"Error: Missing keys when loading state dictionary: {', '.join(real_missing_keys)}")
-            raise RuntimeError(f"Missing keys when loading state dictionary: {', '.join(real_missing_keys)}")
+            def select_fn(v):
+                return type(v) == xser.TensorReference
 
-    def _key_patterns_to_be_ignored(self):
-        """
-        This function gives child of NLPDDPStrategy to extend list 
-        of key patterns to be ignored from missing keys
-        """
-        return ['.rotary_emb.inv_freq']
-    
+            return xm.ToXlaTensorArena(convert_fn, select_fn).transform(ref_data)
+
+        if self.is_load_type_xser():
+            loaded_checkpoint = device_load_xser(checkpoint_path)
+        else:
+            loaded_checkpoint = self.checkpoint_io.load_checkpoint(checkpoint_path)
+
+        return loaded_checkpoint
+
     def remove_checkpoint(self, filepath: _PATH) -> None:
         app_state = AppState()
         # PTL override to accomodate model parallel checkpoints
         filepath = inject_model_parallel_rank(filepath)
-        if not self.restore_path or filepath != inject_model_parallel_rank(self.restore_path):
-            self.checkpoint_io.remove_checkpoint(filepath, self.is_save_type_xser())
+        if self.is_global_zero or app_state.data_parallel_rank == 0:
+            if not self.restore_path or filepath != inject_model_parallel_rank(self.restore_path):
+                logging.info(f'Removing checkpoint: {filepath}')
+                try:
+                    self.checkpoint_io.remove_checkpoint(filepath)
+                except:
+                    pass  # Swallow any exceptions
+                if self.is_save_type_xser():
+                    if os.path.exists(f"{filepath}.tensors"):
+                        try:
+                            shutil.rmtree(f"{filepath}.tensors")
+                        except:
+                            pass  # Swallow any exceptions
 
-    @property
-    def is_distributed(self) -> bool:
-        # HOST_WORLD_SIZE is not set outside the xmp.spawn process
-        # HOST_WORLD_SIZE only exists in XRT, not PJRT
-        import torch_xla.core.xla_env_vars as xenv
-
-        if torch.__version__.startswith('2'):
-            return self.world_size != 1
-        
-        return (xenv.HOST_WORLD_SIZE in os.environ) and self.world_size != 1
-    
     @property
     def distributed_sampler_kwargs(self):
         app_state = AppState()
@@ -1476,13 +1236,8 @@ class NLPDDPStrategy(TPUSpawnStrategy):
 
         import torch_xla.core.xla_model as xm
         xm.mark_step()
-        torch.distributed.all_reduce(output, op=torch.distributed.ReduceOp.SUM, group=parallel_state.get_tensor_model_parallel_group())
-        xm.mark_step()
-        torch.distributed.all_reduce(output, op=torch.distributed.ReduceOp.SUM, group=parallel_state.get_pipeline_model_parallel_group())
-        xm.mark_step()
-        torch.distributed.all_reduce(output, op=torch.distributed.ReduceOp.SUM, group=parallel_state.get_data_parallel_group())
-        xm.mark_step()
 
+        torch.distributed.all_reduce(output, op=torch.distributed.ReduceOp.SUM)
         if isinstance(reduce_op, str) and reduce_op.lower() in ("avg", "mean"):
             output = output / self.world_size
 
@@ -1631,18 +1386,14 @@ class NLPSaveRestoreConnector(SaveRestoreConnector):
         loaded_params = super().load_config_and_state_dict(
             calling_cls, restore_path, override_config_path, map_location, strict, return_config, trainer,
         )
-        if not isinstance(loaded_params, tuple) or return_config is True:
+        if not isinstance(loaded_params, tuple):
             return loaded_params
         conf, instance, state_dict = loaded_params
-        if (
-            self.peft_model_nemo_path is None and self.peft_model_ckpt_dir is None
-        ):  # we have this check only for training PEFT from scratch
-            peft_state_dict = instance.get_peft_state_dict()
-            state_dict.update(peft_state_dict)
         state_dict = self.modify_state_dict(conf, state_dict)
         super().load_instance_with_state_dict(instance, state_dict, strict)
         logging.info(f'Model {instance.__class__.__name__} was successfully restored from {restore_path}.')
         return instance
+
 
 class PipelineMixedPrecisionPlugin(NativeMixedPrecisionPlugin):
     """ Overrides PTL autocasting to not wrap training/val/test_step.

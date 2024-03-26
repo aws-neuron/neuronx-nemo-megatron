@@ -72,12 +72,7 @@ def get_checkpoints_for_pp(pp: int, path_to_checkpoints: str, PP: int=1, TP: int
     template = join(path_to_checkpoints, pp_str, '*.ckpt')
 
     tp_paths = sorted(glob(template))
-    if is_xser:
-        import nemo.collections.nlp.parts.serialization as nser
-        load_fn = lambda path: nser.load(path, cpu_only=True)
-    else:
-        load_fn = torch.load
-    return {i: load_fn(p)['state_dict'] for i, p in enumerate(tp_paths)}
+    return {i: xser.load(p)['state_dict'] if is_xser else torch.load(p)['state_dict'] for i, p in enumerate(tp_paths)}
 
 
 def get_checkpoints_for_tp(tp: int, path_to_checkpoints: str, is_xser: bool=False):
@@ -88,12 +83,7 @@ def get_checkpoints_for_tp(tp: int, path_to_checkpoints: str, is_xser: bool=Fals
     template = join(path_to_checkpoints, f'tp_rank_{tp_str}_pp_rank_*', '*.ckpt')
 
     pp_paths = sorted(glob(template))
-    if is_xser:
-        import nemo.collections.nlp.parts.serialization as nser
-        load_fn = lambda path: nser.load(path, cpu_only=True)
-    else:
-        load_fn = torch.load
-    return {i: load_fn(p)['state_dict'] for i, p in enumerate(pp_paths)}
+    return {i: xser.load(p)['state_dict'] if is_xser else torch.load(p)['state_dict'] for i, p in enumerate(pp_paths)}
 
 def _get_nemo_key(k, nemo_key = 'model.language_model.'):
     if "final_layernorm" in k:
@@ -215,8 +205,8 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--is_xser",
-        action="store_true",
-        help="Enable serialized loading",
+        default=False,
+        type=bool
     )
     args = parser.parse_args()
     convert_checkpoint(args.config_file, args.path_to_checkpoints, args.output_path, args.checkpoint_version, args.is_xser)

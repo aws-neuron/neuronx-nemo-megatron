@@ -14,6 +14,10 @@ wget -qO - https://apt.repos.neuron.amazonaws.com/GPG-PUB-KEY-AMAZON-AWS-NEURON.
 # Update OS packages and install OS headers
 sudo apt-get update -y && sudo apt-get install -y linux-headers-$(uname -r)
 
+# Install Neuron OS packages and dependencies
+sudo apt-get install -y aws-neuronx-dkms aws-neuronx-tools \
+	    aws-neuronx-collectives=2.* aws-neuronx-runtime-lib=2.*
+
 TOKEN=`curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600"` && INSTANCE_ID=$(curl -H "X-aws-ec2-metadata-token: $TOKEN" -s  http://169.254.169.254/latest/meta-data/instance-id)
 echo "instance_id:$INSTANCE_ID hostname:$(hostname)"
 echo "runtime versions"

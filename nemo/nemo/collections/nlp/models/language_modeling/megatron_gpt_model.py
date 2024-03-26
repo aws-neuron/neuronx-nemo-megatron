@@ -207,7 +207,6 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
             init_method_std=self.cfg.get('init_method_std', 0.02),
             use_scaled_init_method=self.cfg.get('use_scaled_init_method', True),
             fp16_lm_cross_entropy=self.cfg.get('fp16_lm_cross_entropy', False),
-            resume_from_checkpoint=self.trainer.is_resuming_from_checkpoint(),
             use_cpu_initialization=self.cfg.get('use_cpu_initialization', False),
             hidden_dropout=self.cfg.get('hidden_dropout', 0.1),
             attention_dropout=self.cfg.get('attention_dropout', 0.0),
@@ -220,7 +219,6 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
             activations_checkpoint_layers_per_pipeline=self.cfg.get(
                 'activations_checkpoint_layers_per_pipeline', None
             ),
-            disable_layer_norm_checkpointing=self.cfg.get('disable_layer_norm_checkpointing', False),
             normalization=self.cfg.get('normalization', 'layernorm'),
             layernorm_epsilon=self.cfg.get('layernorm_epsilon', 1e-5),
             onnx_safe=self.cfg.get('onnx_safe', False),
@@ -247,10 +245,6 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
             use_emha=self.cfg.get('use_emha', False),
             save_logits=self.cfg.get('save_logits', False),
             position_interpolation_factor=self.cfg.get('positition_interpolation_factor', 1.0),
-            position_freq_base=self.cfg.get('position_freq_base', 10000),
-            position_abf_factor=self.cfg.get('position_abf_factor', 1),
-            num_kv_heads=self.cfg.get('num_kv_heads', None),
-            sliding_window=self.cfg.get('sliding_window_size', None)
         )
         logging.trace(f"In gpt_model._build_model, leave GPTModel()", trace_type="recovery_time")
         return model
@@ -327,7 +321,6 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
         """
         # Log start time of the training loop 
         start_time = time.time()
-        full_log = (0 == self.global_step%self.trainer.log_every_n_steps) #always dump at least a partial log
 
         # we zero grads here because we also call backward in the apex fwd/bwd functions
         self._optimizer.zero_grad()
@@ -370,92 +363,91 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
                 'num_micro_batches_with_partial_activation_checkpoints', None
             ),
         )
+
+        xm.mark_step()
+        # only the last stages of the pipeline return losses
+        if losses_per_micro_batch:
+            # average loss across micro batches
+            loss_tensors_list = [average_losses_across_data_parallel_group([loss['mb_loss']]) for loss in losses_per_micro_batch]
+            loss_tensor = torch.concat(loss_tensors_list)
+            loss_mean = loss_tensor.mean()
+        else:
+            # loss_mean = torch.tensor(0.0).cuda()
+            # NEURON
+            loss_mean = torch.tensor(0.0, device=xm.xla_device())
+
         xm.mark_step()
 
-        with torch.no_grad():
-            # when using sequence parallelism, the sequence parallel layernorm grads must be all-reduced
-            if self.cfg.get('tensor_model_parallel_size', 1) > 1 and self.cfg.get('sequence_parallel', False):
-                self.allreduce_sequence_parallel_gradients()
+        # when using sequence parallelism, the sequence parallel layernorm grads must be all-reduced
+        if self.cfg.get('tensor_model_parallel_size', 1) > 1 and self.cfg.get('sequence_parallel', False):
+            self.allreduce_sequence_parallel_gradients()
 
-            if self.with_distributed_adam or self.wrap_with_zero:
-                # gradients are reduced internally in distributed optimizer
-                pass
-            elif self.megatron_amp_o2:
-                # when using pipeline parallelism grads must be all-reduced after the pipeline (not asynchronously)
-                self.allreduce_gradients()
-            else:
-                # async grad allreduce is not currently implemented for O1/autocasting mixed precision training
-                # so we all-reduce gradients after the pipeline
-                self.allreduce_gradients()  # @sangkug we think this is causing memory to blow up (hurts perf)
-
-            if self.cfg.get('pipeline_model_parallel_size', 1) > 1 and self.cfg.get('share_embeddings_and_output_weights', True):
-                # when using pipeline parallelism the first and last stage must keep embeddings in sync
-                self.allreduce_first_last_embeddings()
         xm.mark_step()
 
-        with torch.no_grad() : 
-            full_log = (0 == self.global_step%self.trainer.log_every_n_steps) #dump at least a partial log
-            lr = self._optimizer.param_groups[0]['lr']
-            # TODO: make sure compute_consumed_samples works for pipeline parallelism
-            # at this point the samples for this step has been consumed, but global_step has not been increased, therefore
-            # we need to +1 to step to get correct number of consumed samples.
-            consumed_samples = self.compute_consumed_samples(self.trainer.global_step + 1 - self.init_global_step)
-            
-            elapsed_time = time.time() - start_time
-            if self.throughput.seqs_per_iteration is None:          
-                self.throughput.set_seqs_per_iteration(self.cfg.get('micro_batch_size'), parallel_state.get_data_parallel_world_size(), get_num_microbatches())
-            throughput = self.throughput.get_throughput()   
-            throughput_peak = self.throughput.throughput_peak
-            if throughput > throughput_peak:
-                self.throughput.throughput_peak = throughput
-            self.throughput.throughput_sum += throughput
-    
-            loss_mean = None
-            param_norm = None
-            grad_norm = None
-            if full_log:
-                # only the last stages of the pipeline return losses
-                if losses_per_micro_batch:
-                    # average loss across micro batches
-                    loss_tensors_list = [average_losses_across_data_parallel_group([loss['mb_loss']]) for loss in losses_per_micro_batch]
-                    loss_tensor = torch.concat(loss_tensors_list)
-                    loss_mean = loss_tensor.mean()
-                else:
-                    # loss_mean = torch.tensor(0.0).cuda()
-                    # NEURON
-                    loss_mean = torch.tensor(0.0, device=xm.xla_device())
-                if self.log_parameter_norm:
-                    param_norm = self.calculate_parameter_norm(self.parameters())
-                if self.log_gradient_norm:
-                    if self.wrap_with_zero:
-                        grad_norm = self._optimizer.grad_norm
-                    else:
-                        grad_norm = self.calculate_gradient_norm(self.parameters())
+        if self.with_distributed_adam or self.wrap_with_zero:
+            # gradients are reduced internally in distributed optimizer
+            pass
+        elif self.megatron_amp_o2:
+            # when using pipeline parallelism grads must be all-reduced after the pipeline (not asynchronously)
+            self.allreduce_gradients()
+        else:
+            # async grad allreduce is not currently implemented for O1/autocasting mixed precision training
+            # so we all-reduce gradients after the pipeline
+            self.allreduce_gradients()  # @sangkug we think this is causing memory to blow up (hurts perf)
+
+        xm.mark_step()
+
+        if self.cfg.get('pipeline_model_parallel_size', 1) > 1 and self.cfg.get('share_embeddings_and_output_weights', True):
+            # when using pipeline parallelism the first and last stage must keep embeddings in sync
+            self.allreduce_first_last_embeddings()
+
+        xm.mark_step()
+        ## logging
+        # we can only log on one rank if it is rank zero so we broadcast from last rank
+        # we can avoid this broadcast by updating the PTL log function to accept specific ranks
+        torch.distributed.all_reduce(loss_mean, group=parallel_state.get_pipeline_model_parallel_group())
+
+        xm.mark_step()
+
+        if self.cfg.precision == 16:
+            loss_scale = self.trainer.precision_plugin.scaler._scale
+            if loss_scale is not None:
+                def log_loss_scale(loss_scale):
+                    self.log('loss_scale', loss_scale)
+                xm.add_step_closure(log_loss_scale, (loss_scale,))
+
+        lr = self._optimizer.param_groups[0]['lr']
+        # TODO: make sure compute_consumed_samples works for pipeline parallelism
+        consumed_samples = self.compute_consumed_samples(self.trainer.global_step - self.init_global_step)
         
-                ## logging
-                # we can only log on one rank if it is rank zero so we broadcast from last rank
-                # we can avoid this broadcast by updating the PTL log function to accept specific ranks
-                torch.distributed.all_reduce(loss_mean, group=parallel_state.get_pipeline_model_parallel_group())
-
-        #TDOD : Consider using run_async = True on step closure. Avoiding that not to minimize functional risk
-        def _log_metrics(log_fn, loss_mean, lr, global_step, consumed_samples, grad_norm, param_norm, throughput, throughput_peak, full_log):
-            if full_log :
-              log_fn('reduced_train_loss', loss_mean.detach().cpu(), prog_bar=True, rank_zero_only=True)
-              log_fn('lr', lr, rank_zero_only=True)
-              if grad_norm:
+        elapsed_time = time.time() - start_time
+        if self.throughput.seqs_per_iteration is None:          
+            self.throughput.set_seqs_per_iteration(self.cfg.get('micro_batch_size'), parallel_state.get_data_parallel_world_size(), get_num_microbatches())
+        throughput = self.throughput.get_throughput()   
+        throughput_peak = self.throughput.throughput_peak
+        if throughput > throughput_peak:
+            self.throughput.throughput_peak = throughput
+        self.throughput.throughput_sum += throughput
+        param_norm = None
+        grad_norm = None
+        if self.log_parameter_norm:
+            param_norm = self.calculate_parameter_norm(self.parameters())
+        if self.log_gradient_norm:
+            grad_norm = self.calculate_gradient_norm(self.parameters())
+        def _log_metrics(log_fn, loss_mean, lr, global_step, consumed_samples, grad_norm, param_norm, throughput, throughput_peak):
+            log_fn('reduced_train_loss', loss_mean.detach().cpu(), prog_bar=True, rank_zero_only=True)
+            log_fn('lr', lr, rank_zero_only=True)
+            if grad_norm:
                 log_fn('gradient_norm', grad_norm.detach().cpu(), prog_bar=True, rank_zero_only=True)
-              if param_norm:
+            if param_norm:
                 log_fn('parameter_norm', param_norm.detach().cpu(), prog_bar=True, rank_zero_only=True)
             log_fn('global_step', global_step, prog_bar=True, rank_zero_only=True)
             log_fn('consumed_samples', consumed_samples, prog_bar=True, rank_zero_only=True)
             log_fn('throughput', throughput, prog_bar=True, rank_zero_only=True)
             log_fn('throughput_peak', throughput_peak, prog_bar=True, rank_zero_only=True)
-        xm.add_step_closure(_log_metrics, 
-                            (self.log, loss_mean, lr, float(self.trainer.global_step), float(consumed_samples),
-                                       grad_norm, param_norm, float(throughput), float(throughput_peak), full_log))
+        xm.add_step_closure(_log_metrics, (self.log, loss_mean, lr, float(self.trainer.global_step), float(consumed_samples), grad_norm, param_norm, float(throughput), float(throughput_peak)))
 
-        xm.mark_step()
-        return None
+        return loss_mean
 
     def on_train_batch_end(self, *args, **kwargs):
         super().on_train_batch_end(*args, **kwargs)
@@ -1007,7 +999,7 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
         if stage == 'predict':
             return
         elif self.cfg.data.get("fine_tuning", False):
-            self.build_sft_datasets()
+            self.build_sft_dataets()
             self.setup_training_data(self.cfg.data)
             self.setup_validation_data(self.cfg.data)
             self.setup_test_data(self.cfg.data)
@@ -1033,7 +1025,7 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
 
         logging.trace(f"Leave MegatronGPTModel.setup()", trace_type="recovery_time")
 
-    def build_sft_datasets(self):
+    def build_sft_dataets(self):
         if self.trainer.limit_val_batches > 1.0 and isinstance(self.trainer.limit_val_batches, float):
             raise ValueError("limit_val_batches must be an integer or float less than or equal to 1.0.")
 

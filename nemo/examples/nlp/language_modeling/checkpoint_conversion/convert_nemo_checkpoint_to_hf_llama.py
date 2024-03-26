@@ -7,6 +7,7 @@ from glob import glob
 import re
 import numpy as np
 import torch
+import torch_xla.utils.serialization as xser
 
 def fix_query_key_value_ordering(param, checkpoint_version, num_splits, num_heads, hidden_size):
     # Permutes layout of param tensor to [num_splits * num_heads * hidden_size, :]
@@ -47,7 +48,7 @@ def get_tp_pp_degree(path_to_checkpoints):
             tp_search = re.search('mp_rank_[\d]*', folder)
             if tp_search:
                 TP = max(TP, 1+int(tp_search[0].split('mp_rank_')[1]))
-
+    
     return TP, PP
 
 def _get_tp_str(tp: int):
@@ -75,16 +76,12 @@ def get_checkpoints_for_pp(pp: int, path_to_checkpoints: str, PP: int=1, TP: int
 
     # take largest step saved model from the available checkpoints
     max_step_recorded=max(
-       [int(re.match(r".*megatron_llama--step=(\d+).*ckpt$", i).group(1))
-       for i in glob(template)])
+        [int(re.match(r".*megatron_llama--step=(\d+).*ckpt$", i).group(1)) 
+        for i in glob(template)])
     template = join(path_to_checkpoints, pp_str, f'*megatron_llama--step={max_step_recorded}*.ckpt')
+
     tp_paths = sorted(glob(template))
-    if is_xser:
-        import nemo.collections.nlp.parts.serialization as nser
-        load_fn = lambda path: nser.load(path, cpu_only=True)
-    else:
-        load_fn = torch.load
-    return {i: load_fn(p)['state_dict'] for i, p in enumerate(tp_paths)}
+    return {i: xser.load(p)['state_dict'] if is_xser else torch.load(p)['state_dict'] for i, p in enumerate(tp_paths)}
 
 
 def get_checkpoints_for_tp(tp: int, path_to_checkpoints: str, is_xser: bool=False):
@@ -95,12 +92,7 @@ def get_checkpoints_for_tp(tp: int, path_to_checkpoints: str, is_xser: bool=Fals
     template = join(path_to_checkpoints, f'tp_rank_{tp_str}_pp_rank_*', '*.ckpt')
 
     pp_paths = sorted(glob(template))
-    if is_xser:
-        import nemo.collections.nlp.parts.serialization as nser
-        load_fn = lambda path: nser.load(path, cpu_only=True)
-    else:
-        load_fn = torch.load
-    return {i: load_fn(p)['state_dict'] for i, p in enumerate(pp_paths)}
+    return {i: xser.load(p)['state_dict'] if is_xser else torch.load(p)['state_dict'] for i, p in enumerate(pp_paths)}
 
 def _get_nemo_key(k, nemo_key = 'model.language_model.'):
     if "final_layernorm" in k:
@@ -119,8 +111,6 @@ def convert_checkpoint(config_file,
     translation = {
         "embedding.word_embeddings.weight": (1, "model.embed_tokens.weight", 0, 0), # a['model']['language_model']['word_embeddings']['weight']
         "input_layernorm.weight": (0, "input_layernorm.weight", None, 0),
-        "self_attention.query.weight": (1, "self_attn.query.weight", 0, 0),
-        "self_attention.key_value.weight": (1, "self_attn.key_value.weight", 0, 0),
         "self_attention.query_key_value.weight": (1, "self_attn.query_key_value.weight", 0, 0),
         "self_attention.dense.weight": (1, "self_attn.o_proj.weight", 1, 0),
         "post_attention_layernorm.weight": (0, "post_attention_layernorm.weight", None, 0),
@@ -156,25 +146,25 @@ def convert_checkpoint(config_file,
                 _, key, _, _ = translation[nemo_key]
                 hf_model[key] = tp_models[0][k]
                 continue
-
+            
             if "word_embeddings" in k:
                 nemo_key = _get_nemo_key(k)
                 split, key, dim, transpose = translation[nemo_key]
                 hf_model[key] = torch.concat([tp_models[i][k] for i in range(len(tp_models))], dim=0)
                 continue
-
+            
             if "output_layer" in k:
                 nemo_key = _get_nemo_key(k)
                 split, key, dim, transpose = translation[nemo_key]
                 hf_model[key] = torch.concat([tp_models[i][k] for i in range(len(tp_models))], dim=dim)
                 continue
-
+            
             if "final_layernorm" in k:
                 nemo_key = _get_nemo_key(k)
                 split, key, dim, transpose = translation[nemo_key]
                 hf_model[key] = tp_models[0][k]
                 continue
-
+            
             m = layer_re.match(k)
             layer_idx = m.group(1)
             op_name = m.group(2)
@@ -189,22 +179,6 @@ def convert_checkpoint(config_file,
                 hf_model[hf_key] = tp_models[0][k]
             if "query_key" in k:
                 hf_model[hf_key] = fix_query_key_value_ordering(hf_model[hf_key], checkpoint_version, 3, heads, hidden_size_per_head)
-
-            if 'self_attention.query.weight' in k:
-                hf_model[f"{br_key}{ln_idx}.self_attn.q_proj.weight"] = fix_query_key_value_ordering(hf_model[hf_key], checkpoint_version, 1, heads, hidden_size_per_head)
-                hf_model.pop(hf_key)
-
-            if 'self_attention.key_value.weight' in k:
-                kv_heads = config['num_key_value_heads']
-                hf_model[hf_key] = fix_query_key_value_ordering(
-                    hf_model[hf_key], checkpoint_version, 2, kv_heads, hidden_size_per_head
-                )
-                hf_key_k = f"{br_key}{ln_idx}.self_attn.k_proj.weight"
-                hf_key_v = f"{br_key}{ln_idx}.self_attn.v_proj.weight"
-                size_per_seg = hf_model[hf_key].shape[0] // 2
-                hf_model[hf_key_k], hf_model[hf_key_v] = torch.split(hf_model[hf_key], size_per_seg, dim=0)
-                hf_model.pop(hf_key)
-
             if transpose:
                 hf_model[hf_key] = torch.transpose(hf_model[hf_key], 0, 1)
 
@@ -216,7 +190,7 @@ def convert_checkpoint(config_file,
                 size_per_seg = hf_model[hf_key].shape[0] // 3
                 hf_model[hf_key_q], hf_model[hf_key_k], hf_model[hf_key_v] = torch.split(hf_model[hf_key], size_per_seg, dim=0)
                 hf_model.pop(hf_key)
-
+    
     path = Path(output_path)
     path.mkdir(parents=True, exist_ok=True)
     torch.save(hf_model, str(path)+"/pytorch_model.bin")
@@ -227,7 +201,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--path_to_checkpoints",
         type=str,
-        help="Path to the checkpoints from Nemo. Directory is parent directory of model parallel folders.",
+        help="Path to the checkpoints from creating NeMo checkpoint files using `convert_hf_checkpoint_to_nemo.py`",
         required=True
     )
     parser.add_argument(
@@ -244,8 +218,8 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--is_xser",
-        action="store_true",
-        help="Enable serialized loading",
+        default=False,
+        type=bool
     )
     args = parser.parse_args()
     convert_checkpoint(args.config_file, args.path_to_checkpoints, args.output_path, args.checkpoint_version, args.is_xser)

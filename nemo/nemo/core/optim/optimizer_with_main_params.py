@@ -688,14 +688,6 @@ class MainParamsOptimizerWrapperXLA(torch.optim.Optimizer):
             for param in param_group:
                 params.append(param)
         return params
-    
-    def get_parameters_with_grad(self):
-        params = []
-        for param_group in self.optimizer.param_groups:
-            for param in param_group['params']:
-                if param.grad is not None:  # Added to enable pp>1 training for adapters
-                    params.append(param)
-        return params
 
     # Promote state so it can be retrieved or set via
     # "optimizer_instance.state"

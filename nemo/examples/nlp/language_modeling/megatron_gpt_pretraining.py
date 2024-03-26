@@ -50,7 +50,7 @@ def main(cfg) -> None:
     with_distributed_adam = cfg.model.optim.get('name') == 'distributed_fused_adam'
     plugins = []
     
-    nlp_xla_checkpoint_io = NLPCheckpointIO(cfg.get("async_checkpointing", False))
+    nlp_xla_checkpoint_io = NLPCheckpointIO()
     cluster_environment = None
     if os.environ.get("TORCHELASTIC_RUN_ID") is not None:
         cluster_environment=TorchElasticEnvironment()
@@ -102,7 +102,7 @@ def main(cfg) -> None:
     model = MegatronGPTModel(cfg.model, trainer)
     trainer.fit(model)
     # Convert checkpoint to HuggingFace
-    if cfg.model.get('convert_to_hf', False) and cfg.exp_manager.create_checkpoint_callback:
+    if cfg.model.convert_to_hf and cfg.exp_manager.create_checkpoint_callback:
         import torch_xla.core.xla_model as xm
         if xm.get_ordinal() == 0:
             if cfg.name == "megatron_llama":

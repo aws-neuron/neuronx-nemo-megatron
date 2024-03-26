@@ -221,11 +221,7 @@ def convert_checkpoint(p, args):
             output_folder = output_folder + f"_pp_rank_{p:03d}"
         if not os.path.exists(output_folder):
             os.makedirs(output_folder)
-        if args.is_xser:
-            from nemo.collections.nlp.parts.serialization import save
-            save(out_model, f"{output_folder}/model_optim_rng.ckpt")
-        else:
-            torch.save(out_model, f"{output_folder}/model_optim_rng.ckpt") #, (not master_only), global_master=True) 
+        torch.save(out_model, f"{output_folder}/model_optim_rng.ckpt") #, (not master_only), global_master=True)        
         print("Done saving Megatron checkpoint")
 
 
@@ -287,11 +283,6 @@ if __name__ == "__main__":
         default=True,
         type=bool,
         help="To use bias in the model layers",
-    )
-    parser.add_argument(
-        "--is_xser",
-        action="store_true",
-        help="Enable serialized saving",
     )
     
     args = parser.parse_args()

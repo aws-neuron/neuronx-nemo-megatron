@@ -15,7 +15,6 @@
 import copy
 
 import torch
-from transformers import is_torch_tpu_available
 
 from nemo.collections.common.tokenizers.sentencepiece_tokenizer import SentencePieceTokenizer
 from nemo.collections.common.tokenizers.tokenizer_spec import TokenizerSpec
@@ -297,12 +296,9 @@ class GPTSFTChatDataset(GPTSFTDataset):
         else:
             max_length = min(self.max_seq_length, self._ceil_to_nearest(max_length, 8))
         assert max_length <= self.max_seq_length
-        if is_torch_tpu_available():
-            # we materialize attention mask on XLA device
-            attention_mask = torch.full((len(batch),), True)
-        else:
-            attention_mask = [self._create_attention_mask(max_length) for _ in batch]
-            attention_mask = torch.stack(attention_mask)
+
+        attention_mask = [self._create_attention_mask(max_length) for _ in batch]
+        attention_mask = torch.stack(attention_mask)
         position_ids = [list(range(max_length)) for _ in batch]
         position_ids = torch.LongTensor(position_ids)
         input_ids = torch.LongTensor(
