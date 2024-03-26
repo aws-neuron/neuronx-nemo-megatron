@@ -26,8 +26,7 @@ class RotaryEmbedding(torch.nn.Module):
         max_position_embeddings=4096, 
         base=10000, 
         device=None, 
-        position_interpolation_factor=1.0,
-        position_abf_factor=1,
+        position_interpolation_factor=1.0, 
         rotary_percentage=1.0,
         ):
         super().__init__()
@@ -36,7 +35,6 @@ class RotaryEmbedding(torch.nn.Module):
         else:
             rot_dim = dim
         pass_dim = dim - rot_dim
-        base = base * position_abf_factor
         inv_freq = 1.0 / (base ** (torch.arange(0, rot_dim, 2).float() / rot_dim))
         self.register_buffer("inv_freq", inv_freq)
         self.position_interpolation_factor = position_interpolation_factor
@@ -61,8 +59,8 @@ class RotaryEmbedding(torch.nn.Module):
 
     def forward(self, x, seq_len=None):
         return (
-                self.cos_cached[:seq_len, :, :, :].to(dtype=x.dtype),
-                self.sin_cached[:seq_len, :, :, :].to(dtype=x.dtype),
+            self.cos_cached[:seq_len, ...].to(dtype=x.dtype),
+            self.sin_cached[:seq_len, ...].to(dtype=x.dtype),
         )
 
 
@@ -74,8 +72,8 @@ def rotate_half(x):
 
 
 def apply_rotary_pos_emb(q, k, cos, sin, offset: int = 0):
-    cos = cos[offset: q.shape[0] + offset, :, :, :]
-    sin = sin[offset: q.shape[0] + offset, :, :, :]
+    cos = cos[offset: q.shape[0] + offset, ...]
+    sin = sin[offset: q.shape[0] + offset, ...]
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed

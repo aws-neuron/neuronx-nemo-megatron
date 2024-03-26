@@ -165,11 +165,11 @@ def convert_checkpoint(args):
             path = Path(path)
             path.mkdir(parents=True, exist_ok=True)
             print("saving nemo checkpoint")
-            if args.is_xser:
-                from nemo.collections.nlp.parts.serialization import save
-                save(checkpoint, str(path) + "/megatron_gpt.ckpt")
-            else:
-                torch.save(checkpoint, str(path) + "/megatron_gpt.ckpt")
+            torch.save(
+                checkpoint,
+                str(path)
+                + "/megatron_gpt.ckpt",
+            )
             print("Done saving nemo checkpoint")
 
 
@@ -211,11 +211,5 @@ if __name__ == "__main__":
         type=bool,
         help="Share embedding and output layer weights.",
     )
-    parser.add_argument(
-        "--is_xser",
-        action="store_true",
-        help="Enable serialized saving",
-    )
-
     args = parser.parse_args()
     convert_checkpoint(args)

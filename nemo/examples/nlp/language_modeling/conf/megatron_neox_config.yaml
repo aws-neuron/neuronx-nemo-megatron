@@ -34,7 +34,7 @@ exp_manager:
   create_checkpoint_callback: True
   checkpoint_callback_params:
     monitor: step
-    save_top_k: -1
+    save_top_k: 1
     mode: max
     save_last: True
     always_save_nemo: False # saves nemo file during validation, not implemented for model parallel
@@ -124,12 +124,12 @@ model:
   # These memory intensive activations are also less compute intensive which makes activation checkpointing more efficient for LLMs (20B+).
   # See Reducing Activation Recomputation in Large Transformer Models: https://arxiv.org/abs/2205.05198 for more details.
   # 'full' will checkpoint the entire transformer layer.
-  activations_checkpoint_granularity: null # 'selective' or 'full' 
-  activations_checkpoint_method: null # 'uniform', 'block'
+  activations_checkpoint_granularity: selective # 'selective' or 'full' 
+  activations_checkpoint_method: uniform # 'uniform', 'block'
   # 'uniform' divides the total number of transformer layers and checkpoints the input activation
   # of each chunk at the specified granularity. When used with 'selective', 'uniform' checkpoints all attention blocks in the model.
   # 'block' checkpoints the specified number of layers per pipeline stage at the specified granularity
-  activations_checkpoint_num_layers: null
+  activations_checkpoint_num_layers: 1
   # when using 'uniform' this creates groups of transformer layers to checkpoint. Usually set to 1. Increase to save more memory.
   # when using 'block' this this will checkpoint the first activations_checkpoint_num_layers per pipeline stage.
   num_micro_batches_with_partial_activation_checkpoints: null
@@ -150,13 +150,12 @@ model:
   ## Sequence Parallelism
   # Makes tensor parallelism more memory efficient for LLMs (20B+) by parallelizing layer norms and dropout sequentially
   # See Reducing Activation Recomputation in Large Transformer Models: https://arxiv.org/abs/2205.05198 for more details.
-  sequence_parallel: False
+  sequence_parallel: True
 
   ## Zero Redundancy Optimizer
   # Wraps your chosen optimizer with a Zero Redundancy Optimizer
   # Partitions optimizer states across ranks reducing memory consumption
   wrap_with_zero: False
-  zero_use_master_weight: False
 
   ## Transformer Engine
   transformer_engine: False
@@ -190,7 +189,7 @@ model:
     data_prefix: ???
     index_mapping_dir: null # path to save index mapping .npy files, by default will save in the same location as data_prefix
     data_impl: mmap
-    splits_string: 900,50,50
+    splits_string: 980,10,10
     seq_length: ${model.encoder_seq_length}
     skip_warmup: True
     num_workers: 2
@@ -326,4 +325,3 @@ model:
 
 
 enable_recovery_time_instrumentation: False # default to not printing the detailing timing for recovery
-async_checkpointing: False # default to not use async checkpointing

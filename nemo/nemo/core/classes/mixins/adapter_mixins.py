@@ -168,22 +168,6 @@ class AdapterModuleMixin(ABC):
         else:
             return []
 
-    def get_adapter_module(self, name: str):
-        """
-        Gets an adapter module by name if possible, otherwise returns None.
-
-        Args:
-            name: A str name (resolved or not) corresponding to an Adapter.
-
-        Returns:
-            An nn.Module if the name could be resolved and matched, otherwise None/
-        """
-        _, name = self.resolve_adapter_module_name_(name)
-
-        if hasattr(self, "adapter_layer"):
-            return self.adapter_layer[name] if name in self.adapter_layer else None
-        return None
-
     def get_from_adapter_layer(self, name: str):
         if hasattr(self, "adapter_layer"):
             return self.adapter_layer[name] if name in self.adapter_layer else None
@@ -250,9 +234,6 @@ class AdapterModuleMixin(ABC):
 
             cfg['enabled'] = adapter_enabled
             self.adapter_cfg[adapter_name] = cfg
-
-        if cfg.get('weight_tying', False) and hasattr(self, 'tie_weights'):
-            self.tie_weights(cfg)
 
     def is_adapter_available(self) -> bool:
         """

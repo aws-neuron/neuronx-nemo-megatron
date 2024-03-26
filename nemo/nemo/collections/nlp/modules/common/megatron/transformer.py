@@ -16,7 +16,7 @@
 """Transformer."""
 import math
 from contextlib import nullcontext
-from typing import Any, Callable, Optional, Tuple
+from typing import Any, Callable, Optional
 import datetime
 import torch
 import torch.nn.functional as F
@@ -27,11 +27,7 @@ from nemo.collections.nlp.modules.common.megatron.adapters.parallel_adapters imp
     InfusedAdapterConfig,
     MLPInfusedAdapterConfig,
     ParallelLinearAdapterConfig,
-    LoraKQVAdapterConfig,
-    LoraQAdapterConfig,
-    LoraKVAdapterConfig
 )
-
 from nemo.collections.nlp.modules.common.megatron.fused_bias_dropout_add import (
     bias_dropout_add,
     bias_dropout_add_fused_inference,
@@ -119,7 +115,6 @@ class ParallelMLP(MegatronModule, adapter_mixins.AdapterModuleMixin):
         output_layer_init_method,
         hidden_size,
         ffn_hidden_size,
-        resume_from_checkpoint=False,
         use_cpu_initialization=False,
         bias_activation_fusion=True,
         openai_gelu=False,
@@ -145,7 +140,6 @@ class ParallelMLP(MegatronModule, adapter_mixins.AdapterModuleMixin):
         self.activation = activation
         self.dropout = dropout
         self.set_accepted_adapter_types([MLPInfusedAdapterConfig._target_])
-        self.glu_activation_family = activation in ['geglu', 'reglu', 'swiglu']
 
         if activation not in ['gelu', 'geglu', 'reglu', 'swiglu']:
             raise ValueError(f"Activation {activation} not supported. Only gelu, geglu, reglu, swiglu are supported.")
@@ -154,14 +148,13 @@ class ParallelMLP(MegatronModule, adapter_mixins.AdapterModuleMixin):
             parallel_state.get_tensor_model_parallel_world_size() == 1 or sequence_parallel
         )
         t0 = datetime.datetime.now()
-        # Project to 4h or 2*(8/3) for glu_activation_family 
+        # Project to 4h.
         self.dense_h_to_4h = tensor_parallel.ColumnParallelLinear(
             hidden_size,
-            2*ffn_hidden_size if self.glu_activation_family else ffn_hidden_size,
+            ffn_hidden_size,  # NOTE: When using geglu, divide ffn dim by 2/3 to keep overall params the same.
             gather_output=False,
             init_method=init_method,
             skip_bias_add=True,
-            resume_from_checkpoint=resume_from_checkpoint,
             use_cpu_initialization=use_cpu_initialization,
             bias=bias,
             sequence_parallel_enabled=sequence_parallel,
@@ -172,6 +165,27 @@ class ParallelMLP(MegatronModule, adapter_mixins.AdapterModuleMixin):
         t1 = datetime.datetime.now()
         logging.trace(f"In ParallelMLP  create self.dense_h_to_4h. Begin: {t0} Elapsed: {(t1 - t0).total_seconds()} s.", trace_type="recovery_time")
 
+        if activation in ['geglu', 'reglu', 'swiglu']:
+            # Separate linear layer for *GLU activations.
+            # Source: https://github.com/huggingface/transformers/blob/bee361c6f1f7704f8c688895f2f86f6e5ff84727/src/transformers/models/t5/modeling_t5.py#L292
+            t0 = datetime.datetime.now()
+            self.dense_h_to_4h_2 = tensor_parallel.ColumnParallelLinear(
+                hidden_size,
+                ffn_hidden_size,  # NOTE: When using *glu, divide ffn dim by 2/3 to keep overall params the same.
+                gather_output=False,
+                init_method=init_method,
+                skip_bias_add=True,
+                use_cpu_initialization=use_cpu_initialization,
+                bias=bias,
+                sequence_parallel_enabled=sequence_parallel,
+                no_async_tensor_model_parallel_allreduce=no_async_tensor_model_parallel_allreduce,
+                gradient_accumulation_fusion=gradient_accumulation_fusion,
+                transfer_with_static_ring=transfer_with_static_ring,
+            )
+            t1 = datetime.datetime.now()
+            logging.trace(f"In ParallelMLP create self.dense_h_to_4h_2. Begin: {t0} Elapsed: {(t1 - t0).total_seconds()} s.", trace_type="recovery_time")
+
+        self.glu_activation_family = activation in ['geglu', 'reglu', 'swiglu']
         bias_activation_fusion_unavailable = activation in ['reglu', 'swiglu']
 
         if bias_activation_fusion_unavailable and bias_activation_fusion:
@@ -212,7 +226,6 @@ class ParallelMLP(MegatronModule, adapter_mixins.AdapterModuleMixin):
             input_is_parallel=True,
             init_method=output_layer_init_method,
             skip_bias_add=True,
-            resume_from_checkpoint=resume_from_checkpoint,
             use_cpu_initialization=use_cpu_initialization,
             bias=bias,
             sequence_parallel_enabled=sequence_parallel,
@@ -220,7 +233,7 @@ class ParallelMLP(MegatronModule, adapter_mixins.AdapterModuleMixin):
             transfer_with_static_ring=transfer_with_static_ring,
         )
         t1 = datetime.datetime.now()
-        logging.trace(f"In ParallelMLP create self.dense_4h_to_h with resume={resume_from_checkpoint} Begin: {t0} Elapsed: {(t1 - t0).total_seconds()} s.", trace_type="recovery_time")
+        logging.trace(f"In ParallelMLP create self.dense_4h_to_h. Begin: {t0} Elapsed: {(t1 - t0).total_seconds()} s.", trace_type="recovery_time")
 
         # Normformer normalization
         if transformer_block_type == 'normformer':
@@ -242,13 +255,11 @@ class ParallelMLP(MegatronModule, adapter_mixins.AdapterModuleMixin):
 
     def forward(self, hidden_states):
 
-        # [s, b, 4hp] or for glu_activation_family [s, b, 2*(8/3)hp]
+        # [s, b, 4hp]
         intermediate_parallel, bias_parallel = self.dense_h_to_4h(hidden_states)
 
         if self.glu_activation_family:
-            intermediate_parallel, intermediate_parallel_2 = torch.tensor_split(intermediate_parallel,2,dim=2)
-            if bias_parallel is not None : 
-                bias_parallel, bias_parallel_2 = torch.tensor_split(bias_parallel,2,dim=2)
+            intermediate_parallel_2, bias_parallel_2 = self.dense_h_to_4h_2(hidden_states)
 
         if self.bias_activation_fusion:
             if self.activation == 'gelu':
@@ -443,13 +454,8 @@ class CoreAttention(MegatronModule):
         multi_query_attention=False,
         position_embedding_type='learned_absolute',
         position_interpolation_factor=1.0,
-        position_freq_base=10000,
-        position_abf_factor=1,
         max_position_embeddings=4096,
         rotary_percentage=1.0,
-        rotary_layer=None,
-        num_kv_heads=None,
-        sliding_window=None
     ):
 
         super(CoreAttention, self).__init__()
@@ -458,14 +464,11 @@ class CoreAttention(MegatronModule):
         self.fp16 = precision == 16
         self.bf16 = precision == 'bf16'
         self.multi_query_attention = multi_query_attention
-        self.sliding_window = sliding_window
+
         self.apply_query_key_layer_scaling = apply_query_key_layer_scaling
         self.attention_softmax_in_fp32 = False
         if self.apply_query_key_layer_scaling:
             self.attention_softmax_in_fp32 = True
-        self.use_gqa = (num_kv_heads is not None) and (num_kv_heads != num_attention_heads)
-        if self.use_gqa:
-            self.num_query_head_per_kv_head = num_attention_heads // num_kv_heads
         self.layer_number = max(1, layer_number)
         self.attention_type = attention_type
         self.attn_mask_type = attn_mask_type
@@ -475,9 +478,6 @@ class CoreAttention(MegatronModule):
         self.normalize_attention_scores = normalize_attention_scores
         self.position_embedding_type = position_embedding_type
         self.position_interpolation_factor = position_interpolation_factor
-        self.position_freq_base = position_freq_base
-        self.position_abf_factor = position_abf_factor
-
         self.rotary_percentage=rotary_percentage
         if kv_channels is None:
             assert (
@@ -513,7 +513,10 @@ class CoreAttention(MegatronModule):
         )
 
         if self.position_embedding_type == 'rope':
-            self.rotary_emb = rotary_layer
+            self.rotary_emb = RotaryEmbedding(self.hidden_size_per_attention_head,
+                                              max_position_embeddings=max_position_embeddings,
+                                              position_interpolation_factor=self.position_interpolation_factor,
+                                              rotary_percentage=self.rotary_percentage)
 
         # Dropout. Note that for a single iteration, this layer will generate
         # different outputs on different number of parallel partitions but
@@ -539,33 +542,18 @@ class CoreAttention(MegatronModule):
 
         # [b, np, sq, sk]
         output_size = (query_layer.size(1), query_layer.size(2), query_layer.size(0), key_layer.size(0))
-        sq, b, np, hn = query_layer.shape
 
-        # Materialize attention mask right before use
-        if is_torch_tpu_available():
-            if self.sliding_window and self.sliding_window != sq:
-                def create_binary_sliding_window_attention_mask(seq_len, window_size):
-                    """
-                    Create a binary sliding window local attention mask.
-                    This mask is an OR of two offset triangular masks. True means DO NOT attend.
+        # TODO: figure out how to do this
+        # apply relative positional encoding (rotary embedding)
+        # if rotary_pos_emb is not None:
+            # q_pos_emb, k_pos_emb = rotary_pos_emb
 
-                    :param seq_len: Length of the sequence.
-                    :param window_size: Size of the sliding window.
-                    :return: A binary sliding window local attention mask tensor.
-                    """
-                    # Create two triangular masks
-                    mask1 = torch.tril(torch.ones(seq_len, seq_len, device='xla'), diagonal=-window_size)
-                    mask2 = torch.triu(torch.ones(seq_len, seq_len, device='xla'), diagonal=1)
-
-                    # Combine the masks using logical OR
-                    combined_mask = mask1.logical_or(mask2)
-                    return combined_mask.unsqueeze(0).unsqueeze(0)
-
-                attention_mask = create_binary_sliding_window_attention_mask(sq, self.sliding_window)
-            else:
-                attention_mask = torch.triu(torch.ones(
-                    (1, 1, sq, sq), device='xla'), diagonal=1).bool()
-
+            # query_layer = apply_rotary_pos_emb(query_layer, q_pos_emb)
+            # key_layer = apply_rotary_pos_emb(key_layer, k_pos_emb)
+            # TODO, can apply positional embedding to value_layer so it has
+            # absolute positional embedding.
+            # otherwise, only relative positional embedding takes effect
+            # value_layer = apply_rotary_pos_emb(value_layer, k_pos_emb)
 
         if self.position_embedding_type == 'rope':
             cos, sin = self.rotary_emb(value_layer, seq_len=query_layer.shape[0])
@@ -597,17 +585,6 @@ class CoreAttention(MegatronModule):
                 beta=0.0,
                 alpha=(1.0 / self.norm_factor),
             )
-        elif self.use_gqa:
-            query_layer = rearrange(
-                query_layer, 'sq b (nk q_head) hn -> b q_head nk sq hn', q_head=self.num_query_head_per_kv_head,
-            )
-            key_layer = rearrange(key_layer, 'sk b nk hn -> b 1 nk hn sk')
-            value_layer = rearrange(value_layer, 'sk b nk hn -> b 1 nk sk hn')
-
-            attention_scores = torch.matmul(query_layer, key_layer, )
-            if self.normalize_attention_scores:
-                attention_scores *= 1.0 / self.norm_factor
-            attention_scores = rearrange(attention_scores, 'b q_head nk sq sk -> b (q_head nk) sq sk')
         else:
             # [sq, b, np, hn] -> [sq, b * np, hn]
             query_layer = query_layer.view(output_size[2], output_size[0] * output_size[1], -1)
@@ -632,8 +609,8 @@ class CoreAttention(MegatronModule):
                 alpha=(1.0 / self.norm_factor) if self.normalize_attention_scores else 1.0,
             )
 
-            # change view to [b, np, sq, sk]
-            attention_scores = matmul_result.view(*output_size)
+        # change view to [b, np, sq, sk]
+        attention_scores = matmul_result.view(*output_size)
 
         if relative_position_bias is not None:
             attention_scores += relative_position_bias[
@@ -680,28 +657,20 @@ class CoreAttention(MegatronModule):
         # value_layer -> context layer.
         # [sk, b, np, hn] --> [b, np, sq, hn]
 
-        if self.use_gqa:
-            # GQA
-            attention_probs = rearrange(
-                attention_probs, 'b (q_head nk) sq sk -> b q_head nk sq sk', q_head=self.num_query_head_per_kv_head,
-            )
-            context_layer = torch.matmul(attention_probs, value_layer)
-            context_layer = rearrange(context_layer, 'b q_head nk sq hn -> b (nk q_head) sq hn')
-        else:
-            # context layer shape: [b, np, sq, hn]
-            output_size = (value_layer.size(1), value_layer.size(2), query_layer.size(0), value_layer.size(3))
+        # context layer shape: [b, np, sq, hn]
+        output_size = (value_layer.size(1), value_layer.size(2), query_layer.size(0), value_layer.size(3))
 
-            # change view [sk, b * np, hn]
-            value_layer = value_layer.view(value_layer.size(0), output_size[0] * output_size[1], -1)
+        # change view [sk, b * np, hn]
+        value_layer = value_layer.view(value_layer.size(0), output_size[0] * output_size[1], -1)
 
-            # change view [b * np, sq, sk]
-            attention_probs = attention_probs.view(output_size[0] * output_size[1], output_size[2], -1)
+        # change view [b * np, sq, sk]
+        attention_probs = attention_probs.view(output_size[0] * output_size[1], output_size[2], -1)
 
-            # matmul: [b * np, sq, hn]
-            context_layer = torch.bmm(attention_probs, value_layer.transpose(0, 1))
+        # matmul: [b * np, sq, hn]
+        context_layer = torch.bmm(attention_probs, value_layer.transpose(0, 1))
 
-            # change view [b, np, sq, hn]
-            context_layer = context_layer.view(*output_size)
+        # change view [b, np, sq, hn]
+        context_layer = context_layer.view(*output_size)
 
         if headscale_tensor is not None:
             context_layer = context_layer * headscale_tensor
@@ -735,7 +704,6 @@ class ParallelAttention(MegatronModule, adapter_mixins.AdapterModuleMixin):
         precision=16,
         apply_query_key_layer_scaling=True,
         kv_channels=None,
-        resume_from_checkpoint=False,
         use_cpu_initialization=False,
         masked_softmax_fusion=True,
         attention_dropout=0.1,
@@ -751,13 +719,8 @@ class ParallelAttention(MegatronModule, adapter_mixins.AdapterModuleMixin):
         normalize_attention_scores=True,
         transfer_with_static_ring=True,
         position_interpolation_factor=1.0,
-        position_freq_base=10000,
-        position_abf_factor=1,
         max_position_embeddings=4096,
         rotary_percentage=1.0,
-        rotary_layer=None,
-        num_kv_heads=None,
-        sliding_window=None
     ):
         super(ParallelAttention, self).__init__()
 
@@ -767,20 +730,12 @@ class ParallelAttention(MegatronModule, adapter_mixins.AdapterModuleMixin):
         self.normalize_attention_scores = normalize_attention_scores
         self.position_embedding_type = position_embedding_type
         self.position_interpolation_factor = position_interpolation_factor
-        self.position_freq_base = position_freq_base
-        self.position_abf_factor = position_abf_factor
-        self.rotary_percentage = rotary_percentage
+        self.rotary_percentage=rotary_percentage
         self.multi_query_attention = multi_query_attention
-        self.num_kv_heads = num_kv_heads
-        self.use_gqa = (num_kv_heads is not None) and (num_kv_heads != num_attention_heads)
+
         self.megatron_legacy = megatron_legacy
 
-        self.set_accepted_adapter_types([
-                InfusedAdapterConfig._target_,
-                LoraKQVAdapterConfig._target_,
-                LoraQAdapterConfig._target_,
-                LoraKVAdapterConfig._target_,
-            ])
+        self.set_accepted_adapter_types([InfusedAdapterConfig._target_])
 
         if kv_channels is None:
             assert (
@@ -800,57 +755,22 @@ class ParallelAttention(MegatronModule, adapter_mixins.AdapterModuleMixin):
         no_async_tensor_model_parallel_allreduce = (
             parallel_state.get_tensor_model_parallel_world_size() == 1 or sequence_parallel
         )
-        if self.use_gqa:
-            assert num_attention_heads % num_kv_heads == 0
-            self.num_query_head_per_kv_head = num_attention_heads // num_kv_heads
-            kv_projection_size = kv_channels * num_kv_heads
-            self.num_kv_attention_heads_per_partition = safe_divide(num_kv_heads, world_size)
-            self.num_kv_heads_per_partition = safe_divide(num_kv_heads, world_size)
-        else:
-            self.num_kv_attention_heads_per_partition = self.num_attention_heads_per_partition
-            kv_projection_size = projection_size
 
         # Strided linear layer.
         if attention_type == AttnType.self_attn:
             t0 = datetime.datetime.now()
-            if not self.use_gqa:
-                self.query_key_value = tensor_parallel.ColumnParallelLinear(
-                    hidden_size,
-                    3 * projection_size,
-                    gather_output=False,
-                    init_method=init_method,
-                    resume_from_checkpoint=resume_from_checkpoint,
-                    use_cpu_initialization=use_cpu_initialization,
-                    bias=bias,
-                    sequence_parallel_enabled=sequence_parallel,
-                    no_async_tensor_model_parallel_allreduce=no_async_tensor_model_parallel_allreduce,
-                    gradient_accumulation_fusion=gradient_accumulation_fusion,
-                    transfer_with_static_ring=transfer_with_static_ring,
-                )
-            else:
-                self.query = tensor_parallel.ColumnParallelLinear(
-                    hidden_size,
-                    projection_size,
-                    gather_output=False,
-                    init_method=init_method,
-                    bias=bias,
-                    sequence_parallel_enabled=sequence_parallel,
-                    no_async_tensor_model_parallel_allreduce=no_async_tensor_model_parallel_allreduce,
-                    gradient_accumulation_fusion=gradient_accumulation_fusion,
-                    transfer_with_static_ring=transfer_with_static_ring,
-                )
-
-                self.key_value = tensor_parallel.ColumnParallelLinear(
-                    hidden_size,
-                    2 * kv_projection_size,
-                    gather_output=False,
-                    init_method=init_method,
-                    bias=bias,
-                    sequence_parallel_enabled=sequence_parallel,
-                    no_async_tensor_model_parallel_allreduce=no_async_tensor_model_parallel_allreduce,
-                    gradient_accumulation_fusion=gradient_accumulation_fusion,
-                    transfer_with_static_ring=transfer_with_static_ring,
-                    )
+            self.query_key_value = tensor_parallel.ColumnParallelLinear(
+                hidden_size,
+                3 * projection_size,
+                gather_output=False,
+                init_method=init_method,
+                use_cpu_initialization=use_cpu_initialization,
+                bias=bias,
+                sequence_parallel_enabled=sequence_parallel,
+                no_async_tensor_model_parallel_allreduce=no_async_tensor_model_parallel_allreduce,
+                gradient_accumulation_fusion=gradient_accumulation_fusion,
+                transfer_with_static_ring=transfer_with_static_ring,
+            )
             t1 = datetime.datetime.now()
             logging.trace(f"In ParallelAttention create self.query_key_value Begin: {t0} Elapsed: {(t1 - t0).total_seconds()} s", trace_type="recovery_time")
         else:
@@ -895,13 +815,8 @@ class ParallelAttention(MegatronModule, adapter_mixins.AdapterModuleMixin):
             normalize_attention_scores=normalize_attention_scores,
             position_embedding_type=self.position_embedding_type,
             position_interpolation_factor=self.position_interpolation_factor,
-            position_freq_base=self.position_freq_base,
-            position_abf_factor=self.position_abf_factor,
             max_position_embeddings=max_position_embeddings,
             rotary_percentage=self.rotary_percentage,
-            rotary_layer=rotary_layer,
-            num_kv_heads=num_kv_heads,
-            sliding_window=sliding_window,
         )
 
 
@@ -913,7 +828,6 @@ class ParallelAttention(MegatronModule, adapter_mixins.AdapterModuleMixin):
             input_is_parallel=True,
             init_method=output_layer_init_method,
             skip_bias_add=True,
-            resume_from_checkpoint=resume_from_checkpoint,
             use_cpu_initialization=use_cpu_initialization,
             bias=bias,
             sequence_parallel_enabled=sequence_parallel,
@@ -1086,61 +1000,20 @@ class ParallelAttention(MegatronModule, adapter_mixins.AdapterModuleMixin):
         # =====================
 
         if self.attention_type == AttnType.self_attn:
-            if self.use_gqa:
-                mixed_kv_layer, _ = self.key_value(hidden_states)
-                if self.is_adapter_available():
-                    lora_kv_adapter = self.get_adapter_module(AdapterName.LORA_KV_ADAPTER)
-                    if lora_kv_adapter:
-                        lora_mixed_kv_layer = lora_kv_adapter(hidden_states)
-                        mixed_kv_layer = mixed_kv_layer + lora_mixed_kv_layer
+            # Attention heads [sq, b, h] --> [sq, b, (np * 3 * hn)]
+            mixed_x_layer, _ = self.query_key_value(hidden_states)
 
-                # [sk, b, (np * 2 * hn)] --> [sk, b, np, 2 * hn]
-                new_tensor_shape = mixed_kv_layer.size()[:-1] + (
-                    self.num_kv_attention_heads_per_partition,
-                    2 * self.hidden_size_per_attention_head,
-                )
-                if self.megatron_legacy:
-                    mixed_kv_layer = self._transpose_last_dim(mixed_kv_layer, 2, True)
-                mixed_kv_layer = mixed_kv_layer.view(*new_tensor_shape)
+            # [sq, b, (np * 3 * hn)] --> [sq, b, np, 3 * hn]
+            new_tensor_shape = mixed_x_layer.size()[:-1] + (
+                self.num_attention_heads_per_partition,
+                3 * self.hidden_size_per_attention_head,
+            )
+            if self.megatron_legacy:
+                mixed_x_layer = self._transpose_last_dim(mixed_x_layer, 3, True)
+            mixed_x_layer = mixed_x_layer.view(*new_tensor_shape)
 
-                # [sk, b, np, 2 * hn] --> 2 [sk, b, np, hn]
-                (key_layer, value_layer) = tensor_parallel.split_tensor_along_last_dim(
-                    mixed_kv_layer, 2, contiguous_split_chunks=True
-                )
-                # Attention head [sq, b, h] --> [sq, b, hp]
-                query_layer, _ = self.query(hidden_states)
-                if self.is_adapter_available():
-                    lora_q_adapter = self.get_adapter_module(AdapterName.LORA_Q_ADAPTER)
-                    if lora_q_adapter:
-                        lora_q_layer = lora_q_adapter(hidden_states)
-                        query_layer = query_layer + lora_q_layer
-                # [sq, b, hp] --> [sq, b, np, hn]
-                new_tensor_shape = query_layer.size()[:-1] + (
-                    self.num_attention_heads_per_partition,
-                    self.hidden_size_per_attention_head,
-                )
-                query_layer = query_layer.view(*new_tensor_shape)
-            else:
-                # Attention heads [sq, b, h] --> [sq, b, (np * 3 * hn)]
-                mixed_x_layer, _ = self.query_key_value(hidden_states)
-                if self.is_adapter_available():
-                    lora_kqv_adapter = self.get_adapter_module(AdapterName.LORA_KQV_ADAPTER)
-                    if lora_kqv_adapter:
-                        lora_mixed_kqv_layer: torch.Tensor = lora_kqv_adapter(hidden_states)
-                        assert(mixed_x_layer.shape == lora_mixed_kqv_layer.shape), f"LoRA output shape must match [sq, b, (np * 3 * hn)]: hidden_states={hidden_states.shape} mixed_x_layer={mixed_x_layer.shape}, lora_mixed_kqv_layer={lora_mixed_kqv_layer.shape}"
-                        mixed_x_layer.add_(lora_mixed_kqv_layer, alpha=1.0) #TODO: Set custom alpha
-
-                # [sq, b, (np * 3 * hn)] --> [sq, b, np, 3 * hn]
-                new_tensor_shape = mixed_x_layer.size()[:-1] + (
-                    self.num_attention_heads_per_partition,
-                    3 * self.hidden_size_per_attention_head,
-                )
-                if self.megatron_legacy:
-                    mixed_x_layer = self._transpose_last_dim(mixed_x_layer, 3, True)
-                mixed_x_layer = mixed_x_layer.view(*new_tensor_shape)
-
-                # [sq, b, np, 3 * hn] --> 3 [sq, b, np, hn]
-                (query_layer, key_layer, value_layer) = tensor_parallel.split_tensor_along_last_dim(mixed_x_layer, 3)
+            # [sq, b, np, 3 * hn] --> 3 [sq, b, np, hn]
+            (query_layer, key_layer, value_layer) = tensor_parallel.split_tensor_along_last_dim(mixed_x_layer, 3)
         else:
             # Attention heads [sk, b, h] --> [sk, b, (np * 2 * hn)]
             mixed_kv_layer, _ = self.key_value(encoder_output)
@@ -1454,7 +1327,6 @@ class ParallelTransformerLayer_(MegatronModule, adapter_mixins.AdapterModuleMixi
         layernorm_epsilon=1e-5,
         hidden_dropout=0.1,
         persist_layer_norm=False,
-        resume_from_checkpoint=False,
         use_cpu_initialization=False,
         bias_activation_fusion=True,
         bias_dropout_add_fusion=True,
@@ -1474,20 +1346,14 @@ class ParallelTransformerLayer_(MegatronModule, adapter_mixins.AdapterModuleMixi
         multi_query_attention=False,
         headscale=False,
         activations_checkpoint_granularity=None,
-        disable_layer_norm_checkpointing=False,
         sequence_parallel=False,
         normalize_attention_scores=True,
         num_moe_experts=1,
         moe_frequency=1,
         moe_dropout=0.0,
         position_interpolation_factor=1.0,
-        position_freq_base=10000,
-        position_abf_factor=1,
         max_position_embeddings=4096,
         rotary_percentage=1.0,
-        rotary_layer=None,
-        num_kv_heads=None,
-        sliding_window=None
     ):
         super(ParallelTransformerLayer_, self).__init__()
 
@@ -1504,8 +1370,6 @@ class ParallelTransformerLayer_(MegatronModule, adapter_mixins.AdapterModuleMixi
         self.transformer_block_type = transformer_block_type
         self.position_embedding_type = position_embedding_type
         self.position_interpolation_factor = position_interpolation_factor
-        self.position_freq_base = position_freq_base
-        self.position_abf_factor = position_abf_factor
         self.rotary_percentage=rotary_percentage
         self.set_accepted_adapter_types([LinearAdapterConfig._target_, ParallelLinearAdapterConfig._target_])
 
@@ -1528,10 +1392,10 @@ class ParallelTransformerLayer_(MegatronModule, adapter_mixins.AdapterModuleMixi
         self.bias_dropout_add_fusion = bias_dropout_add_fusion  # if true, enable bias dropout fusion
 
         self.checkpoint_layer_norm = (
-            activations_checkpoint_granularity == 'selective' and not disable_layer_norm_checkpointing
+            activations_checkpoint_granularity == 'selective'
         )  # transformer engine forward allows for more granular selective checkpointing
-        # Only transfer with static ring when full activation checkpointing
-        transfer_with_static_ring = activations_checkpoint_granularity == 'full'
+        transfer_with_static_ring = not self.checkpoint_layer_norm # For now do not transfer with static ring
+        # when selective enabled to avoid memory pressure
 
         # Self attention.
         # retrieval_decoder_after_self_attn skips the self attention
@@ -1561,7 +1425,6 @@ class ParallelTransformerLayer_(MegatronModule, adapter_mixins.AdapterModuleMixi
                 precision=precision,
                 apply_query_key_layer_scaling=apply_query_key_layer_scaling,
                 kv_channels=kv_channels,
-                resume_from_checkpoint=resume_from_checkpoint,
                 use_cpu_initialization=use_cpu_initialization,
                 masked_softmax_fusion=masked_softmax_fusion,
                 attention_dropout=attention_dropout,
@@ -1577,13 +1440,8 @@ class ParallelTransformerLayer_(MegatronModule, adapter_mixins.AdapterModuleMixi
                 normalize_attention_scores=normalize_attention_scores,
                 transfer_with_static_ring=transfer_with_static_ring,
                 position_interpolation_factor=position_interpolation_factor,
-                position_freq_base=position_freq_base,
-                position_abf_factor=position_abf_factor,
                 max_position_embeddings=max_position_embeddings,
                 rotary_percentage=self.rotary_percentage,
-                rotary_layer=rotary_layer,
-                num_kv_heads=num_kv_heads,
-                sliding_window=sliding_window
             )
             logging.trace("In ParallelTransfomerLayer() create ParallelAttention for encoder done", trace_type="recovery_time")
 
@@ -1632,7 +1490,7 @@ class ParallelTransformerLayer_(MegatronModule, adapter_mixins.AdapterModuleMixi
                     sequence_parallel_enabled=sequence_parallel)
 
         if self.layer_type == LayerType.decoder or self.layer_type == LayerType.retrieval_encoder:
-            logging.trace(f"In ParallelTransfomerLayer() create ParallelAttention for decoder with resume being {resume_from_checkpoint} ....", trace_type="recovery_time")
+            logging.trace("In ParallelTransfomerLayer() create ParallelAttention for decoder ....", trace_type="recovery_time")
             self.inter_attention = ParallelAttention(
                 init_method=init_method,
                 output_layer_init_method=output_layer_init_method,
@@ -1645,7 +1503,6 @@ class ParallelTransformerLayer_(MegatronModule, adapter_mixins.AdapterModuleMixi
                 apply_query_key_layer_scaling=apply_query_key_layer_scaling,
                 kv_channels=kv_channels,
                 multi_query_attention=multi_query_attention,
-                resume_from_checkpoint=resume_from_checkpoint,
                 use_cpu_initialization=use_cpu_initialization,
                 masked_softmax_fusion=masked_softmax_fusion,
                 attention_dropout=attention_dropout,
@@ -1759,13 +1616,12 @@ class ParallelTransformerLayer_(MegatronModule, adapter_mixins.AdapterModuleMixi
             )
             logging.trace("In ParallelTransfomerLayer() create SwitchMLP ....", trace_type="recovery_time")
         else:
-            logging.trace(f"In ParallelTransfomerLayer() create ParallelMLP with resume being {resume_from_checkpoint}....", trace_type="recovery_time")
+            logging.trace("In ParallelTransfomerLayer() create ParallelMLP ....", trace_type="recovery_time")
             self.mlp = ParallelMLP(
                 init_method=init_method,
                 output_layer_init_method=output_layer_init_method,
                 hidden_size=hidden_size,
                 ffn_hidden_size=ffn_hidden_size,
-                resume_from_checkpoint=resume_from_checkpoint,
                 use_cpu_initialization=use_cpu_initialization,
                 bias_activation_fusion=bias_activation_fusion,
                 openai_gelu=openai_gelu,
@@ -1856,6 +1712,14 @@ class ParallelTransformerLayer_(MegatronModule, adapter_mixins.AdapterModuleMixi
                 else:
                     normalization_output = self.post_attention_layernorm(hidden_states)
                     hidden_states = self.input_layernorm(hidden_states)
+
+            # Materialize attention mask right before use
+            if is_torch_tpu_available():
+                seq_len = hidden_states.shape[0] # See above [b, *s*, h] shape
+                if self.sequence_parallel:
+                    seq_len *= parallel_state.get_tensor_model_parallel_world_size()
+                attention_mask = torch.triu(torch.ones(
+                    (1, 1, seq_len, seq_len), device='xla'), diagonal=1).bool()
 
             attention_output, attention_bias = self.self_attention(
                 hidden_states,
@@ -2025,7 +1889,6 @@ class ParallelTransformerLayer(ParallelTransformerLayer_):
         hidden_dropout=0.1,
         bias_dropout_add_fusion=True,
         persist_layer_norm=False,
-        resume_from_checkpoint=False,
         use_cpu_initialization=False,
         bias_activation_fusion=True,
         openai_gelu=False,
@@ -2043,7 +1906,6 @@ class ParallelTransformerLayer(ParallelTransformerLayer_):
         multi_query_attention=False,
         headscale=False,
         activations_checkpoint_granularity=None,
-        disable_layer_norm_checkpointing=False,
         sequence_parallel=False,
         gradient_accumulation_fusion=False,
         normalize_attention_scores=True,
@@ -2051,13 +1913,8 @@ class ParallelTransformerLayer(ParallelTransformerLayer_):
         moe_frequency=1,
         moe_dropout=0.0,
         position_interpolation_factor=1.0,
-        position_freq_base=10000,
-        position_abf_factor=1,
         max_position_embeddings=4096,
         rotary_percentage=1.0,
-        rotary_layer=None,
-        num_kv_heads=None,
-        sliding_window=None
     ):
         super(ParallelTransformerLayer, self).__init__(
             init_method=init_method,
@@ -2076,7 +1933,6 @@ class ParallelTransformerLayer(ParallelTransformerLayer_):
             hidden_dropout=hidden_dropout,
             bias_dropout_add_fusion=bias_dropout_add_fusion,
             persist_layer_norm=persist_layer_norm,
-            resume_from_checkpoint=resume_from_checkpoint,
             use_cpu_initialization=use_cpu_initialization,
             bias_activation_fusion=bias_activation_fusion,
             openai_gelu=openai_gelu,
@@ -2094,7 +1950,6 @@ class ParallelTransformerLayer(ParallelTransformerLayer_):
             headscale=headscale,
             multi_query_attention=multi_query_attention,
             activations_checkpoint_granularity=activations_checkpoint_granularity,
-            disable_layer_norm_checkpointing=disable_layer_norm_checkpointing,
             sequence_parallel=sequence_parallel,
             gradient_accumulation_fusion=gradient_accumulation_fusion,
             normalize_attention_scores=normalize_attention_scores,
@@ -2102,13 +1957,8 @@ class ParallelTransformerLayer(ParallelTransformerLayer_):
             moe_frequency=moe_frequency,
             moe_dropout=moe_dropout,
             position_interpolation_factor=position_interpolation_factor,
-            position_freq_base=position_freq_base,
-            position_abf_factor=position_abf_factor,
             max_position_embeddings=max_position_embeddings,
             rotary_percentage=rotary_percentage,
-            rotary_layer=rotary_layer,
-            num_kv_heads=num_kv_heads,
-            sliding_window=sliding_window
         )
 
         if precision == 32:
@@ -2295,7 +2145,6 @@ class ParallelTransformer(MegatronModule):
         hidden_dropout=0.1,
         attention_dropout=0.1,
         ffn_dropout=0.0,
-        resume_from_checkpoint=False,
         use_cpu_initialization=False,
         bias_activation_fusion=True,
         bias_dropout_add_fusion=True,
@@ -2316,7 +2165,6 @@ class ParallelTransformer(MegatronModule):
         layer_number_offset=0,  # this is use only for attention norm_factor scaling
         activations_checkpoint_granularity=None,
         activations_checkpoint_layers_per_pipeline=None,
-        disable_layer_norm_checkpointing=False,
         sequence_parallel=False,
         transformer_engine=False,
         fp8=False,
@@ -2334,12 +2182,8 @@ class ParallelTransformer(MegatronModule):
         moe_frequency=1,
         moe_dropout=0.0,
         position_interpolation_factor=1.0,
-        position_freq_base=10000,
-        position_abf_factor=1,
         max_position_embeddings=4096,
         rotary_percentage=1.0,
-        num_kv_heads=None,
-        sliding_window=None
     ):
         super(ParallelTransformer, self).__init__()
 
@@ -2360,16 +2204,13 @@ class ParallelTransformer(MegatronModule):
         self.layer_type = layer_type
         self.position_embedding_type = position_embedding_type
         self.position_interpolation_factor = position_interpolation_factor
-        self.position_freq_base = position_freq_base
-        self.position_abf_factor = position_abf_factor
         self.multi_query_attention = multi_query_attention
-        self.max_position_embeddings = max_position_embeddings
-        self.rotary_percentage = rotary_percentage
+        self.max_position_embeddings=max_position_embeddings
+        self.rotary_percentage=rotary_percentage
         self.activations_checkpoint_method = activations_checkpoint_method
         self.activations_checkpoint_num_layers = activations_checkpoint_num_layers
         self.activations_checkpoint_granularity = activations_checkpoint_granularity
         self.activations_checkpoint_layers_per_pipeline = activations_checkpoint_layers_per_pipeline
-        self.disable_layer_norm_checkpointing = disable_layer_norm_checkpointing
 
         if self.activations_checkpoint_granularity:
             if self.activations_checkpoint_granularity == 'selective':
@@ -2446,18 +2287,6 @@ class ParallelTransformer(MegatronModule):
 
         assert moe_frequency <= num_layers, 'MoE frequency must be <= number of transformer layers'
         # TODO: Add similar assert for encoder-decoder.
-        rope = None
-        if self.position_embedding_type == 'rope':
-            world_size = parallel_state.get_tensor_model_parallel_world_size()
-            projection_size = kv_channels * num_attention_heads
-            self.hidden_size_per_partition = safe_divide(projection_size, world_size)
-            self.hidden_size_per_attention_head = safe_divide(projection_size, num_attention_heads)
-            rope = RotaryEmbedding(self.hidden_size_per_attention_head,
-                            max_position_embeddings=max_position_embeddings,
-                            base=self.position_freq_base,
-                            position_interpolation_factor=self.position_interpolation_factor,
-                            position_abf_factor=self.position_abf_factor,
-                            rotary_percentage=self.rotary_percentage)
 
         self.num_layers = self.get_num_layers(num_layers)
         # Transformer layers.
@@ -2495,7 +2324,7 @@ class ParallelTransformer(MegatronModule):
                     zero_centered_gamma=normalization == 'layernorm1p',
                 )
             else:
-                logging.trace(f"building ParallelTransformerLayer {layer_number} begin with resume being {resume_from_checkpoint}", trace_type="recovery_time")
+                logging.trace(f"building ParallelTransformerLayer {layer_number} begin", trace_type="recovery_time")
                 return ParallelTransformerLayer(
                     init_method=init_method,
                     output_layer_init_method=output_layer_init_method,
@@ -2513,7 +2342,6 @@ class ParallelTransformer(MegatronModule):
                     hidden_dropout=hidden_dropout,
                     attention_dropout=attention_dropout,
                     ffn_dropout=ffn_dropout,
-                    resume_from_checkpoint=resume_from_checkpoint,
                     use_cpu_initialization=use_cpu_initialization,
                     bias_activation_fusion=bias_activation_fusion,
                     bias_dropout_add_fusion=bias_dropout_add_fusion,
@@ -2530,7 +2358,6 @@ class ParallelTransformer(MegatronModule):
                     transformer_block_type=transformer_block_type,
                     headscale=headscale,
                     activations_checkpoint_granularity=activations_checkpoint_granularity,
-                    disable_layer_norm_checkpointing=disable_layer_norm_checkpointing,
                     sequence_parallel=sequence_parallel,
                     normalize_attention_scores=normalize_attention_scores,
                     num_moe_experts=num_moe_experts,
@@ -2538,13 +2365,8 @@ class ParallelTransformer(MegatronModule):
                     moe_dropout=moe_dropout,
                     position_embedding_type=self.position_embedding_type,
                     position_interpolation_factor=self.position_interpolation_factor,
-                    position_freq_base=self.position_freq_base,
-                    position_abf_factor=self.position_abf_factor,
                     max_position_embeddings=self.max_position_embeddings,
                     rotary_percentage=self.rotary_percentage,
-                    rotary_layer=rope,
-                    num_kv_heads=num_kv_heads,
-                    sliding_window=sliding_window
                 )
 
         if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
@@ -2583,7 +2405,7 @@ class ParallelTransformer(MegatronModule):
             else:
                 offset = parallel_state.get_pipeline_model_parallel_rank() * self.num_layers
 
-        logging.trace("In ParallelTransformer(), building layers with resume being {resume_from_checkpoint} begin", trace_type="recovery_time")
+        logging.trace("In ParallelTransformer(), building layers begin", trace_type="recovery_time")
         self.layers = torch.nn.ModuleList([build_layer(i + 1 + offset) for i in range(self.num_layers)])
         logging.trace("In ParallelTransformer(), building layers done", trace_type="recovery_time")
 

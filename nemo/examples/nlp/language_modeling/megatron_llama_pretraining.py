@@ -11,22 +11,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 import lightning_neuron_patch
 import os
-import datetime
+
 from lightning_lite.plugins.environments import TorchElasticEnvironment
-from omegaconf.omegaconf import OmegaConf, open_dict, DictConfig
+from omegaconf.omegaconf import OmegaConf, open_dict
 from pytorch_lightning import Trainer
+from omegaconf.dictconfig import DictConfig
 from pytorch_lightning.callbacks.timer import Timer
 from pytorch_lightning.trainer.connectors.checkpoint_connector import CheckpointConnector
 
-from checkpoint_conversion.convert_nemo_checkpoint_to_hf_llama import convert_checkpoint as convert_checkpoint_llama
-
-from checkpoint_conversion.convert_nemo_checkpoint_to_hf import convert_checkpoint as convert_checkpoint_gpt2
-from checkpoint_conversion.convert_nemo_checkpoint_to_hf_neox import convert_checkpoint as convert_checkpoint_neox
-from nemo.collections.nlp.models.language_modeling.megatron.falcon_model import FalconModel
 from nemo.collections.nlp.models.language_modeling.megatron_gpt_model import MegatronGPTModel
+from nemo.collections.nlp.models.language_modeling.megatron.llama_model import LlamaModel
+
 from nemo.collections.nlp.parts.nlp_overrides import (
     GradScaler,
     MegatronHalfPrecisionPlugin,
@@ -39,17 +36,22 @@ from nemo.core.config import hydra_runner
 from nemo.utils import logging
 from nemo.utils.exp_manager import StatelessTimer, exp_manager
 
+import torch.optim.adamw as torch_adamw
+from nemo.core.optim.adamw import _single_tensor_adamw_
+torch_adamw._single_tensor_adamw = _single_tensor_adamw_
 
-class MegatronFalconModel(MegatronGPTModel):
+
+class PreTrainLlamaModel(MegatronGPTModel):
     """
-    Pretrain GPT Model without validation
-    """
+        Pretrain LLama Model without validation
+        """
+
     def __init__(self, cfg: DictConfig, trainer: Trainer):
         super().__init__(cfg, trainer)
 
     def model_provider_func(self, pre_process, post_process):
         """Model depends on pipeline paralellism."""
-        model = FalconModel(
+        model = LlamaModel(
             vocab_size=self.padded_vocab_size,
             hidden_size=self.cfg.hidden_size,
             max_position_embeddings=self.cfg.max_position_embeddings,
@@ -83,11 +85,11 @@ class MegatronFalconModel(MegatronGPTModel):
             bias_activation_fusion=self.cfg.get('bias_activation_fusion', True),
             bias_dropout_add_fusion=self.cfg.get('bias_dropout_add_fusion', True),
             share_embeddings_and_output_weights=self.cfg.get('share_embeddings_and_output_weights', True),
-            position_embedding_type=self.cfg.get('position_embedding_type', 'rope'),
+            position_embedding_type=self.cfg.get('position_embedding_type', 'learned_absolute'),
             rotary_percentage=self.cfg.get('rotary_percentage', 1.0),
             activation=self.cfg.get('activation', 'gelu'),
             bias=self.cfg.get('has_bias', True),
-            transformer_block_type=self.cfg.get('transformer_block_type','parallel_attn'),
+            transformer_block_type=self.cfg.get('transformer_block_type','pre_ln'),
             masked_softmax_fusion=self.cfg.get('masked_softmax_fusion', True),
             gradient_accumulation_fusion=self.cfg.get('gradient_accumulation_fusion', False),
             persist_layer_norm=self.cfg.get('persist_layer_norm', False),
@@ -101,30 +103,26 @@ class MegatronFalconModel(MegatronGPTModel):
             fp8_amax_history_len=self.cfg.get('fp8_amax_history_len', 1),
             fp8_amax_compute_algo=self.cfg.get('fp8_amax_compute_algo', 'most_recent'),
             use_emha=self.cfg.get('use_emha', False),
-            multi_query_attention=self.cfg.get('attention_type', 'multithead') == 'multiquery',
             save_logits=self.cfg.get('save_logits', False),
+            num_kv_heads=self.cfg.get('num_kv_heads', None),
         )
 
         return model
 
 
-@hydra_runner(config_path="conf", config_name="megatron_falcon_7b_config")
+@hydra_runner(config_path="conf", config_name="megatron_llama_70b_config")
 def main(cfg) -> None:
-    if cfg.enable_recovery_time_instrumentation:
-        logging.add_allowed_trace_type("recovery_time")
-        print(f"Entering main at {datetime.datetime.now()}")
-
     logging.info("\n\n************** Experiment configuration ***********")
     logging.info(f'\n{OmegaConf.to_yaml(cfg)}')
 
     megatron_amp_o2 = cfg.model.get('megatron_amp_O2', False)
     with_distributed_adam = cfg.model.optim.get('name') == 'distributed_fused_adam'
     plugins = []
-
+    
     nlp_xla_checkpoint_io = NLPCheckpointIO()
     cluster_environment = None
     if os.environ.get("TORCHELASTIC_RUN_ID") is not None:
-        cluster_environment = TorchElasticEnvironment()
+        cluster_environment=TorchElasticEnvironment()
     strategy = NLPDDPStrategy(
         no_ddp_communication_hook=True,  # we don't use DDP for async grad allreduce
         gradient_as_bucket_view=cfg.model.gradient_as_bucket_view,
@@ -153,48 +151,25 @@ def main(cfg) -> None:
     # update resume from checkpoint found by exp_manager
     if cfg.model.resume_from_checkpoint is not None:
         resume_from_checkpoint = cfg.model.resume_from_checkpoint
-        trainer = NLPTrainer(plugins=plugins, strategy=strategy, resume_from_checkpoint=resume_from_checkpoint,
-                             **cfg.trainer)
+        trainer = NLPTrainer(plugins=plugins, strategy=strategy, resume_from_checkpoint=resume_from_checkpoint, **cfg.trainer)
     else:
         trainer = NLPTrainer(plugins=plugins, strategy=strategy, **cfg.trainer)
 
+
     exp_manager(trainer, cfg.exp_manager)
     # We use NLPCheckpointConnector which correctly loads global_step, epoch
-    # trainer._checkpoint_connector = CheckpointConnector(trainer, resume_from_checkpoint=resume_from_checkpoint)
+    #trainer._checkpoint_connector = CheckpointConnector(trainer, resume_from_checkpoint=resume_from_checkpoint)
     # Override timer callback to a stateless one
     for idx, callback in enumerate(trainer.callbacks):
         if isinstance(callback, Timer):
-            trainer.callbacks[idx] = StatelessTimer(cfg.trainer.max_time, )
+            trainer.callbacks[idx] = StatelessTimer(cfg.trainer.max_time,)
 
     # hydra interpolation does not work here as the interpolation key is lost when PTL saves hparams
     with open_dict(cfg):
         cfg.model.precision = cfg.trainer.precision
 
-    model = MegatronFalconModel(cfg.model, trainer)
+    model = PreTrainLlamaModel(cfg.model, trainer)
     trainer.fit(model)
-    # Convert checkpoint to HuggingFace
-    if cfg.model.convert_to_hf and cfg.exp_manager.create_checkpoint_callback:
-        import torch_xla.core.xla_model as xm
-        if xm.get_ordinal() == 0:
-            if cfg.name == "megatron_llama":
-                logging.info("Converting LLama checkpoints to HuggingFace format")
-                checkpoint_path = os.path.join(os.getcwd(), "nemo_experiments", cfg.exp_manager.name,
-                                               os.environ.get('SLURM_JOB_ID'), "checkpoints")
-                convert_checkpoint_llama(cfg.model.config_path, checkpoint_path, cfg.model.output_dir, 2.0, True)
-                logging.info("Finished converting Llama checkpoints")
-            elif cfg.name == "megatron_neox":
-                logging.info("Converting Neox checkpoints to HuggingFace format")
-                checkpoint_path = os.path.join(os.getcwd(), "nemo_experiments", cfg.exp_manager.name,
-                                               os.environ.get('SLURM_JOB_ID'), "checkpoints")
-                convert_checkpoint_neox(cfg.model.config_path, checkpoint_path, cfg.model.output_dir, 2.0, True)
-                logging.info("Finished converting Llama checkpoints")
-            elif cfg.name == "megatron_gpt":
-                logging.info("Converting GPT2 checkpoints to HuggingFace format")
-                checkpoint_path = os.path.join(os.getcwd(), "nemo_experiments", cfg.exp_manager.name,
-                                               os.environ.get('SLURM_JOB_ID'), "checkpoints")
-                convert_checkpoint_gpt2(cfg.model.config_path, checkpoint_path, cfg.model.output_dir, 2.0, True)
-                logging.info("Finished converting GPT2 checkpoints")
-
 
 if __name__ == '__main__':
     main()

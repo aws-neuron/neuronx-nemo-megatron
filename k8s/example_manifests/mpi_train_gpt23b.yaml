@@ -6,8 +6,6 @@ spec:
   slotsPerWorker: 1
   runPolicy:
     cleanPodPolicy: Running
-    # Uncomment the line below to allow the launcher to wait longer for the workers to join
-    # backoffLimit: 20
   mpiReplicaSpecs:
     Launcher:
       replicas: 1

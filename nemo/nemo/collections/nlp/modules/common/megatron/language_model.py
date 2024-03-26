@@ -58,7 +58,6 @@ def get_language_model(
     pre_process=True,
     post_process=True,
     init_method_std=0.02,
-    resume_from_checkpoint=False,
     use_cpu_initialization=False,
     hidden_dropout=0.1,
     attention_dropout=0.1,
@@ -67,7 +66,6 @@ def get_language_model(
     fp32_residual_connection=False,
     activations_checkpoint_method=None,
     activations_checkpoint_num_layers=1,
-    disable_layer_norm_checkpointing=False,
     normalization='layernorm',
     layernorm_epsilon=1e-5,
     bias_activation_fusion=True,
@@ -102,10 +100,6 @@ def get_language_model(
     reduce_amax=True,
     use_emha=False,
     position_interpolation_factor=1.0,
-    position_freq_base=10000,
-    position_abf_factor=1,
-    num_kv_heads=None,
-    sliding_window=None
 ):
     """Build language model and return along with the key to save."""
 
@@ -114,8 +108,7 @@ def get_language_model(
             hidden_size % num_attention_heads == 0
         ), 'hidden_size must be divisible by num_attention_heads if kv_channels is None'
         kv_channels = hidden_size // num_attention_heads
-    if num_kv_heads is not None:
-        assert num_attention_heads % num_kv_heads == 0, 'number of query heads should be divisible by kv heads'
+
     if init_method is None:
         init_method = init_method_normal(init_method_std)
 
@@ -142,7 +135,6 @@ def get_language_model(
         add_pooler=add_pooler,
         pre_process=pre_process,
         post_process=post_process,
-        resume_from_checkpoint=resume_from_checkpoint,
         use_cpu_initialization=use_cpu_initialization,
         hidden_dropout=hidden_dropout,
         attention_dropout=attention_dropout,
@@ -172,7 +164,6 @@ def get_language_model(
         megatron_legacy=megatron_legacy,
         activations_checkpoint_granularity=activations_checkpoint_granularity,
         activations_checkpoint_layers_per_pipeline=activations_checkpoint_layers_per_pipeline,
-        disable_layer_norm_checkpointing=disable_layer_norm_checkpointing,
         sequence_parallel=sequence_parallel,
         transformer_engine=transformer_engine,
         fp8=fp8,
@@ -185,10 +176,6 @@ def get_language_model(
         reduce_amax=reduce_amax,
         use_emha=use_emha,
         position_interpolation_factor=position_interpolation_factor,
-        position_freq_base=position_freq_base,
-        position_abf_factor=position_abf_factor,
-        num_kv_heads=num_kv_heads,
-        sliding_window=sliding_window
     )
     logging.trace(f"In get_language_model() leave TransformerLanguageModel()", trace_type="recovery_time")
 
@@ -242,7 +229,6 @@ class Embedding(MegatronModule):
         init_method: weight initialization method
         num_tokentypes: size of the token-type embeddings. 0 value
                         will ignore this embedding
-        resume_from_checkpoint: whether the training was resuming from a checkpoint. If so, then no need to initialize the weights
         use_cpu_initialization: whether to initialize the weights in CPU
         position_embedding_type: position embedding type determines whether we instantiate a learnable position embedding table.
     """
@@ -255,7 +241,6 @@ class Embedding(MegatronModule):
         embedding_dropout_prob,
         init_method,
         num_tokentypes=0,
-        resume_from_checkpoint=False,
         use_cpu_initialization=False,
         fp32_residual_connection=False,
         sequence_parallel=False,
@@ -263,6 +248,7 @@ class Embedding(MegatronModule):
         transpose_batch_sequence=True,
     ):
         super(Embedding, self).__init__()
+
         self.hidden_size = hidden_size
         self.init_method = init_method
         self.num_tokentypes = num_tokentypes
@@ -271,9 +257,7 @@ class Embedding(MegatronModule):
 
         # Word embeddings (parallel).
         self.word_embeddings = tensor_parallel.VocabParallelEmbedding(
-            vocab_size, self.hidden_size, init_method=self.init_method,
-            resume_from_checkpoint=resume_from_checkpoint,
-            use_cpu_initialization=use_cpu_initialization,
+            vocab_size, self.hidden_size, init_method=self.init_method, use_cpu_initialization=use_cpu_initialization,
         )
         self._word_embeddings_key = 'word_embeddings'
 
@@ -453,7 +437,6 @@ class TransformerLanguageModel(MegatronModule):
         add_pooler=False,
         pre_process=True,
         post_process=True,
-        resume_from_checkpoint=False,
         use_cpu_initialization=False,
         hidden_dropout=0.1,
         attention_dropout=0.1,
@@ -483,7 +466,6 @@ class TransformerLanguageModel(MegatronModule):
         megatron_legacy=False,
         activations_checkpoint_granularity=None,
         activations_checkpoint_layers_per_pipeline=None,
-        disable_layer_norm_checkpointing=False,
         sequence_parallel=False,
         transformer_engine=False,
         fp8=False,
@@ -496,10 +478,6 @@ class TransformerLanguageModel(MegatronModule):
         reduce_amax=True,
         use_emha=False,
         position_interpolation_factor=1.0,
-        position_freq_base=10000,
-        position_abf_factor=1,
-        num_kv_heads=None,
-        sliding_window=None
     ):
         super(TransformerLanguageModel, self).__init__(share_token_embeddings=share_embeddings_and_output_weights)
 
@@ -519,8 +497,6 @@ class TransformerLanguageModel(MegatronModule):
         self.output_layer_init_method = output_layer_init_method
         self.position_embedding_type = position_embedding_type
         self.position_interpolation_factor = position_interpolation_factor
-        self.position_freq_base = position_freq_base
-        self.position_abf_factor = position_abf_factor
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
         self.sequence_parallel = sequence_parallel
         self.rotary_percentage=rotary_percentage
@@ -542,7 +518,6 @@ class TransformerLanguageModel(MegatronModule):
                 max_sequence_length=self.max_position_embeddings,
                 init_method=self.init_method,
                 num_tokentypes=self.num_tokentypes,
-                resume_from_checkpoint=resume_from_checkpoint,
                 use_cpu_initialization=use_cpu_initialization,
                 embedding_dropout_prob=self.hidden_dropout,
                 sequence_parallel=sequence_parallel,
@@ -560,7 +535,7 @@ class TransformerLanguageModel(MegatronModule):
         #         rotary_dim = int(rotary_dim * rotary_percentage)
         #     self.rotary_pos_emb = RotaryEmbedding(rotary_dim)
         # Transformer.
-        logging.trace(f"In TransformerLanguageModel() create encoder with resume={resume_from_checkpoint} begin", trace_type="recovery_time")
+        logging.trace(f"In TransformerLanguageModel() create encoder begin", trace_type="recovery_time")
         self.encoder = ParallelTransformer(
             init_method=self.init_method,
             output_layer_init_method=self.output_layer_init_method,
@@ -582,7 +557,6 @@ class TransformerLanguageModel(MegatronModule):
             hidden_dropout=hidden_dropout,
             attention_dropout=attention_dropout,
             ffn_dropout=ffn_dropout,
-            resume_from_checkpoint=resume_from_checkpoint,
             use_cpu_initialization=use_cpu_initialization,
             persist_layer_norm=persist_layer_norm,
             openai_gelu=openai_gelu,
@@ -601,7 +575,6 @@ class TransformerLanguageModel(MegatronModule):
             sequence_parallel=sequence_parallel,
             activations_checkpoint_granularity=activations_checkpoint_granularity,
             activations_checkpoint_layers_per_pipeline=activations_checkpoint_layers_per_pipeline,
-            disable_layer_norm_checkpointing=disable_layer_norm_checkpointing,
             transformer_engine=transformer_engine,
             fp8=fp8,
             fp8_e4m3=fp8_e4m3,
@@ -614,12 +587,8 @@ class TransformerLanguageModel(MegatronModule):
             use_emha=use_emha,
             position_embedding_type=self.position_embedding_type,
             position_interpolation_factor=self.position_interpolation_factor,
-            position_freq_base=self.position_freq_base,
-            position_abf_factor=self.position_abf_factor,
             max_position_embeddings=self.max_position_embeddings,
             rotary_percentage=self.rotary_percentage,
-            num_kv_heads=num_kv_heads,
-            sliding_window=sliding_window
         )
         logging.trace(f"In TransformerLanguageModel() create encoder done", trace_type="recovery_time")
         self._encoder_key = 'encoder'
@@ -661,8 +630,6 @@ class TransformerLanguageModel(MegatronModule):
                 activations_checkpoint_layers_per_pipeline=activations_checkpoint_layers_per_pipeline,
                 transformer_engine=transformer_engine,
                 position_interpolation_factor=self.position_interpolation_factor,
-                position_freq_base=self.position_freq_base,
-                position_abf_factor=self.position_abf_factor,
                 max_position_embeddings=self.max_position_embeddings,
                 rotary_percentage=self.rotary_percentage,
             )

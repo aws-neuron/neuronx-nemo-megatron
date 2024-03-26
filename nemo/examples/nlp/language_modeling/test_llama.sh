@@ -68,9 +68,6 @@ $MAYBE_COMPILE torchrun $DISTRIBUTED_ARGS megatron_gpt_pretraining.py  \
     model.activations_checkpoint_method=uniform \
     model.activations_checkpoint_num_layers=1 \
     +model.save_xser=True\
-    +model.load_xser=True \
-    model.wrap_with_zero=$wrap_with_zero \
-    model.zero_use_master_weight=$zero_use_master_weight \
     exp_manager.create_tensorboard_logger=$CREATE_TB_LOGGER \
     exp_manager.resume_if_exists=False \
     exp_manager.resume_ignore_no_checkpoint=False \
@@ -80,4 +77,6 @@ $MAYBE_COMPILE torchrun $DISTRIBUTED_ARGS megatron_gpt_pretraining.py  \
     model.use_cpu_initialization=True   2>&1  | tee -a $LOG_PATH/log
 
 # Note: to resume training using a checkpoint, please add the following configuration above, adjusting for your checkpoint path
+#    model.use_cpu_initialization=False \
+#    +model.load_xser=True \
 #    model.resume_from_checkpoint='/efs/checkpoint/megatron_gpt--step\=1085-consumed_samples\=69632.0-last.ckpt' \

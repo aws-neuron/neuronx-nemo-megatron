@@ -62,19 +62,19 @@ training_precision="bf16SR"
 if [[ $training_precision == "bf16SR" ]];then
     echo using BF16 SR
     export XLA_USE_BF16=1
-    export NEURON_CC_FLAGS="--model-type transformer --distribution-strategy=llm-training --enable-mixed-precision-accumulation"
+    export NEURON_CC_FLAGS="--model-type transformer --distribution-strategy=nemo --enable-mixed-precision-accumulation"
     OPTIM_NAME=adamw
     megatron_amp_O2=false
 elif [[ $training_precision == "megatron_amp_O2" ]]; then
     echo using megatron_amp_O2
     export XLA_DOWNCAST_BF16=1
-    export NEURON_CC_FLAGS="--model-type transformer --distribution-strategy=llm-training --enable-mixed-precision-accumulation"
+    export NEURON_CC_FLAGS="--model-type transformer --distribution-strategy=nemo --enable-mixed-precision-accumulation"
     OPTIM_NAME=adamw
     megatron_amp_O2=true
 elif [[ $training_precision == "fp32_OptStates" ]]; then
     echo using FP32 Optimizer States
     export XLA_DOWNCAST_BF16=1
-    export NEURON_CC_FLAGS="--model-type transformer --distribution-strategy=llm-training --enable-mixed-precision-accumulation"
+    export NEURON_CC_FLAGS="--model-type transformer --distribution-strategy=nemo --enable-mixed-precision-accumulation"
     OPTIM_NAME=adamw_fp32OptState
     megatron_amp_O2=false
 else
@@ -164,7 +164,6 @@ torchrun $DISTRIBUTED_ARGS megatron_gpt_pretraining.py \
     model.activations_checkpoint_method=uniform \
     model.activations_checkpoint_num_layers=$AL \
     +model.save_xser=True \
-    +model.load_xser=True \
     exp_manager.create_tensorboard_logger=$CREATE_TB_LOGGER \
     +exp_manager.checkpoint_callback_params.train_time_interval=72000\
     $EXP_DIR_OPTION \
@@ -176,4 +175,5 @@ torchrun $DISTRIBUTED_ARGS megatron_gpt_pretraining.py \
        2>&1  | tee  $LOG_PATH/$LOG_FILE_NAME
 
 # Note: to resume training using a checkpoint, please add the following configuration above, adjusting for your checkpoint path
+#    +model.load_xser=True \
 #    model.resume_from_checkpoint='/efs/checkpoint/megatron_gpt--step\=1085-consumed_samples\=69632.0-last.ckpt' \
