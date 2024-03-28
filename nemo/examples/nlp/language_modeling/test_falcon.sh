@@ -3,29 +3,29 @@
 source ./train_setup.sh
 
 : ${TRAIN_ITERS:=20000}
-: ${INIT_METHOD_STD:=0.021}
+: ${INIT_METHOD_STD:=0.02}
 : ${LAYERNORM_EPSILON:=1e-5}
 : ${WARMUP_STEPS:=10}
 
 : ${SEQ_LENGTH:=2048}
-: ${HS:=4096}
+: ${HS:=4544}
 : ${TP:=8}
 : ${PP:=1}
 : ${N_LAYERS:=32}
-: ${N_AH:=32}
+: ${N_AH:=71}
 : ${UBS:=1}
-: ${FFN_HS:=11008}
+: ${FFN_HS:=18176}
 : ${GBS:=256}
 
-: ${TOKENIZER_PATH=$HOME/llamav2_weights/7b-hf}
-: ${DATASET_PATH=$HOME/examples_datasets/llama_7b/book.jsonl-processed_text_document}
+: ${TOKENIZER_PATH=$HOME/falcon/7b-hf}
+: ${DATASET_PATH=$HOME/examples_datasets/falcon/wiki/wiki_text_document}
 
 echo "SEQ_LEN=$SEQ_LENGTH, HS=$HS, FFN_HS=$FFN_HS TP=$TP PP=$PP N_LAYERS=$N_LAYERS N_AH=$N_AH GBS=$GBS UBS=$UBS TRAIN_ITERS=$TRAIN_ITERS"
 
 
-$MAYBE_COMPILE torchrun $DISTRIBUTED_ARGS megatron_gpt_pretraining.py  \
+$MAYBE_COMPILE torchrun $DISTRIBUTED_ARGS megatron_falcon_pretraining.py  \
     --config-path=conf \
-    --config-name=megatron_llama_config \
+    --config-name=megatron_falcon_7b_config \
     trainer.devices=$PROCESSES_PER_NODE \
     trainer.num_nodes=$NTASKS \
     trainer.max_epochs=null \
@@ -67,10 +67,8 @@ $MAYBE_COMPILE torchrun $DISTRIBUTED_ARGS megatron_gpt_pretraining.py  \
     model.activations_checkpoint_granularity=full \
     model.activations_checkpoint_method=uniform \
     model.activations_checkpoint_num_layers=1 \
-    +model.save_xser=True\
+    +model.save_xser=True \
     +model.load_xser=True \
-    model.wrap_with_zero=$wrap_with_zero \
-    model.zero_use_master_weight=$zero_use_master_weight \
     exp_manager.create_tensorboard_logger=$CREATE_TB_LOGGER \
     exp_manager.resume_if_exists=False \
     exp_manager.resume_ignore_no_checkpoint=False \

@@ -24,8 +24,8 @@ echo "SEQ_LEN=$SEQ_LENGTH, HS=$HS, FFN_HS=$FFN_HS TP=$TP PP=$PP N_LAYERS=$N_LAYE
 
 
 $MAYBE_COMPILE torchrun $DISTRIBUTED_ARGS megatron_gpt_pretraining.py  \
-    --config-path=conf \
-    --config-name=megatron_llama_config \
+    --config-path=tuning/conf \
+    --config-name=megatron_llama_lora_tuning_config.yaml \
     trainer.devices=$PROCESSES_PER_NODE \
     trainer.num_nodes=$NTASKS \
     trainer.max_epochs=null \
@@ -67,10 +67,10 @@ $MAYBE_COMPILE torchrun $DISTRIBUTED_ARGS megatron_gpt_pretraining.py  \
     model.activations_checkpoint_granularity=full \
     model.activations_checkpoint_method=uniform \
     model.activations_checkpoint_num_layers=1 \
-    +model.save_xser=True\
-    +model.load_xser=True \
     model.wrap_with_zero=$wrap_with_zero \
     model.zero_use_master_weight=$zero_use_master_weight \
+    +model.save_xser=True\
+    +model.load_xser=True \
     exp_manager.create_tensorboard_logger=$CREATE_TB_LOGGER \
     exp_manager.resume_if_exists=False \
     exp_manager.resume_ignore_no_checkpoint=False \

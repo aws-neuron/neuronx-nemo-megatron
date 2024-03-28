@@ -12,12 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Llama GQA model."""
+"""Falcon-7B model."""
 
 import torch
 
-from nemo.collections.nlp.modules.common.megatron.language_model import get_language_model
-from nemo.collections.nlp.modules.common.megatron.llama_module import get_llama_language_model
+from nemo.collections.nlp.modules.common.megatron.falcon_module import get_falcon_language_model
 from nemo.collections.nlp.modules.common.megatron.module import MegatronModule
 from nemo.collections.nlp.modules.common.megatron.utils import (
     ApexGuardDefaults,
@@ -57,7 +56,7 @@ def post_language_model_processing(
         else:
             logits = None
             if return_logits:
-                logits = output.clone()
+                logits = lm_output.clone()
             if fp16_lm_cross_entropy:
                 assert lm_output.dtype == torch.half
                 loss = tensor_parallel.vocab_parallel_cross_entropy(lm_output, labels)
@@ -108,8 +107,8 @@ def post_language_model_processing(
         return loss, logits
 
 
-class LlamaModel(MegatronModule):
-    """GPT-2 Language model."""
+class FalconModel(MegatronModule):
+    """Falcon Language model."""
 
     def __init__(
         self,
@@ -150,7 +149,7 @@ class LlamaModel(MegatronModule):
         normalize_attention_scores=True,
         position_embedding_type='rope',
         rotary_percentage=1.0,
-        attention_type='multiquery',
+        attention_type='multihead',
         share_embeddings_and_output_weights=True,
         gradient_accumulation_fusion=False,
         persist_layer_norm=False,
@@ -169,10 +168,9 @@ class LlamaModel(MegatronModule):
         use_emha=False,
         multi_query_attention=False,
         save_logits=False,
-        num_kv_heads=None,
     ):
 
-        super(LlamaModel, self).__init__(share_token_embeddings=share_embeddings_and_output_weights)
+        super(FalconModel, self).__init__(share_token_embeddings=share_embeddings_and_output_weights)
 
         self.parallel_output = parallel_output
         self.pre_process = pre_process
@@ -194,7 +192,7 @@ class LlamaModel(MegatronModule):
             if use_scaled_init_method
             else init_method_normal(init_method_std)
         )
-        self.language_model, self._language_model_key = get_llama_language_model(
+        self.language_model, self._language_model_key = get_falcon_language_model(
             vocab_size=vocab_size,
             hidden_size=hidden_size,
             hidden_dropout=hidden_dropout,
@@ -251,7 +249,6 @@ class LlamaModel(MegatronModule):
             reduce_amax=reduce_amax,
             use_emha=use_emha,
             multi_query_attention=multi_query_attention,
-            num_kv_heads=num_kv_heads,
         )
 
         if self.share_embeddings_and_output_weights:

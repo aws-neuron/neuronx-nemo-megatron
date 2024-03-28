@@ -8,8 +8,7 @@ export N_AH=40
 export FFN_HS=13824
 export GBS=1024
 export UBS=1
-export TRAIN_ITERS=400000
-
+: ${TRAIN_ITERS:=400000}
 export INIT_METHOD_STD=0.02
 export LAYERNORM_EPSILON=1e-6
 export WARMUP_STEPS=2000

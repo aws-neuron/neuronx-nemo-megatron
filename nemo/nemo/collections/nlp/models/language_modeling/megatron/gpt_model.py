@@ -24,7 +24,7 @@ from nemo.collections.nlp.modules.common.megatron.utils import (
     parallel_lm_logits,
     scaled_init_method_normal,
 )
-
+import warnings
 try:
     from apex.transformer import tensor_parallel, parallel_state
     from apex.transformer.enums import AttnMaskType
@@ -127,6 +127,7 @@ class GPTModel(MegatronModule):
         init_method_std=0.02,
         use_scaled_init_method=True,
         fp16_lm_cross_entropy=False,
+        resume_from_checkpoint=False,
         use_cpu_initialization=False,
         hidden_dropout=0.1,
         attention_dropout=0.1,
@@ -137,6 +138,7 @@ class GPTModel(MegatronModule):
         activations_checkpoint_method=None,
         activations_checkpoint_num_layers=1,
         activations_checkpoint_layers_per_pipeline=None,
+        disable_layer_norm_checkpointing=False,
         normalization='layernorm',
         layernorm_epsilon=1e-5,
         bias=True,
@@ -169,10 +171,18 @@ class GPTModel(MegatronModule):
         multi_query_attention=False,
         save_logits=False,
         position_interpolation_factor=1.0,
+        position_freq_base=10000,
+        position_abf_factor=1,
+        num_kv_heads=None,
+        sliding_window=None,
     ):
 
         super(GPTModel, self).__init__(share_token_embeddings=share_embeddings_and_output_weights)
-
+        if sliding_window:
+            if sliding_window > max_position_embeddings:
+                warnings.warn(f"Warning sliding window attention value:{sliding_window} is set higher than max position embeddings value:{max_position_embeddings}.")
+            elif sliding_window < max_position_embeddings:
+                warnings.warn(f"Warning sliding window attention value:{sliding_window} is enabled.")
         self.parallel_output = parallel_output
         self.pre_process = pre_process
         self.post_process = post_process
@@ -216,6 +226,7 @@ class GPTModel(MegatronModule):
             pre_process=self.pre_process,
             post_process=self.post_process,
             init_method_std=init_method_std,
+            resume_from_checkpoint=resume_from_checkpoint,
             use_cpu_initialization=use_cpu_initialization,
             precision=precision,
             fp32_residual_connection=fp32_residual_connection,
@@ -223,6 +234,7 @@ class GPTModel(MegatronModule):
             activations_checkpoint_method=activations_checkpoint_method,
             activations_checkpoint_num_layers=activations_checkpoint_num_layers,
             activations_checkpoint_layers_per_pipeline=activations_checkpoint_layers_per_pipeline,
+            disable_layer_norm_checkpointing=disable_layer_norm_checkpointing,
             normalization=normalization,
             layernorm_epsilon=layernorm_epsilon,
             rotary_percentage=rotary_percentage,
@@ -254,6 +266,10 @@ class GPTModel(MegatronModule):
             use_emha=use_emha,
             multi_query_attention=multi_query_attention,
             position_interpolation_factor=position_interpolation_factor,
+            position_freq_base=position_freq_base,
+            position_abf_factor=position_abf_factor,
+            num_kv_heads=num_kv_heads,
+            sliding_window=sliding_window
         )
 
         logging.trace(f"In GPTModel._init_() leave get_language_model()", trace_type="recovery_time")
