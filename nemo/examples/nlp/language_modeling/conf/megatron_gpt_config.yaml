@@ -145,6 +145,8 @@ model:
   # stage 0 and stage 2 to checkpoint 6 layers less stage 0, and so on. This is possible because later pipeline stage
   # uses less GPU memory with fewer outstanding micro-batch backpropagations. Used with 'num_micro_batches_with_partial_activation_checkpoints',
   # this feature removes most of activation checkpoints at the last pipeline stage, which is the critical execution path.
+  disable_layer_norm_checkpointing: False
+  # Removes activation checkpointing for layer norm and RMS Norm
 
   ## Sequence Parallelism
   # Makes tensor parallelism more memory efficient for LLMs (20B+) by parallelizing layer norms and dropout sequentially
@@ -155,6 +157,7 @@ model:
   # Wraps your chosen optimizer with a Zero Redundancy Optimizer
   # Partitions optimizer states across ranks reducing memory consumption
   wrap_with_zero: False
+  zero_use_master_weight: False
 
   ## Transformer Engine
   transformer_engine: False
@@ -325,3 +328,4 @@ model:
 
 
 enable_recovery_time_instrumentation: False # default to not printing the detailing timing for recovery
+async_checkpointing: False

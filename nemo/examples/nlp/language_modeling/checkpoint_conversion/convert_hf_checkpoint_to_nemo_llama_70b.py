@@ -216,8 +216,12 @@ def convert_checkpoint(p, args, config):
             output_folder = output_folder + f"_pp_rank_{p:03d}"
         if not os.path.exists(output_folder):
             os.makedirs(output_folder)
-        torch.save(out_model,
-                   f"{output_folder}/model_optim_rng.ckpt")  # , (not master_only), global_master=True)
+        if args.is_xser:
+            from nemo.collections.nlp.parts.serialization import save
+            save(out_model, f"{output_folder}/model_optim_rng.ckpt")
+        else:
+            torch.save(out_model,
+                       f"{output_folder}/model_optim_rng.ckpt")  # , (not master_only), global_master=True)
         print("Done saving Megatron checkpoint")
 
 
@@ -227,18 +231,18 @@ if __name__ == "__main__":
     parser.add_argument(
         "--path_to_checkpoint",
         type=str,
-        help="Path to the checkpoint file (.zip archive or direct .pt file)",
+        help="Path to the checkpoint folder",
     )
     parser.add_argument(
         "--config_file",
         type=str,
-        help="An optional config json file describing the pre-trained model.",
+        help="Config json file describing the pre-trained model.",
     )
 
     parser.add_argument(
         "--model_bin_file",
         type=str,
-        help="An optional config json file describing the pre-trained model. ext and pp rank added in code",
+        help="The pytorch_model.bin.index.json file describing the mapping of layers to .bin shards.",
     )
     parser.add_argument(
         "--output_path",
@@ -253,7 +257,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--pp_degree",
-        default=2,
+        default=8,
         type=int,
         help="Pipeline parallelism",
     )
@@ -265,9 +269,14 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--num_shards",
-        default=15,
+        default=29,
         type=int,
         help="Number of shards in the save checkpoint",
+    )
+    parser.add_argument(
+        "--is_xser",
+        action="store_true",
+        help="Enable serialized saving",
     )
 
     args = parser.parse_args()

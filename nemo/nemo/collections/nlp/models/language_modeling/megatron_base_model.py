@@ -291,6 +291,19 @@ class MegatronBaseModel(NLPModel):
             for param in param_group['params']:
                 params.append(param)
         return params
+    
+    def get_parameters_with_grad(self):
+        """
+        Get all parameters with grad from optimizer param groups
+        """
+        params = []
+        for param_group in self._optimizer_param_groups:
+            for param in param_group['params']:
+                if (
+                    param.grad is not None
+                ):  # Adapter training with pp>1 can result in params with no grads
+                    params.append(param)
+        return params
 
     def configure_gradient_clipping(self, *args, **kwargs):
         """PTL hook to configure gradients.
@@ -314,14 +327,10 @@ class MegatronBaseModel(NLPModel):
         else:
             if self.megatron_amp_o2:
                 # grep fp32 master parameters for gradient clipping
-                parameters = self._optimizer.get_parameters()
+                parameters = self._optimizer.get_parameters_with_grad()
             else:
-                parameters = self._get_parameters()
-            grad_norm = clip_grad_norm_fp32(parameters=parameters, max_norm=clip_val)
-
-        def _log_grad_norm(log_fn, grad_norm):
-            log_fn('grad_norm', grad_norm.cpu(), rank_zero_only=True)
-        xm.add_step_closure(_log_grad_norm, (self.log, grad_norm.detach(),))
+                parameters = self.get_parameters_with_grad()
+            grad_norm = clip_grad_norm_fp32(parameters=parameters, max_norm=clip_val, optimizer_dtype=torch.double if self.megatron_amp_o2 else torch.float32)
 
     def allreduce_gradients(self):
         """Reduce gradients across data parallel ranks.
