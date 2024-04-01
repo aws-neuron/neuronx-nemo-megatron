@@ -21,6 +21,7 @@ trainer:
   enable_model_summary: False # default PTL callback for this does not support model parallelism, instead we log manually
 
 exp_manager:
+  log_local_rank_0_only: True # reduce file system access pressure
   create_tensorboard_logger: True
   explicit_log_dir: null
   exp_dir: null
@@ -158,6 +159,7 @@ model:
   # Wraps your chosen optimizer with a Zero Redundancy Optimizer
   # Partitions optimizer states across ranks reducing memory consumption
   wrap_with_zero: False
+  zero_use_master_weight: False
 
   ## Transformer Engine
   transformer_engine: False
@@ -222,3 +224,4 @@ model:
 
 
 enable_recovery_time_instrumentation: False # default to not printing the detailing timing for recovery
+async_checkpointing: False # default to not use async checkpointing

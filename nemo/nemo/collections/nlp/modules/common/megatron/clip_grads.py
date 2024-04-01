@@ -23,6 +23,7 @@ else:
     from torch._six import inf
 
 from nemo.collections.nlp.modules.common.megatron.module import param_is_not_shared
+from nemo.utils import logging
 
 try:
     # import amp_C
@@ -68,7 +69,7 @@ if HAVE_APEX:
         pass
 
 
-def clip_grad_norm_fp32(parameters, max_norm, norm_type=2):
+def clip_grad_norm_fp32(parameters, max_norm, norm_type=2, optimizer_dtype=torch.float32):
     """Clips gradient norm of an iterable of parameters whose gradients
        are in fp32.
     This is adapted from torch.nn.utils.clip_grad.clip_grad_norm_ and
@@ -108,17 +109,22 @@ def clip_grad_norm_fp32(parameters, max_norm, norm_type=2):
             grads_for_norm.append(grad)
 
     if not grads_for_norm:
-        raise ValueError(f"No grads found, please disable gradient clipping {xm.get_ordinal()}")
+        logging.warning(f"No grads found, consider disabling gradient clipping  {xm.get_ordinal()}")
+        #raise ValueError(f"No grads found, please disable gradient clipping {xm.get_ordinal()}")
 
     # Norm parameters.
     max_norm = float(max_norm)
     norm_type = float(norm_type)
     # total_norm = 0.0
-    total_norm = torch.cuda.FloatTensor([float(0.0)])
+    if optimizer_dtype == 'torch.double':
+        total_norm = torch.cuda.DoubleTensor([float(0.0)])
+    else:
+        total_norm = torch.cuda.FloatTensor([float(0.0)])
 
     # Calculate norm.
     if norm_type == inf:
-        total_norm = max(grad.abs().max() for grad in grads_for_norm)
+        if grads_for_norm:  # grads_for_norm can be empty for adapter training with pp>1
+            total_norm = max(grad.abs().max() for grad in grads_for_norm)
         total_norm_cuda = torch.cuda.FloatTensor([float(total_norm)])
         # Take max across all model-parallel GPUs.
         torch.distributed.all_reduce(
@@ -140,15 +146,22 @@ def clip_grad_norm_fp32(parameters, max_norm, norm_type=2):
             # )
             # # Since we will be summing across data parallel groups,
             # # we need the pow(norm-type).
-            # total_norm = grad_norm ** norm_type
-            for grad in grads_for_norm:
-                grad_norm = torch.norm(grad, norm_type)
-                total_norm += grad_norm ** norm_type
-
+            if grads_for_norm:  # grads_for_norm can be empty for adapter training with pp>1
+                for grad in grads_for_norm:
+                    grad_norm = torch.norm(grad, norm_type)
+                    total_norm += grad_norm ** norm_type
+            else:
+                grad_norm = torch.cuda.FloatTensor([float(0.0)])
+                total_norm = grad_norm ** norm_type
+            
         else:
-            for grad in grads_for_norm:
-                grad_norm = torch.norm(grad, norm_type)
-                total_norm += grad_norm ** norm_type
+            if grads_for_norm:
+                for grad in grads_for_norm:
+                    grad_norm = torch.norm(grad, norm_type)
+                    total_norm += grad_norm ** norm_type
+            else:
+                grad_norm = torch.cuda.FloatTensor([float(0.0)])
+                total_norm = grad_norm ** norm_type
 
         # Sum across all model-parallel GPUs.
         torch.distributed.all_reduce(
@@ -165,8 +178,9 @@ def clip_grad_norm_fp32(parameters, max_norm, norm_type=2):
     # if clip_coeff < 1.0:
     #     dummy_overflow_buf = torch.cuda.IntTensor([0])
     #     multi_tensor_applier(amp_C.multi_tensor_scale, dummy_overflow_buf, [grads, grads], clip_coeff)
-    for g in grads:
-        g.data.mul_(torch.where(clip_coeff < 1, clip_coeff, torch.tensor(1., device=xm.xla_device())))
+    if grads:  # grads can be empty for adapter training.
+        for g in grads:
+            g.data.mul_(torch.where(clip_coeff < 1, clip_coeff, torch.tensor(1., device=xm.xla_device(), dtype=optimizer_dtype)))
 
     xm.mark_step()
     return total_norm
