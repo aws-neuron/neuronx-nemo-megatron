@@ -102,7 +102,7 @@ def save(data, path, should_save=True, partition=0, num_partitions=1, saver=None
       Default: False
   """
   if saver is None:
-      saver = SimplerSaver()
+      saver = SimpleSaver()
   ref_data = _rewrite_data(_get_tensors_folder(path), data, should_save, partition, num_partitions, saver)
   if should_save:
     saver.add_save_task(ref_data, path)

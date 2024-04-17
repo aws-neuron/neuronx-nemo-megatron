@@ -83,8 +83,7 @@ def convert_checkpoint(p, args, config):
         "self_attention.dense.weight": (1, "self_attn.o_proj.weight", 1, 0),
         "post_attention_layernorm.weight": (0, "post_attention_layernorm.weight", None, 0),
         "self_attention.core_attention.rotary_emb.inv_freq": (0, "self_attn.rotary_emb.inv_freq", None, 0),
-        "mlp.dense_h_to_4h.weight": (1, "mlp.gate_proj.weight", 0, 0),
-        "mlp.dense_h_to_4h_2.weight": (1, "mlp.up_proj.weight", 0, 0),
+        "mlp.dense_h_to_4h.weight": (1, "mlp.gate_proj_up_proj.weight", 0, 0),
         "mlp.dense_4h_to_h.weight": (1, "mlp.down_proj.weight", 1, 0),
         "model.language_model.encoder.final_layernorm.weight": (0, "model.norm.weight", None, 0),
         "model.language_model.output_layer.weight": (1, "lm_head.weight", 0, 0),
@@ -102,7 +101,7 @@ def convert_checkpoint(p, args, config):
     model_llama = {}
     for _path in model_paths:
         print(f'Loading {_path}')
-        ts = torch.load(_path)
+        ts = torch.load(_path, map_location='cpu')
         model_llama.update(ts)
     print(len(model_llama))
 
@@ -117,9 +116,15 @@ def convert_checkpoint(p, args, config):
         model_llama[f'model.layers.{i}.self_attn.query.weight'] = q
         model_llama[f'model.layers.{i}.self_attn.key_value.weight'] = torch.cat([k, v], dim=0)
 
+        gate_proj = model_llama[f'model.layers.{i}.mlp.gate_proj.weight']
+        up_proj = model_llama[f'model.layers.{i}.mlp.up_proj.weight']
+        model_llama[f'model.layers.{i}.mlp.gate_proj_up_proj.weight'] = torch.cat([gate_proj, up_proj], dim=0)
+
         model_llama.pop(f'model.layers.{i}.self_attn.q_proj.weight')
         model_llama.pop(f'model.layers.{i}.self_attn.k_proj.weight')
         model_llama.pop(f'model.layers.{i}.self_attn.v_proj.weight')
+        model_llama.pop(f'model.layers.{i}.mlp.gate_proj.weight')
+        model_llama.pop(f'model.layers.{i}.mlp.up_proj.weight')
 
     for i in range(TP):
 

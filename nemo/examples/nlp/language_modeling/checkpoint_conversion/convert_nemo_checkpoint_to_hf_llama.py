@@ -30,6 +30,7 @@ def fix_query_key_value_ordering(param, checkpoint_version, num_splits, num_head
     param = param.view(*input_shape)
     return param
 
+
 def get_tp_pp_degree(path_to_checkpoints):
 
     dir_name = PurePath(path_to_checkpoints).name
@@ -125,8 +126,7 @@ def convert_checkpoint(config_file,
         "self_attention.dense.weight": (1, "self_attn.o_proj.weight", 1, 0),
         "post_attention_layernorm.weight": (0, "post_attention_layernorm.weight", None, 0),
         "self_attention.core_attention.rotary_emb.inv_freq": (0, "self_attn.rotary_emb.inv_freq", None, 0),
-        "mlp.dense_h_to_4h.weight": (1, "mlp.gate_proj.weight", 0, 0),
-        "mlp.dense_h_to_4h_2.weight": (1, "mlp.up_proj.weight", 0, 0),
+        "mlp.dense_h_to_4h.weight": (1, "mlp.gate_proj_up_proj.weight", 0, 0),
         "mlp.dense_4h_to_h.weight": (1, "mlp.down_proj.weight", 1, 0),
         "final_layernorm.weight": (0, "model.norm.weight", None, 0),
         "output_layer.weight": (1, "lm_head.weight", 0, 0),  # this is shared
@@ -215,6 +215,13 @@ def convert_checkpoint(config_file,
                 hf_key_v = f"{br_key}{ln_idx}.self_attn.v_proj.weight"
                 size_per_seg = hf_model[hf_key].shape[0] // 3
                 hf_model[hf_key_q], hf_model[hf_key_k], hf_model[hf_key_v] = torch.split(hf_model[hf_key], size_per_seg, dim=0)
+                hf_model.pop(hf_key)
+
+            if "dense_h_to_4h" in k:
+                hf_key_gate_proj = f"{br_key}{ln_idx}.mlp.gate_proj.weight"
+                hf_key_up_proj = f"{br_key}{ln_idx}.mlp.up_proj.weight"
+                size_per_seg = hf_model[hf_key].shape[0] // 2
+                hf_model[hf_key_gate_proj], hf_model[hf_key_up_proj] = torch.split(hf_model[hf_key], size_per_seg, dim=0)
                 hf_model.pop(hf_key)
 
     path = Path(output_path)

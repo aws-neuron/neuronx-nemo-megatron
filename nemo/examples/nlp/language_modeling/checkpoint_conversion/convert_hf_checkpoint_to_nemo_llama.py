@@ -47,8 +47,7 @@ def convert_checkpoint(p):
         "self_attention.dense.weight": (1, "self_attn.o_proj.weight", 1, 0),
         "post_attention_layernorm.weight": (0, "post_attention_layernorm.weight", None, 0),
         "self_attention.core_attention.rotary_emb.inv_freq": (0, "self_attn.rotary_emb.inv_freq", None, 0),
-        "mlp.dense_h_to_4h.weight": (1, "mlp.gate_proj.weight", 0, 0),
-        "mlp.dense_h_to_4h_2.weight": (1, "mlp.up_proj.weight", 0, 0),
+        "mlp.dense_h_to_4h.weight": (1, "mlp.gate_proj_up_proj.weight", 0, 0),
         "mlp.dense_4h_to_h.weight": (1, "mlp.down_proj.weight", 1, 0),
         "model.language_model.encoder.final_layernorm.weight": (0, "model.norm.weight", None, 0),
         "model.language_model.output_layer.weight": (1, "lm_head.weight", 0, 0),
@@ -78,9 +77,15 @@ def convert_checkpoint(p):
         v = model_llama[f'model.layers.{i}.self_attn.v_proj.weight']
         model_llama[f'model.layers.{i}.self_attn.query_key_value.weight'] = torch.cat([q, k, v], dim=0)
 
+        gate_proj = model_llama[f'model.layers.{i}.mlp.gate_proj.weight']
+        up_proj = model_llama[f'model.layers.{i}.mlp.up_proj.weight']
+        model_llama[f'model.layers.{i}.mlp.gate_proj_up_proj.weight'] = torch.cat([gate_proj, up_proj], dim=0)
+
         model_llama.pop(f'model.layers.{i}.self_attn.q_proj.weight')
         model_llama.pop(f'model.layers.{i}.self_attn.k_proj.weight')
         model_llama.pop(f'model.layers.{i}.self_attn.v_proj.weight')
+        model_llama.pop(f'model.layers.{i}.mlp.gate_proj.weight')
+        model_llama.pop(f'model.layers.{i}.mlp.up_proj.weight')
 
     for p in range(PP):
         for i in range(TP):
