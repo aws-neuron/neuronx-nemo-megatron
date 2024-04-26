@@ -4,17 +4,19 @@
 #   and the OMPI world size
 import re
 import os
-##os.environ['PMIX_HOSTNAME'] = "test-mpi-dumpenv-worker-1"
-##os.environ['OMPI_COMM_WORLD_SIZE'] = "2"
-this_host = os.environ.get("PMIX_HOSTNAME", "")
-s = re.search(r"^(.*-worker)-\d+", this_host)
-if not s:
+import subprocess
+
+if not os.environ.get("PMIX_HOSTNAME"):
     raise Exception("Error: This script should be run via mpirun on EKS")
+
+this_host = subprocess.check_output(["hostname", "--fqdn"]).decode().strip()
+s = re.search(r"^(.*-worker)-\d+(.*)", this_host)
 host_prefix = s.group(1)
-world_size = int(os.environ.get("OMPI_COMM_WORLD_SIZE", "0"))
+host_suffix = s.group(2)
+world_size = int(os.environ.get("OMPI_COMM_WORLD_SIZE", "1"))
 
 hosts = []
 for x in range(world_size):
-    hosts.append(f"{host_prefix}-{x}.{host_prefix}.default.svc")
+    hosts.append(f"{host_prefix}-{x}{host_suffix}")
 
 print(" ".join(hosts))
