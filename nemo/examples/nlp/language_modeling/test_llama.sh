@@ -72,8 +72,8 @@ $MAYBE_COMPILE torchrun $DISTRIBUTED_ARGS megatron_gpt_pretraining.py  \
     model.wrap_with_zero=$wrap_with_zero \
     model.zero_use_master_weight=$zero_use_master_weight \
     exp_manager.create_tensorboard_logger=$CREATE_TB_LOGGER \
-    exp_manager.resume_if_exists=False \
-    exp_manager.resume_ignore_no_checkpoint=False \
+    exp_manager.resume_if_exists=True \
+    exp_manager.resume_ignore_no_checkpoint=True \
     exp_manager.create_checkpoint_callback=$CHECKPOINT_CALLBACK \
     exp_manager.explicit_log_dir=$EXPLICIT_LOGDIR \
     +exp_manager.checkpoint_callback_params.train_time_interval=36000 \
@@ -81,3 +81,5 @@ $MAYBE_COMPILE torchrun $DISTRIBUTED_ARGS megatron_gpt_pretraining.py  \
 
 # Note: to resume training using a checkpoint, please add the following configuration above, adjusting for your checkpoint path
 #    model.resume_from_checkpoint='/efs/checkpoint/megatron_gpt--step\=1085-consumed_samples\=69632.0-last.ckpt' \
+#    +exp_manager.checkpoint_callback_params.train_time_interval=36000 is in seconds and will cause checkpoints to be created every
+#    10 hours. Change this appropriately for your use case.
