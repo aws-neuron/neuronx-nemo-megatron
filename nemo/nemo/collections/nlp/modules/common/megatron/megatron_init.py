@@ -52,7 +52,10 @@ except:
 try:
     import torch_xla.core.xla_model as xm
     #(TODO)getting global worldsize, change to local, assuming TP only for now
-    torch.cuda.device_count = lambda : xm.xrt_world_size()
+    if tuple(map(int, torch.__version__.split(".")[:2])) >= tuple(map(int, "2.1".split("."))):
+        torch.cuda.device_count = lambda : int(os.getenv('WORLD_SIZE', '1'))
+    else:
+        torch.cuda.device_count = lambda : xm.xrt_world_size()
     torch.cuda.set_device = lambda x: None
     torch.cuda.is_available = lambda : False
     HAVE_XLA=True

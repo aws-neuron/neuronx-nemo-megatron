@@ -117,6 +117,9 @@ model:
   log_gradient_norm: False # Logs gradient norm across model parallel ranks
   save_logits: False # Saves logits in numpy array of dimensions batch x sequence_length x vocab_size
   save_logits_interval: 0 # Step interval at which to save logits to disk - Note should be Zero Indexed
+  # Comma separated string (i.e. \'0:4,1-2:8,-1:4\') where left of colon is pp rank and right is number of layers for that rank
+  # We only support passing in all pp ranks or just first and last, and you can also pass in ranges of numbers separated with '-'
+  flexible_pipeline_parallel_stages: null 
 
   ## Activation Checkpointing
   # NeMo Megatron supports 'selective' activation checkpointing where only the memory intensive part of attention is checkpointed.
@@ -329,3 +332,4 @@ model:
 
 enable_recovery_time_instrumentation: False # default to not printing the detailing timing for recovery
 async_checkpointing: False
+enable_checkpoint_removal_protection: True  # whether to make sure current checkpoint has been fully saved before removing previous checkpoint (which will incur cost for synchronization)

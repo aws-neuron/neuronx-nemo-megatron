@@ -12,12 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FIM_PREFIX = "<fim_prefix>"
-FIM_MIDDLE = "<fim_middle>"
-FIM_SUFFIX = "<fim_suffix>"
-FIM_PAD = "<fim_pad>"
-EOD = "<|endoftext|>"
-
 from abc import ABC, abstractmethod
 from typing import List
 

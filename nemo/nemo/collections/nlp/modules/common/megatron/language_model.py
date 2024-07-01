@@ -105,7 +105,9 @@ def get_language_model(
     position_freq_base=10000,
     position_abf_factor=1,
     num_kv_heads=None,
-    sliding_window=None
+    sliding_window=None,
+    flexible_pipeline_parallel_stages=None,
+    use_flash_attention=False,
 ):
     """Build language model and return along with the key to save."""
 
@@ -188,7 +190,9 @@ def get_language_model(
         position_freq_base=position_freq_base,
         position_abf_factor=position_abf_factor,
         num_kv_heads=num_kv_heads,
-        sliding_window=sliding_window
+        sliding_window=sliding_window,
+        flexible_pipeline_parallel_stages=flexible_pipeline_parallel_stages,
+        use_flash_attention=use_flash_attention,
     )
     logging.trace(f"In get_language_model() leave TransformerLanguageModel()", trace_type="recovery_time")
 
@@ -499,7 +503,9 @@ class TransformerLanguageModel(MegatronModule):
         position_freq_base=10000,
         position_abf_factor=1,
         num_kv_heads=None,
-        sliding_window=None
+        sliding_window=None,
+        flexible_pipeline_parallel_stages=None,
+        use_flash_attention=False,
     ):
         super(TransformerLanguageModel, self).__init__(share_token_embeddings=share_embeddings_and_output_weights)
 
@@ -523,7 +529,8 @@ class TransformerLanguageModel(MegatronModule):
         self.position_abf_factor = position_abf_factor
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
         self.sequence_parallel = sequence_parallel
-        self.rotary_percentage=rotary_percentage
+        self.flexible_pipeline_parallel_stages = flexible_pipeline_parallel_stages
+        self.rotary_percentage = rotary_percentage
         assert 0 < rotary_percentage <= 1
 
         if kv_channels is None:
@@ -619,7 +626,9 @@ class TransformerLanguageModel(MegatronModule):
             max_position_embeddings=self.max_position_embeddings,
             rotary_percentage=self.rotary_percentage,
             num_kv_heads=num_kv_heads,
-            sliding_window=sliding_window
+            sliding_window=sliding_window,
+            flexible_pipeline_parallel_stages=flexible_pipeline_parallel_stages,
+            use_flash_attention=use_flash_attention,
         )
         logging.trace(f"In TransformerLanguageModel() create encoder done", trace_type="recovery_time")
         self._encoder_key = 'encoder'
@@ -665,6 +674,8 @@ class TransformerLanguageModel(MegatronModule):
                 position_abf_factor=self.position_abf_factor,
                 max_position_embeddings=self.max_position_embeddings,
                 rotary_percentage=self.rotary_percentage,
+                flexible_pipeline_parallel_stages=flexible_pipeline_parallel_stages,
+                use_flash_attention=use_flash_attention,
             )
             self._decoder_key = 'decoder'
 

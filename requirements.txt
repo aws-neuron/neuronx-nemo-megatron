@@ -33,3 +33,4 @@ mecab-python3
 protobuf~=3.20
 datasets
 dill==0.3.7
+huggingface-hub<0.23

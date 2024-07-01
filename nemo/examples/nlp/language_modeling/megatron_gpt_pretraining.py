@@ -50,7 +50,10 @@ def main(cfg) -> None:
     with_distributed_adam = cfg.model.optim.get('name') == 'distributed_fused_adam'
     plugins = []
     
-    nlp_xla_checkpoint_io = NLPCheckpointIO(cfg.get("async_checkpointing", False))
+    nlp_xla_checkpoint_io = NLPCheckpointIO(
+            async_save=cfg.get("async_checkpointing", False),
+            enable_removal_protection=cfg.get("enable_checkpoint_removal_protection", True),
+        )
     cluster_environment = None
     if os.environ.get("TORCHELASTIC_RUN_ID") is not None:
         cluster_environment=TorchElasticEnvironment()

@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Generator, Iterator, List, Mapping, Optional, Sized, Union, Iterable
 from datetime import timedelta
 from functools import partial
+import gc
 
 import pytorch_lightning as pl
 import torch
@@ -90,6 +91,8 @@ from nemo.core.optim import MainParamsOptimizerWrapper
 from nemo.utils import AppState, logging
 from nemo.utils.model_utils import inject_model_parallel_rank
 from nemo.utils.cast_utils import cast_all
+import nemo.collections.nlp.parts.serialization as xser
+from .checkpoint_storage import create_checkpoint_storage
 
 try:
     from apex.transformer import parallel_state
@@ -352,16 +355,12 @@ class NLPFitLoop(FitLoop):
         self.trainer._call_strategy_hook("on_train_start")
 
 
-def _create_zero1_optimizer_states_directory(checkpoint_filepath: str, dp_rank: int):
+def _create_zero1_optimizer_states_directory(checkpoint_filepath: str, dp_group: torch.distributed.ProcessGroup):
     dirname = os.path.dirname(checkpoint_filepath)
-    dirname = os.path.join(dirname, "optim")
-    if not os.path.exists(dirname):
-        xm.rendezvous("ensure all worker process enter this branch")
-        if dp_rank == 0:
-            os.makedirs(dirname)
-        xm.rendezvous("make directory for optimizer states")
-        dirname = os.path.join(dirname, "dp_rank_{:03d}".format(dp_rank))
-        os.makedirs(dirname)
+    checkpoint_dir = create_checkpoint_storage(dirname)
+    checkpoint_dir.create_shared_dir("optim", exist_ok=True, process_group=dp_group)
+    dp_rank = dp_group.rank() if dp_group else 0
+    checkpoint_dir.create_dir(os.path.join("optim", "dp_rank_{:03d}".format(dp_rank)))
 
 
 def _get_zero1_optimizer_states_filepath(checkpoint_filepath: str, dp_rank: int):
@@ -369,54 +368,58 @@ def _get_zero1_optimizer_states_filepath(checkpoint_filepath: str, dp_rank: int)
     basename = os.path.basename(checkpoint_filepath)
     dirname = os.path.join(dirname, "optim")
     dirname = os.path.join(dirname, "dp_rank_{:03d}".format(dp_rank))
-    return os.path.join(dirname, basename.replace("ckpt", "optimizer_states"))
+    if '-last.ckpt' in basename:
+        new_basename = basename.replace('-last.ckpt', '-optimizer_states-last.ckpt')
+    else:
+        new_basename = basename.replace('.ckpt', '-optimizer_states.ckpt')
+    return os.path.join(dirname, new_basename)
+
+
+def _remove_checkpoint_filepath_impl(checkpoint_filepath):
+    dirname = os.path.dirname(checkpoint_filepath)
+    filename = os.path.basename(checkpoint_filepath)
+    checkpoint_dir = create_checkpoint_storage(dirname)
+ 
+    try:
+        checkpoint_dir.remove_file(filename)
+    except:
+        # swallow any exception
+        pass
+
+    try:
+        checkpoint_dir.remove_dir(filename + ".tensors")
+    except:
+        # swallow any exception
+        pass
 
 
 def _remove_checkpoint_impl(checkpoint_filepath):
     dp_rank = parallel_state.get_data_parallel_rank()
     if dp_rank == 0:
-        if os.path.exists(checkpoint_filepath):
-            try:
-                os.unlink(checkpoint_filepath)
-            except:
-                # swallow any exception
-                pass
+        _remove_checkpoint_filepath_impl(checkpoint_filepath)
 
-        if os.path.exists(f"{checkpoint_filepath}.tensors"):
-            try:
-                shutil.rmtree(f"{checkpoint_filepath}.tensors")
-            except:
-                # swallow any exception
-                pass
-
-    optimizer_states_filepath = _get_zero1_optimizer_states_filepath(checkpoint_filepath, dp_rank)
-    if os.path.exists(optimizer_states_filepath):
-        try:
-            os.unlink(optimizer_states_filepath)
-        except:
-            pass
-
-    if os.path.exists(optimizer_states_filepath + ".tensors"):
-        try:
-            shutil.rmtree(optimizer_states_filepath + ".tensors")
-        except:
-            pass
+    zero1_optimizer_states_filepath = _get_zero1_optimizer_states_filepath(checkpoint_filepath, dp_rank)
+    _remove_checkpoint_filepath_impl(zero1_optimizer_states_filepath)
 
 
 def _bulk_save(items):
-    for tensor, path in items:
-        torch.save(tensor, path)
+    for tensor, checkpoint_dir, basename in items:
+        checkpoint_dir.save_object(tensor, basename)
 
 class NLPCheckpointIOState:
     '''
     class to store state of checkpoint saving
     '''
 
-    def __init__(self, async_save: bool):
+    def __init__(self, async_save: bool, enable_removal_protection: bool=True):
         '''
         async_save : whether to use asynchronous checkpoint saving. Default no
+        enable_removal_protection: whether to make sure new checkpoint has been fully saved before deleting
+             previous checkpoint. This will incur some performance cost, and might not be necessary
+             if user save multiple checkpoints. Default True
        '''
         self._async_save = async_save
+        self._enable_removal_protection = enable_removal_protection
         self._current_tag = None
 
         if self._async_save:
@@ -445,30 +448,51 @@ class NLPCheckpointIOState:
         self._current_tag = tag
 
     def add_save_task(self, tensor, path: str):
+        dirname = os.path.dirname(path)
+        basename = os.path.basename(path)
+        checkpoint_dir = create_checkpoint_storage(dirname)
         if self._async_save:
-            self._save_items.append( (tensor, path) )
+            self._save_items.append( (tensor, checkpoint_dir, basename) )
         else:
-            torch.save(tensor, path)
+            checkpoint_dir.save_object(tensor, basename)
+
+    def _dealloc_tensor_host_memory_callback(self, future):
+        """ Future callback to asynchronous deallocate the tensor host memory
+        """
+        self._save_items = []
+        gc.collect()
 
     def end(self):
         if self._async_save:
             if len(self._save_items) > 0:
-                self._save_tasks.append(self._executor.submit(_bulk_save, self._save_items))
+                # Init new executor b/c class functions can't be passed to self._exector as they implicity reference self
+                executor = concurrent.futures.ProcessPoolExecutor(max_workers=1)
+                future = executor.submit(_bulk_save, self._save_items)
                 if torch.distributed.get_rank() == 0:
                     logging.info(f"Async saving of checkpoint {self._current_tag} requested")
+
+                # After save async process is finished, use callback to async dealloc the tensor host memory
+                future.add_done_callback(self._dealloc_tensor_host_memory_callback)
+                self._save_tasks.append(future)
         else:
-            # this rendezous point ensures the entire checkpoint has been saved (not just the local portion).
-            # It prevents the pre-mature deletion of previous checkpoint because user will call add_remove_task()
-            # to delete previous checkpoint upon return of this function,
-            # Async saving does not need this rendezvous point, because when async saving is used,
-            # add_remove_task() does not remove file, it only put the file in a queue
-            xm.rendezvous("Synchronous saving of scheckpoint done")
-            logging.info(f"Synchronous saving of checkpoint {self._current_tag} completed")
+            if self._enable_removal_protection:
+                # this rendezous point ensures the entire checkpoint has been saved (not just the local portion).
+                # It prevents the pre-mature deletion of previous checkpoint because user will call add_remove_task()
+                # to delete previous checkpoint upon return of this function,
+                # Async saving does not need this rendezvous point, because when async saving is used,
+                # add_remove_task() does not remove file, it only put the file in a queue
+                xm.rendezvous("Synchronous saving of scheckpoint done")
+                logging.info(f"Synchronous saving of checkpoint {self._current_tag} fully completed")
+            else:
+                logging.info(f"Synchronous saving of checkpoint {self._current_tag} on rank {torch.distributed.get_rank()} completed")
 
     def add_remove_task(self, filepath):
         if self._async_save:
             self._remove_paths.append(filepath)
-            logging.info(f"Previous checkpoint {os.path.basename(filepath)} will be removed after {self._current_tag} is fully saved")
+            if self._enable_removal_protection:
+                logging.info(f"Previous checkpoint {os.path.basename(filepath)} will be removed after {self._current_tag} is fully saved")
+            else:
+                logging.info(f"Processes will start removing checkpoint {os.path.basename(filepath)} after it finish saving its own portion of {self._current_tag}.")
         else:
             logging.info(f"Removing previous checkpoint {os.path.basename(filepath)}")
             _remove_checkpoint_impl(filepath)
@@ -481,13 +505,17 @@ class NLPCheckpointIOState:
                 if f.exception():
                     raise f.exception()
             self._save_tasks = []
+            # This is already asynchronously invoked in _dealloc_tensor_host_memory_callback
+            # However, this needs to be kept for the sync checkpointing case
             self._save_items = []
 
-        # This rendezvous point ensures the entire checkpoint has been saved
-        # It prevent use from prematurely removing previous checkpoint.
-        xm.rendezvous(f"Async saving checkpoint done")
-        if torch.distributed.get_rank() == 0:
-            logging.info(f"Async saving of checkpoint {self._current_tag} completed")
+        if self._enable_removal_protection:
+            # This rendezvous point ensures the entire checkpoint has been saved
+            # It prevent use from prematurely removing previous checkpoint.
+            xm.rendezvous(f"Async saving checkpoint done")
+            logging.info(f"Async saving of checkpoint {self._current_tag} fully completed")
+        else:
+            logging.info(f"Async saving of checkpoint {self._current_tag} on rank {torch.distributed.get_rank()} completed")
 
         if len(self._remove_paths) == 0:
             logging.info(f"No previous checkpoints to remove.")
@@ -527,37 +555,69 @@ class NLPCheckpointIOState:
             logging.info(f"Async removal of checkpoint {os.path.basename(path)} completed")
 
 
+class ParallelSaver:
+
+    def __init__(self, rank, world_size, process_group, iostate):
+        self._rank = rank
+        self._world_size = world_size
+        assert world_size == 1 or process_group
+        self._process_group = process_group
+        self._iostate = iostate
+
+    def rank(self):
+        return self._rank
+
+    def world_size(self):
+        return self._world_size
+
+    def process_group(self):
+        return self._process_group
+
+    def add_save_task(self, obj, path):
+        self._iostate.add_save_task(obj, path)
+
 
 class NLPCheckpointIO(XLACheckpointIO):
-    def __init__(self, async_save=False):
+    def __init__(self, async_save: bool = False, enable_removal_protection: bool = True, avoid_redundant_weights_saving: bool = False):
          super().__init__()
-         self._iostate = NLPCheckpointIOState(async_save)
+         self._iostate = NLPCheckpointIOState(async_save=async_save, enable_removal_protection=enable_removal_protection)
+         self._avoid_redundant_weights_saving = avoid_redundant_weights_saving
 
     def load_checkpoint(self, checkpoint_path: _PATH, load_type_xser: bool) -> Dict[str, Any]:
         """ PTL override to accomodate model parallel checkpoints """
         checkpoint_path = inject_model_parallel_rank(checkpoint_path)
-        from .serialization import load
 
-        if load_type_xser:
-            loaded_checkpoint = load(checkpoint_path, parallel_state.get_data_parallel_rank(),
-                                     parallel_state.get_data_parallel_world_size(),
-                                     parallel_state.get_data_parallel_group())
+        zero1_optimizer_states_filepath = _get_zero1_optimizer_states_filepath(checkpoint_path, parallel_state.get_data_parallel_rank())
+        zero1_optimizer_states_dir = create_checkpoint_storage(os.path.dirname(zero1_optimizer_states_filepath))
+        if zero1_optimizer_states_dir.file_exists(os.path.basename(zero1_optimizer_states_filepath)):
+            zero1_optimizer_states = self._load(zero1_optimizer_states_filepath, load_type_xser, process_group=None, ignore_tensor_data=False)
+
+            ignore_tensor_data = self._zero1_optimizer_states_have_master_weights(zero1_optimizer_states) and load_type_xser
+            if ignore_tensor_data:
+                logging.info(f"Because zero1 optimizer states contain master weights, tensor data will be ignored when loading {checkpoint_path}")
+
+            loaded_checkpoint = self._load(checkpoint_path, load_type_xser, process_group=parallel_state.get_data_parallel_group(), ignore_tensor_data=ignore_tensor_data)
+
+            self._add_optimizer_states_to_checkpoint(loaded_checkpoint, zero1_optimizer_states)
+
         else:
-            loaded_checkpoint = super().load_checkpoint(checkpoint_path)
-
-        if self._is_checkpoint_using_zero1_optimizer(loaded_checkpoint):
-            optimizer_states_filepath = _get_zero1_optimizer_states_filepath(checkpoint_path, parallel_state.get_data_parallel_rank())
-            if not os.path.exists(optimizer_states_filepath):
-                raise RuntimeError("When loading zero1 optimizer states, the file {optimizer_states_filepath} is missing")
-
-            if load_type_xser:
-                optimizer_states = load(optimizer_states_filepath)
-            else:
-                optimizer_states = torch.load(optimizer_states_filepath).to_xla_device()
-
-            self._add_optimizer_states_to_checkpoint(loaded_checkpoint, optimizer_states)
+            loaded_checkpoint = self._load(checkpoint_path, load_type_xser, process_group=parallel_state.get_data_parallel_group(), ignore_tensor_data=False)
+            if self._is_checkpoint_using_zero1_optimizer(loaded_checkpoint):
+                raise RuntimeError(f"When loading checkpoint that used zero1 optimizer, the file {zero1_optimizer_states_filepath} is missing")
 
         return loaded_checkpoint
+
+    def _zero1_optimizer_states_have_master_weights(self, zero1_optimizer_states):
+        assert type(zero1_optimizer_states) == list and len(zero1_optimizer_states) > 0
+        return 'sharded_master_weights' in zero1_optimizer_states[0]
+
+    def _load(self, path: str, load_type_xser: bool, process_group, ignore_tensor_data: bool=False) -> Dict[str, Any]:
+        if load_type_xser:
+            loaded = xser.load(path, process_group, ignore_tensor_data)
+        else:
+            loaded = torch.load(path)
+
+        return loaded
 
     def _exclude_callbacks_from_checkpoint(self, checkpoint: Dict[str, Any]):
         return {k: v for k, v in checkpoint.items() if k != "callbacks"}
@@ -572,6 +632,17 @@ class NLPCheckpointIO(XLACheckpointIO):
         optimizer_states = checkpoint["optimizer_states"]
         del checkpoint["optimizer_states"]
         return optimizer_states
+
+    def _copy_untrained_buffers_to_zero1_optimizer_states(self, checkpoint: Dict[str, Any], zero1_optimizer_states):
+        if "state_dict" not in checkpoint:
+            raise RuntimeError("Error: while copying untrained buffers to optimizer state, state_dict is not in checkpoint")
+
+        if "untrained_buffer_names" not in checkpoint["state_dict"]:
+            raise RuntimeError("Error: while copying untrained buffers to optimizer state, untrained_buffer_names is not in checkpoint's state_dict")
+
+        zero1_optimizer_states[0]["untrained_buffers"] = {}
+        for buffer_name in checkpoint["state_dict"]["untrained_buffer_names"]:
+            zero1_optimizer_states[0]["untrained_buffers"][buffer_name] = checkpoint["state_dict"][buffer_name]
 
     def save_checkpoint(
         self, checkpoint: Dict[str, Any], filepath: _PATH, save_type_xser: bool, storage_options: Optional[Any] = None
@@ -598,10 +669,9 @@ class NLPCheckpointIO(XLACheckpointIO):
         def ensure_directory_exists(filename):
             """Build filename's path if it does not already exists."""
             dirname = os.path.dirname(filename)
-            if not os.path.exists(dirname):
-                os.makedirs(dirname)
+            checkpoint_dir = create_checkpoint_storage(dirname)
+            checkpoint_dir.create_dir(".")
 
-        import torch_xla.utils.serialization as xser
         import torch_xla.core.xla_model as xm
         # PTL override to accomodate model parallel checkpoints
         filepath = inject_model_parallel_rank(filepath)
@@ -617,24 +687,37 @@ class NLPCheckpointIO(XLACheckpointIO):
             save_bf16 = self.lightning_module.cfg.save_bf16
         except:
             save_bf16 = False
-        from .serialization import save
 
         self._iostate.begin(os.path.basename(filepath))
         checkpoint = self._exclude_callbacks_from_checkpoint(checkpoint)
         if self._is_checkpoint_using_zero1_optimizer(checkpoint):
             # when zero1 optimizer is used. each worker process has unique optimizer state
             # therefore need to be saved separately
-            optimizer_states = self._remove_optimizer_states_from_checkpoint(checkpoint)
-            _create_zero1_optimizer_states_directory(filepath, parallel_state.get_data_parallel_rank())
-            optimizer_states_filepath = _get_zero1_optimizer_states_filepath(filepath, parallel_state.get_data_parallel_rank())
+            zero1_optimizer_states = self._remove_optimizer_states_from_checkpoint(checkpoint)
+            _create_zero1_optimizer_states_directory(filepath, parallel_state.get_data_parallel_group())
+            zero1_optimizer_states_filepath = _get_zero1_optimizer_states_filepath(filepath, parallel_state.get_data_parallel_rank())
         else:
-            optimizer_states = None
+            zero1_optimizer_states = None
 
         if save_type_xser:
-            save(checkpoint, filepath, parallel_state.get_data_parallel_rank()==0,
-                 parallel_state.get_data_parallel_rank(), parallel_state.get_data_parallel_world_size(), self._iostate)
-            if optimizer_states:
-                save(optimizer_states, optimizer_states_filepath, True, 0, 1, self._iostate)
+            saver = ParallelSaver(
+                    parallel_state.get_data_parallel_rank(),
+                    parallel_state.get_data_parallel_world_size(),
+                    parallel_state.get_data_parallel_group(),
+                    self._iostate
+                )
+
+            if zero1_optimizer_states:
+                ignore_tensor_data = self._avoid_redundant_weights_saving and self._zero1_optimizer_states_have_master_weights(zero1_optimizer_states)
+                if ignore_tensor_data:
+                    logging.info("Because zero1 optimizer states have master weights, weights in model will not be saved")
+                    # copy untrained buffers to zero1 optimizer states so it has full set of weights.
+                    self._copy_untrained_buffers_to_zero1_optimizer_states(checkpoint, zero1_optimizer_states)
+                xser.save(checkpoint, filepath, saver, ignore_tensor_data=ignore_tensor_data)
+                optimizer_states_saver = ParallelSaver(0, 1, None, self._iostate)
+                xser.save(zero1_optimizer_states, zero1_optimizer_states_filepath, optimizer_states_saver, ignore_tensor_data=False)
+            else:
+                xser.save(checkpoint, filepath, saver, ignore_tensor_data=False)
         else:
             for tp_rank in range(0, parallel_state.get_tensor_model_parallel_world_size()):
                 my_tp_rank = parallel_state.get_tensor_model_parallel_rank()
@@ -650,10 +733,10 @@ class NLPCheckpointIO(XLACheckpointIO):
                     cpu_data = xm._maybe_convert_to_cpu(checkpoint, convert=True)
                     ensure_directory_exists(filepath)
                     self._iostate.add_save_task(cpu_data, filepath)
-
-                if optimizer_states and my_tp_rank == tp_rank:
+                
+                if zero1_optimizer_states and my_tp_rank == tp_rank:
                     optimizer_states_cpu_data = xm._maybe_convert_to_cpu(optimizer_states, convert=True)
-                    self._iostate.add_save_task(optimizer_states_cpu_data, optimizer_states_filepath)
+                    self._iostate.add_save_task(optimizer_states_cpu_data, zero1_optimizer_states_filepath)
 
         self._iostate.end()
 

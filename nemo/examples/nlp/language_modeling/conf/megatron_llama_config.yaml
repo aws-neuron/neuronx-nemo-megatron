@@ -119,6 +119,10 @@ model:
   sync_batch_comm: False # Enable stream synchronization after each p2p communication between pipeline stages
   log_parameter_norm: True # Logs parameter norm across model parallel ranks
   log_gradient_norm: True # Logs gradient norm across model parallel ranks
+  # Comma separated string (i.e. \'0:4,1-2:8,-1:4\') where left of colon is pp rank and right is number of layers for that rank
+  # We only support passing in all pp ranks or just first and last, and you can also pass in ranges of numbers separated with '-'
+  flexible_pipeline_parallel_stages: null 
+
 
   ## Activation Checkpointing
   # NeMo Megatron supports 'selective' activation checkpointing where only the memory intensive part of attention is checkpointed.
@@ -160,6 +164,7 @@ model:
   # Partitions optimizer states across ranks reducing memory consumption
   wrap_with_zero: False
   zero_use_master_weight: False
+  zero_use_fp32_grad_accum: False
 
   ## Transformer Engine
   transformer_engine: False
@@ -331,3 +336,4 @@ model:
 
 enable_recovery_time_instrumentation: False # default to not printing the detailing timing for recovery
 async_checkpointing: False # default to not use async checkpointing
+enable_checkpoint_removal_protection: True  # whether to make sure current checkpoint has been fully saved before removing previous checkpoint (which will incur cost for synchronization)

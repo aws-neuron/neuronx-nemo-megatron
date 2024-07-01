@@ -175,6 +175,8 @@ class GPTModel(MegatronModule):
         position_abf_factor=1,
         num_kv_heads=None,
         sliding_window=None,
+        flexible_pipeline_parallel_stages=None,
+        use_flash_attention=False,
     ):
 
         super(GPTModel, self).__init__(share_token_embeddings=share_embeddings_and_output_weights)
@@ -269,7 +271,9 @@ class GPTModel(MegatronModule):
             position_freq_base=position_freq_base,
             position_abf_factor=position_abf_factor,
             num_kv_heads=num_kv_heads,
-            sliding_window=sliding_window
+            sliding_window=sliding_window,
+            flexible_pipeline_parallel_stages=flexible_pipeline_parallel_stages,
+            use_flash_attention=use_flash_attention,
         )
 
         logging.trace(f"In GPTModel._init_() leave get_language_model()", trace_type="recovery_time")

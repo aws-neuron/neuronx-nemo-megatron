@@ -5,7 +5,8 @@ import numpy as np
 import torch
 import os
 import glob
-
+from multiprocessing import Pool
+from functools import partial
 
 def fix_query_key_value_ordering(
         param, checkpoint_version, num_splits, num_heads, hidden_size
@@ -32,11 +33,33 @@ def fix_query_key_value_ordering(
     return param
 
 
-def convert_checkpoint(p):
-    with open(args.config_file, "r") as f:
-        config = json.load(f)
-    print(config)
+def convert_checkpoint(p, args, config):
+    TP = args.tp_degree
+    PP = args.pp_degree
 
+    out_models = convert_state_dict_for_pp_rank(p, args.path_to_checkpoint, config, TP, PP, args.save_bf16)
+
+    for i in range(args.tp_degree):
+        output_folder = args.output_path
+        if TP > 1:
+            if PP > 1:
+                output_folder = output_folder + f"/tp_rank_{i:02d}"
+            else:
+                output_folder = output_folder + f"/mp_rank_{i:02d}"
+        if PP > 1:
+            output_folder = output_folder + f"_pp_rank_{p:03d}"
+        if not os.path.exists(output_folder):
+            os.makedirs(output_folder)
+        checkpoint_name = f"{output_folder}/llmv2_converted_checkpoint--step={args.step}.ckpt"
+        if args.is_xser:
+            from nemo.collections.nlp.parts.serialization import save
+            save(out_models[i], checkpoint_name)
+        else:
+            torch.save(out_models[i], checkpoint_name)  # , (not master_only), global_master=True)
+    print("Done saving Megatron checkpoint")
+
+
+def convert_state_dict_for_pp_rank(p, path_to_checkpoint, config, TP, PP, save_bf16):
     br_key = "layers."  # Used to filter all transformer layers except layernorm
 
     translation = {
@@ -59,9 +82,7 @@ def convert_checkpoint(p):
         split, br_k, dim, transpose = v
         reverse_translation[br_k] = (split, k, dim, transpose)
 
-    TP = args.tp_degree
-    PP = args.pp_degree
-    model_paths = sorted(glob.glob(f'{args.path_to_checkpoint}/pytorch_model*.bin'))
+    model_paths = sorted(glob.glob(f'{path_to_checkpoint}/pytorch_model*.bin'))
     model_llama = {}
     for _path in model_paths:
         print(f'Loading {_path}')
@@ -82,103 +103,98 @@ def convert_checkpoint(p):
         model_llama.pop(f'model.layers.{i}.self_attn.k_proj.weight')
         model_llama.pop(f'model.layers.{i}.self_attn.v_proj.weight')
 
-    for p in range(PP):
-        for i in range(TP):
-            print(f"=== PP {p}, TP {i} ===")
-            nemo_model = {}
-            for k, v in model_llama.items():
-                # print(f">>> {k}")
-                if "attention.masked_bias" in k:
-                    # We don't want to copy attention mask bias, since its a constant of 1e4
+    out_models = {}
+    for i in range(TP):
+        print(f"=== PP {p}, TP {i} ===")
+        nemo_model = {}
+        for k, v in model_llama.items():
+            # print(f">>> {k}")
+            if "attention.masked_bias" in k:
+                # We don't want to copy attention mask bias, since its a constant of 1e4
+                continue
+            if br_key in k:
+                parts = k.split(br_key)[1].split(".")
+                layer_number = parts[0]
+                if int(layer_number) >= (config["num_hidden_layers"] // PP) * (p + 1) or int(layer_number) < (
+                        config["num_hidden_layers"] // PP) * p:
                     continue
-                if br_key in k:
-                    parts = k.split(br_key)[1].split(".")
-                    layer_number = parts[0]
-                    if int(layer_number) >= (config["num_hidden_layers"] // PP) * (p + 1) or int(layer_number) < (
-                            config["num_hidden_layers"] // PP) * p:
-                        continue
-                    k = ".".join(parts[1:])
-                    if k == "attn.bias":
-                        continue
-                    split, key, dim, tranpose = reverse_translation[k]
-                    layer_number = layer_number if PP == 1 else str(
-                        int(layer_number) % (config["num_hidden_layers"] // PP))
-                    key = "model.language_model.encoder.layers." + layer_number + "." + key
-                    nemo_model[key] = v
-                    if tranpose:
-                        nemo_model[key] = torch.transpose(
-                            nemo_model[key], 0, 1
-                        )
+                k = ".".join(parts[1:])
+                if k == "attn.bias":
+                    continue
+                split, key, dim, tranpose = reverse_translation[k]
+                layer_number = layer_number if PP == 1 else str(
+                    int(layer_number) % (config["num_hidden_layers"] // PP))
+                key = "model.language_model.encoder.layers." + layer_number + "." + key
+                nemo_model[key] = v
+                if tranpose:
+                    nemo_model[key] = torch.transpose(
+                        nemo_model[key], 0, 1
+                    )
 
-                    if "query_key_value" in key:
-                        heads = config["num_attention_heads"]
-                        hidden_size_per_head = config["hidden_size"] // heads
-                        nemo_model[key] = fix_query_key_value_ordering(
-                            nemo_model[key], 2.0, 3, heads, hidden_size_per_head
-                        )
+                if "query_key_value" in key:
+                    heads = config["num_attention_heads"]
+                    hidden_size_per_head = config["hidden_size"] // heads
+                    nemo_model[key] = fix_query_key_value_ordering(
+                        nemo_model[key], 2.0, 3, heads, hidden_size_per_head
+                    )
 
-                    if split:
-                        tp_last_dim_size = nemo_model[key].shape[dim] // TP
-                        if dim:  # First or last dimension to shard
-                            nemo_model[key] = nemo_model[key][
-                                              ..., i * tp_last_dim_size: (i + 1) * tp_last_dim_size
-                                              ].clone()
-                        else:
-                            nemo_model[key] = nemo_model[key][
-                                              i * tp_last_dim_size: (i + 1) * tp_last_dim_size, ...
-                                              ].clone()
-
-                    print(key, split, nemo_model[key].shape, v.shape)
-                else:
-                    split, key, dim, transpose = reverse_translation[k]
-                    if "embed_tokens" in k and p == 0:
-                        # Padding to make it divisble by TP degree
-                        if v.shape[0] % TP > 0:
-                            x = torch.nn.functional.pad(
-                                v, (0, (TP - v.shape[0] % TP), 0, 0)
-                            )
-                        else:
-                            x = v
-                        last_dim_size = x.shape[0]
-                        tp_last_dim_size = last_dim_size // TP
-                        nemo_model[key] = x[
+                if split:
+                    tp_last_dim_size = nemo_model[key].shape[dim] // TP
+                    if dim:  # First or last dimension to shard
+                        nemo_model[key] = nemo_model[key][
+                                          ..., i * tp_last_dim_size: (i + 1) * tp_last_dim_size
+                                          ].clone()
+                    else:
+                        nemo_model[key] = nemo_model[key][
                                           i * tp_last_dim_size: (i + 1) * tp_last_dim_size, ...
                                           ].clone()
-                        print(key, split, nemo_model[key].shape, v.shape)
-                    elif "model.norm" in k and p == (PP - 1):
-                        nemo_model[key] = v
-                        print(key, split, nemo_model[key].shape, v.shape)
-                    elif "lm_head" in k and p == (PP - 1):  # Not used
-                        if split:
-                            tp_last_dim_size = v.shape[dim] // TP
-                            if dim:
-                                nemo_model[key] = v[..., i * tp_last_dim_size:(i + 1) * tp_last_dim_size].clone()
-                            else:
-                                nemo_model[key] = v[i * tp_last_dim_size:(i + 1) * tp_last_dim_size, ...].clone()
-                        print(key, split, nemo_model[key].shape, v.shape)
 
-            if args.save_bf16:
-                for _k in nemo_model:
-                    nemo_model[_k] = nemo_model[_k].to(dtype=torch.bfloat16, device='cpu')
-            out_model = {"state_dict": nemo_model, 'pytorch-lightning_version': '1.9.5', 'epoch': 0, 'global_step': 0}
-
-            output_folder = args.output_path
-            if TP > 1:
-                if PP > 1:
-                    output_folder = output_folder + f"/tp_rank_{i:02d}"
-                else:
-                    output_folder = output_folder + f"/mp_rank_{i:02d}"
-            if PP > 1:
-                output_folder = output_folder + f"_pp_rank_{p:03d}"
-            if not os.path.exists(output_folder):
-                os.makedirs(output_folder)
-            if args.is_xser:
-                from nemo.collections.nlp.parts.serialization import save
-                save(out_model, f"{output_folder}/model_optim_rng.ckpt")
+                print(key, split, nemo_model[key].shape, v.shape)
             else:
-                torch.save(out_model,
-                           f"{output_folder}/model_optim_rng.ckpt")  # , (not master_only), global_master=True)
-            print("Done saving Megatron checkpoint")
+                split, key, dim, transpose = reverse_translation[k]
+                if "embed_tokens" in k and p == 0:
+                    # Padding to make it divisble by TP degree
+                    if v.shape[0] % TP > 0:
+                        x = torch.nn.functional.pad(
+                            v, (0, (TP - v.shape[0] % TP), 0, 0)
+                        )
+                    else:
+                        x = v
+                    last_dim_size = x.shape[0]
+                    tp_last_dim_size = last_dim_size // TP
+                    nemo_model[key] = x[
+                                      i * tp_last_dim_size: (i + 1) * tp_last_dim_size, ...
+                                      ].clone()
+                    print(key, split, nemo_model[key].shape, v.shape)
+                elif "model.norm" in k and p == (PP - 1):
+                    nemo_model[key] = v
+                    print(key, split, nemo_model[key].shape, v.shape)
+                elif "lm_head" in k and p == (PP - 1):  # Not used
+                    if split:
+                        tp_last_dim_size = v.shape[dim] // TP
+                        if dim:
+                            nemo_model[key] = v[..., i * tp_last_dim_size:(i + 1) * tp_last_dim_size].clone()
+                        else:
+                            nemo_model[key] = v[i * tp_last_dim_size:(i + 1) * tp_last_dim_size, ...].clone()
+                    print(key, split, nemo_model[key].shape, v.shape)
+
+        if save_bf16:
+            for _k in nemo_model:
+                nemo_model[_k] = nemo_model[_k].to(dtype=torch.bfloat16, device='cpu')
+
+        # TODO: fix the hardcoded keys
+        out_model = {"state_dict": nemo_model, 'pytorch-lightning_version': '1.9.5', 'epoch': 0, 'global_step': 0}
+
+        # merge dense_h_to_4h and dense_h_to_4h_2 for Trn checkpoint
+        h_to_4h_keys = [k for k in out_model['state_dict'].keys() if 'dense_h_to_4h' in k and 'dense_h_to_4h_2' not in k]
+        for k in h_to_4h_keys:
+            k_1 = k.replace('dense_h_to_4h', 'dense_h_to_4h_2')
+            print(f"merging {k} ({out_model['state_dict'][k].shape}) and {k_1} ({out_model['state_dict'][k_1].shape})")
+            out_model['state_dict'][k] = torch.concat([out_model['state_dict'][k], out_model['state_dict'][k_1]], dim=0)
+            out_model['state_dict'].pop(k_1)
+
+        out_models[i] = out_model
+    return out_models
 
 
 if __name__ == "__main__":
@@ -222,6 +238,25 @@ if __name__ == "__main__":
         action="store_true",
         help="Enable serialized saving",
     )
+    parser.add_argument(
+        "--step",
+        type=int,
+        help="step used for this checkpoint",
+        required=True
+    )
 
     args = parser.parse_args()
-    convert_checkpoint(args)
+
+    with open(args.config_file, "r") as f:
+        config = json.load(f)
+
+    PP = args.pp_degree
+    f = partial(convert_checkpoint, args=args, config=config)
+
+    # parallel processing
+    with Pool(PP) as p:
+        p.map(f, [i for i in range(PP)])
+
+    # serial processing (use for debugging)
+    # for p in range(PP):
+    #     f(p)
