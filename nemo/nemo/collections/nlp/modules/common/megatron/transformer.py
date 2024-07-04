@@ -14,6 +14,7 @@
 # limitations under the License.
 
 """Transformer."""
+import ast
 import math
 from contextlib import nullcontext
 from typing import Any, Callable, Optional, Tuple
@@ -48,6 +49,7 @@ from nemo.collections.nlp.modules.common.megatron.module import MegatronModule
 from nemo.collections.nlp.modules.common.megatron.rotary_pos_embedding import RotaryEmbedding, apply_rotary_pos_emb
 from nemo.collections.nlp.modules.common.megatron.utils import ApexGuardDefaults, attention_mask_func, erf_gelu
 from nemo.collections.nlp.modules.common.megatron.utils import openai_gelu as openai_gelu_func
+from nemo.collections.nlp.modules.common.megatron.neuron_kernels import nki_flash_attn_func
 from nemo.core import adapter_mixins
 from nemo.utils import logging
 from transformers.utils import is_torch_tpu_available
@@ -88,6 +90,19 @@ except:
             logging.warning(
                 "Transformer Engine was not found. transformer_engine.pytorch.transformer.TransformerLayer will not work. Please see the NeMo README for installation instructions: https://github.com/NVIDIA/NeMo#megatron-gpt."
             )
+
+
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """
+    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
+    num_query_groups, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
+    """
+    batch, num_query_groups, slen, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_query_groups, n_rep, slen, head_dim)
+    return hidden_states.reshape(batch, num_query_groups * n_rep, slen, head_dim)
+
 
 """ We use the following notation throughout this file:
      h: hidden size
@@ -449,7 +464,8 @@ class CoreAttention(MegatronModule):
         rotary_percentage=1.0,
         rotary_layer=None,
         num_kv_heads=None,
-        sliding_window=None
+        sliding_window=None,
+        use_flash_attention=False,
     ):
 
         super(CoreAttention, self).__init__()
@@ -520,6 +536,8 @@ class CoreAttention(MegatronModule):
         # on average it should not be partition dependent.
         self.attention_dropout = torch.nn.Dropout(attention_dropout)
 
+        self.use_flash_attention = use_flash_attention
+
     def forward(
         self,
         query_layer,
@@ -570,6 +588,32 @@ class CoreAttention(MegatronModule):
         if self.position_embedding_type == 'rope':
             cos, sin = self.rotary_emb(value_layer, seq_len=query_layer.shape[0])
             query_layer, key_layer = apply_rotary_pos_emb(query_layer, key_layer, cos, sin, offset=0)
+
+
+        if self.use_flash_attention:
+            if not self.sequence_parallel:
+                raise NotImplementedError("The flash attention without the sequence parallel is not supported yet.")
+
+            # [sq, b, np, hn] -> [b, np, sq, hn]
+            query_layer = query_layer.permute([1, 2, 0, 3])
+            # [sk, b, np, hn] -> [b, np, sk, hn]
+            key_layer = key_layer.permute([1, 2, 0, 3])
+            # [sk, b, np, hn] -> [b, np, sk, hn]
+            value_layer = value_layer.permute([1, 2, 0, 3])
+            
+            if self.use_gqa:
+                key_layer = repeat_kv(key_layer, self.num_query_head_per_kv_head)
+                value_layer = repeat_kv(value_layer, self.num_query_head_per_kv_head)
+
+            context_layer = nki_flash_attn_func(query_layer, key_layer, value_layer, dropout_p=self.attention_dropout.p)
+
+            # [b, np, sq, hn] --> [sq, b, np, hn]
+            context_layer = context_layer.permute(2, 0, 1, 3).contiguous()
+            # [sq, b, np, hn] --> [sq, b, hp]
+            new_context_layer_shape = context_layer.size()[:-2] + (self.hidden_size_per_partition,)
+            context_layer = context_layer.view(*new_context_layer_shape)
+            return context_layer
+
 
         if self.multi_query_attention:
             # [sq, b, np, hn] -> [b, np * sq, hn]
@@ -757,7 +801,8 @@ class ParallelAttention(MegatronModule, adapter_mixins.AdapterModuleMixin):
         rotary_percentage=1.0,
         rotary_layer=None,
         num_kv_heads=None,
-        sliding_window=None
+        sliding_window=None,
+        use_flash_attention=False,
     ):
         super(ParallelAttention, self).__init__()
 
@@ -902,6 +947,7 @@ class ParallelAttention(MegatronModule, adapter_mixins.AdapterModuleMixin):
             rotary_layer=rotary_layer,
             num_kv_heads=num_kv_heads,
             sliding_window=sliding_window,
+            use_flash_attention=use_flash_attention,
         )
 
 
@@ -1278,6 +1324,7 @@ class ParallelChunkedCrossAttention(MegatronModule):
         headscale=False,
         gradient_accumulation_fusion=False,
         normalize_attention_scores=True,
+        use_flash_attention=False,
     ):
         super(ParallelChunkedCrossAttention, self).__init__()
         self.cross_attention = ParallelAttention(
@@ -1487,7 +1534,8 @@ class ParallelTransformerLayer_(MegatronModule, adapter_mixins.AdapterModuleMixi
         rotary_percentage=1.0,
         rotary_layer=None,
         num_kv_heads=None,
-        sliding_window=None
+        sliding_window=None,
+        use_flash_attention=False,
     ):
         super(ParallelTransformerLayer_, self).__init__()
 
@@ -1506,7 +1554,7 @@ class ParallelTransformerLayer_(MegatronModule, adapter_mixins.AdapterModuleMixi
         self.position_interpolation_factor = position_interpolation_factor
         self.position_freq_base = position_freq_base
         self.position_abf_factor = position_abf_factor
-        self.rotary_percentage=rotary_percentage
+        self.rotary_percentage = rotary_percentage
         self.set_accepted_adapter_types([LinearAdapterConfig._target_, ParallelLinearAdapterConfig._target_])
 
         if not bias and bias_dropout_add_fusion:
@@ -1583,7 +1631,8 @@ class ParallelTransformerLayer_(MegatronModule, adapter_mixins.AdapterModuleMixi
                 rotary_percentage=self.rotary_percentage,
                 rotary_layer=rotary_layer,
                 num_kv_heads=num_kv_heads,
-                sliding_window=sliding_window
+                sliding_window=sliding_window,
+                use_flash_attention=use_flash_attention,
             )
             logging.trace("In ParallelTransfomerLayer() create ParallelAttention for encoder done", trace_type="recovery_time")
 
@@ -1656,6 +1705,7 @@ class ParallelTransformerLayer_(MegatronModule, adapter_mixins.AdapterModuleMixi
                 gradient_accumulation_fusion=gradient_accumulation_fusion,
                 normalize_attention_scores=normalize_attention_scores,
                 transfer_with_static_ring=transfer_with_static_ring,
+                use_flash_attention=use_flash_attention,
             )
             logging.trace("In ParallelTransfomerLayer() create ParallelAttention for decoder done", trace_type="recovery_time")
 
@@ -2057,7 +2107,8 @@ class ParallelTransformerLayer(ParallelTransformerLayer_):
         rotary_percentage=1.0,
         rotary_layer=None,
         num_kv_heads=None,
-        sliding_window=None
+        sliding_window=None,
+        use_flash_attention=False,
     ):
         super(ParallelTransformerLayer, self).__init__(
             init_method=init_method,
@@ -2108,7 +2159,8 @@ class ParallelTransformerLayer(ParallelTransformerLayer_):
             rotary_percentage=rotary_percentage,
             rotary_layer=rotary_layer,
             num_kv_heads=num_kv_heads,
-            sliding_window=sliding_window
+            sliding_window=sliding_window,
+            use_flash_attention=use_flash_attention,
         )
 
         if precision == 32:
@@ -2339,7 +2391,9 @@ class ParallelTransformer(MegatronModule):
         max_position_embeddings=4096,
         rotary_percentage=1.0,
         num_kv_heads=None,
-        sliding_window=None
+        sliding_window=None,
+        flexible_pipeline_parallel_stages=None,
+        use_flash_attention=False,
     ):
         super(ParallelTransformer, self).__init__()
 
@@ -2370,6 +2424,7 @@ class ParallelTransformer(MegatronModule):
         self.activations_checkpoint_granularity = activations_checkpoint_granularity
         self.activations_checkpoint_layers_per_pipeline = activations_checkpoint_layers_per_pipeline
         self.disable_layer_norm_checkpointing = disable_layer_norm_checkpointing
+        self.flexible_pipeline_parallel_stages = flexible_pipeline_parallel_stages
 
         if self.activations_checkpoint_granularity:
             if self.activations_checkpoint_granularity == 'selective':
@@ -2439,7 +2494,7 @@ class ParallelTransformer(MegatronModule):
             activations_checkpoint_granularity == 'selective'
         )  # transformer engine forward allows for more granular selective checkpointing
 
-        if self.model_type == ModelType.encoder_or_decoder:
+        if self.model_type == ModelType.encoder_or_decoder and self.flexible_pipeline_parallel_stages is None:
             assert (
                 num_layers % parallel_state.get_pipeline_model_parallel_world_size() == 0
             ), 'num_layers must be divisible by pipeline_model_parallel_size'
@@ -2544,10 +2599,14 @@ class ParallelTransformer(MegatronModule):
                     rotary_percentage=self.rotary_percentage,
                     rotary_layer=rope,
                     num_kv_heads=num_kv_heads,
-                    sliding_window=sliding_window
+                    sliding_window=sliding_window,
+                    use_flash_attention=use_flash_attention,
                 )
 
         if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
+            if self.flexible_pipeline_parallel_stages:
+                logging.warning("Flexible pipeline parallel stages is not supported for virtual pipeline parallel")
+
             assert num_layers % parallel_state.get_virtual_pipeline_model_parallel_world_size() == 0, (
                 'num_layers_per_stage must be divisible by ' 'virtual_pipeline_model_parallel_size'
             )
@@ -2574,6 +2633,9 @@ class ParallelTransformer(MegatronModule):
                 self.model_type == ModelType.encoder_and_decoder
                 and parallel_state.get_pipeline_model_parallel_world_size() > 1
             ):
+                if self.flexible_pipeline_parallel_stages:
+                    logging.warning("Flexible pipeline parallel stages is not supported for encoder and decoder model type")
+
                 pipeline_rank = parallel_state.get_pipeline_model_parallel_rank()
                 if layer_type == LayerType.encoder:
                     offset = pipeline_rank * self.num_layers
@@ -2581,7 +2643,26 @@ class ParallelTransformer(MegatronModule):
                     num_ranks_in_enc = parallel_state.get_pipeline_model_parallel_split_rank()
                     offset = (pipeline_rank - num_ranks_in_enc) * self.num_layers
             else:
-                offset = parallel_state.get_pipeline_model_parallel_rank() * self.num_layers
+                if self.flexible_pipeline_parallel_stages is not None:
+                    pipeline_parallel_layers_per_rank = self.preprocess_pipeline_parallel_dict(num_layers, self.flexible_pipeline_parallel_stages)
+                    curr_rank = parallel_state.get_pipeline_model_parallel_rank()
+                    if len(pipeline_parallel_layers_per_rank) == 2:
+                        # Last rank needs to multiply offset by the second to last ranks number of layers not its own
+                        first_stage_num_layers = pipeline_parallel_layers_per_rank.get(0) if pipeline_parallel_layers_per_rank.get(0) else self.num_layers
+                        if curr_rank == (parallel_state.get_pipeline_model_parallel_world_size() - 1):
+                            remaining_layers = num_layers - sum(pipeline_parallel_layers_per_rank.values())
+                            remaining_stages = parallel_state.get_pipeline_model_parallel_world_size() - len(pipeline_parallel_layers_per_rank)
+                            prev_stage_num_layers = remaining_layers // remaining_stages
+                            offset = curr_rank * prev_stage_num_layers - (prev_stage_num_layers - first_stage_num_layers)
+                        else: 
+                            # This offset value only works if only the first and/or last stage is specified (no intermediate stages)
+                            offset = curr_rank * self.num_layers - (self.num_layers - first_stage_num_layers)
+                    else:
+                        offset = 0
+                        for i in range(curr_rank):
+                            offset += pipeline_parallel_layers_per_rank[i]                    
+                else:
+                    offset = parallel_state.get_pipeline_model_parallel_rank() * self.num_layers
 
         logging.trace("In ParallelTransformer(), building layers with resume being {resume_from_checkpoint} begin", trace_type="recovery_time")
         self.layers = torch.nn.ModuleList([build_layer(i + 1 + offset) for i in range(self.num_layers)])
@@ -2627,12 +2708,81 @@ class ParallelTransformer(MegatronModule):
                 else:
                     num_layers = num_layers // num_ranks_in_decoder
             elif self.model_type == ModelType.encoder_or_decoder:
-                assert (
-                    num_layers % parallel_state.get_pipeline_model_parallel_world_size() == 0
-                ), 'num_layers must be divisible by pipeline_model_parallel_size'
-                num_layers = num_layers // parallel_state.get_pipeline_model_parallel_world_size()
+                if self.flexible_pipeline_parallel_stages is not None:
+                    # Passed in as a comma separated string of "<rank or range>:<# of layers> i.e 0:1,1-2:4,3:1"
+                    pipeline_parallel_layers_per_rank = self.preprocess_pipeline_parallel_dict(num_layers, self.flexible_pipeline_parallel_stages)
 
+                    # Allow for only first and last rank to be passed in or all ranks to be passed in
+                    assert (
+                        len(pipeline_parallel_layers_per_rank) == parallel_state.get_pipeline_model_parallel_world_size() or
+                        (len(pipeline_parallel_layers_per_rank) == 2 and 
+                        (0 in pipeline_parallel_layers_per_rank) and 
+                        (-1 in pipeline_parallel_layers_per_rank or ((parallel_state.get_pipeline_model_parallel_world_size() - 1) in pipeline_parallel_layers_per_rank)))
+                    ), "For flexible pipeline parallel, ranks must all be specified or only first and last rank."
+
+                    if len(pipeline_parallel_layers_per_rank) == 2:
+                        remaining_layers = num_layers - sum(pipeline_parallel_layers_per_rank.values())
+                        remaining_stages = parallel_state.get_pipeline_model_parallel_world_size() - len(pipeline_parallel_layers_per_rank)
+                        # Check if remaining stages are divisible by the remaining layers not specified in the dict
+                        pipeline_stages = num_layers / parallel_state.get_pipeline_model_parallel_world_size()
+                        last_pp_rank = parallel_state.get_pipeline_model_parallel_world_size() - 1
+                        assert (remaining_layers % remaining_stages == 0), 'Remaining, non-specified pipeline parallel layers must be divisible by (pipeline parallel world size - # layers of non specified stages).'
+                        if parallel_state.get_pipeline_model_parallel_rank() == 0:
+                            num_layers = pipeline_parallel_layers_per_rank[0]
+                        elif parallel_state.get_pipeline_model_parallel_rank() == last_pp_rank:
+                            num_layers = pipeline_parallel_layers_per_rank[last_pp_rank]
+                        else:
+                            num_layers = remaining_layers // remaining_stages
+                    else:
+                        num_layers = pipeline_parallel_layers_per_rank[parallel_state.get_pipeline_model_parallel_rank()]
+                else: 
+                    assert (
+                        num_layers % parallel_state.get_pipeline_model_parallel_world_size() == 0
+                    ), 'num_layers must be divisible by pipeline_model_parallel_size'
+                    num_layers = num_layers // parallel_state.get_pipeline_model_parallel_world_size()
+                
         return num_layers
+
+    def preprocess_pipeline_parallel_dict(self, num_layers, flexible_pipeline_parallel_stages):
+        pp_rank_to_layers = flexible_pipeline_parallel_stages.split(',')
+        output_dict = {}
+        pp_ranks = set()
+
+        # Process each key-value pair
+        for pair in pp_rank_to_layers:
+            key, value = pair.split(':')
+            if '-' in key and key != '-1':
+                # Handle range oxf numbers
+                start, end = key.split('-')
+                if int(end) == -1:
+                    # Handle -1 indexing
+                    end = parallel_state.get_pipeline_model_parallel_world_size() - 1
+                for i in range(int(start), int(end) + 1):
+                    if i in pp_ranks:
+                        assert False, "Passed in duplicate pipeline parallel ranks to flexible pipeline parallel stages."
+                    else:
+                        pp_ranks.add(i)
+                    output_dict[i] = int(value)
+            else:
+                # Handle single number
+                if int(key) == -1:
+                    # Handle -1 indexing
+                    key = parallel_state.get_pipeline_model_parallel_world_size() - 1
+                if int(key) in pp_ranks:
+                    assert False, "Passed in multiple of the same pipeline parallel rank to flexible pipeline parallel stages."
+                else:
+                    pp_ranks.add(int(key))
+                output_dict[int(key)] = int(value)
+        
+        for key in output_dict.keys():
+            assert (key < parallel_state.get_pipeline_model_parallel_world_size()), "Rank given to flexible pipeline parallel is greater than pipeline parallel size."
+        
+        if len(output_dict) > 2 or parallel_state.get_pipeline_model_parallel_world_size() == 2:
+            assert (sum(output_dict.values()) == num_layers), "The sum of given flexible pipeline parallel layers does not equal the total layers."
+
+        logging.info(f"Pipeline parallel ranks to # of layers dict for flexible PP: {output_dict}")
+
+        return output_dict
 
     def _checkpointed_forward(
         self,

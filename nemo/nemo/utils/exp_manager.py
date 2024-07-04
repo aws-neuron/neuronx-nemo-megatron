@@ -46,7 +46,7 @@ from nemo.utils.exceptions import NeMoBaseException
 from nemo.utils.get_rank import is_global_rank_zero
 from nemo.utils.lightning_logger_patch import add_filehandlers_to_pl_logger
 from nemo.utils.model_utils import inject_model_parallel_rank, uninject_model_parallel_rank
-
+from nemo.collections.nlp.parts.checkpoint_storage import create_checkpoint_storage
 
 class NotFoundError(NeMoBaseException):
     """ Raised when a file or folder is not found"""
@@ -132,6 +132,7 @@ class ExpManagerConfig:
     version: Optional[str] = None
     use_datetime_version: Optional[bool] = True
     resume_if_exists: Optional[bool] = False
+    explicit_ckpt_path: Optional[str] = None
     resume_past_end: Optional[bool] = False
     resume_ignore_no_checkpoint: Optional[bool] = False
     # Logging parameters
@@ -315,7 +316,8 @@ def exp_manager(trainer: 'pytorch_lightning.Trainer', cfg: Optional[Union[DictCo
                 cfg.resume_past_end,
                 cfg.resume_ignore_no_checkpoint,
                 cfg.checkpoint_callback_params.dirpath,
-            )
+                cfg.explicit_ckpt_path,
+            )          
         else:
             check_resume(trainer, log_dir, cfg.resume_past_end, cfg.resume_ignore_no_checkpoint)
 
@@ -474,6 +476,7 @@ def check_resume(
     resume_past_end: bool = False,
     resume_ignore_no_checkpoint: bool = False,
     dirpath: str = None,
+    explicit_ckpt_path: str = None,
 ):
     """Checks that resume=True was used correctly with the arguments pass to exp_manager. Sets
     trainer._checkpoint_connector.resume_from_checkpoint_fit_path as necessary.
@@ -489,32 +492,38 @@ def check_resume(
         ValueError: If resume is True, and there were more than 1 checkpoint could found.
     """
 
-    if not log_dir:
-        raise ValueError(f"Resuming requires the log_dir {log_dir} to be passed to exp_manager")
+    if explicit_ckpt_path:
+        checkpoint = explicit_ckpt_path
+    else:
+        if not log_dir:
+            raise ValueError(f"Resuming requires the log_dir {log_dir} to be passed to exp_manager")
 
-    # Use <log_dir>/checkpoints/ unless `dirpath` is set
-    checkpoint_dir = Path(dirpath) if dirpath else Path(Path(log_dir) / "checkpoints")
+        # Use <log_dir>/checkpoints/ unless `dirpath` is set
+        checkpoint_dirname = dirpath if dirpath else os.path.join(log_dir, "checkpoints")
+        checkpoint_dir = create_checkpoint_storage(checkpoint_dirname)
 
-    if not checkpoint_dir.exists():
-        if resume_ignore_no_checkpoint:
-            logging.warning(
-                f"There was no checkpoint folder at checkpoint_dir :{checkpoint_dir}. Training from scratch."
-            )
-            return
-        else:
-            raise NotFoundError(f"There was no checkpoint folder at checkpoint_dir :{checkpoint_dir}. Cannot resume.")
-    all_checkpoints = list(checkpoint_dir.rglob("*.ckpt"))
-    if len(all_checkpoints) == 0:
-        if resume_ignore_no_checkpoint:
-            logging.warning(f"There were no checkpoints found in {checkpoint_dir}. Training from scratch.")
-            return
-        else:
-            raise FileNotFoundError(f"There were no checkpoints found in {checkpoint_dir}. Cannot resume.")
+        if not checkpoint_dir.dir_exists("."):
+            if resume_ignore_no_checkpoint:
+                logging.warning(
+                    f"There was no checkpoint folder at checkpoint_dir :{checkpoint_dirname}. Training from scratch."
+                )
+                return
+            else:
+                raise NotFoundError(f"There was no checkpoint folder at checkpoint_dir :{checkpoint_dirname}. Cannot resume.")
 
-    all_checkpoints.sort(key=os.path.getmtime, reverse=True)
-    checkpoint = all_checkpoints[0]
-    if 'mp_rank' in str(checkpoint) or 'tp_rank' in str(checkpoint):
-        checkpoint = uninject_model_parallel_rank(checkpoint)
+        all_checkpoints = checkpoint_dir.find_files("*.ckpt", search_depth=2, sort_by_mdate=True)
+
+        print(f"all_checkpoints: {all_checkpoints}")
+        if len(all_checkpoints) == 0:
+            if resume_ignore_no_checkpoint:
+                logging.warning(f"There were no checkpoints found in {checkpoint_dir}. Training from scratch.")
+                return
+            else:
+                raise FileNotFoundError(f"There were no checkpoints found in {checkpoint_dir}. Cannot resume.")
+
+        checkpoint = os.path.join(checkpoint_dirname, all_checkpoints[-1])
+        if 'mp_rank' in str(checkpoint) or 'tp_rank' in str(checkpoint):
+            checkpoint = uninject_model_parallel_rank(checkpoint)
 
     logging.info(f"Resuming from {checkpoint}")
 
@@ -890,6 +899,26 @@ class NeMoModelCheckpoint(ModelCheckpoint):
         self._save_topk_checkpoint(trainer, monitor_candidates)
         self._save_last_checkpoint(trainer, monitor_candidates)
 
+    def _save_last_checkpoint(self, trainer, monitor_candidates) -> None:
+        # override _save_last_checkpoint function in ModelCheckpoint class, to skip file
+        if not self.save_last:
+            return
+
+        start_time = time.perf_counter()
+        filepath = self.format_checkpoint_name(monitor_candidates, self.CHECKPOINT_NAME_LAST)
+
+        ## self.file_exists function will call s3 with HeadObject request on all ranks, and because filepath is not tp_rank injected at this time,
+        ## it will result in NoSuchKey errors at the back end, which wastes siginificant s3 TPS quota. Skip the existence check here as
+        ## we will handle the existence check and clean up any conflicting files later in save_checkpoint function in nlp_overrides, and they are handled on dp0 ranks only.
+
+        # set the last model path before saving because it will be part of the state.
+        previous, self.last_model_path = self.last_model_path, filepath
+        self._save_checkpoint(trainer, filepath)
+        if previous and previous != filepath:
+            self._remove_checkpoint(trainer, previous)
+        logging.info(f'Total time elapsed saving last checkpoint at step {trainer.global_step}: '
+                    f'{(time.perf_counter() - start_time):.2f} seconds, rank {torch.distributed.get_rank()}')
+
     def on_train_end(self, trainer, pl_module):
         if trainer.fast_dev_run:
             return None
@@ -906,7 +935,7 @@ class NeMoModelCheckpoint(ModelCheckpoint):
             should_save_last_checkpoint = True
         if should_save_last_checkpoint:
             monitor_candidates = self._monitor_candidates(trainer)
-            super()._save_last_checkpoint(trainer, monitor_candidates)
+            self._save_last_checkpoint(trainer, monitor_candidates)
         # Call parent on_train_end() to save the -last checkpoint
         super().on_train_end(trainer, pl_module)
 

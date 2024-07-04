@@ -254,6 +254,7 @@ class ModelPT(NLPLightningModule, Model):
         # set global vars in AppState
         app_state = AppState()
         self.zero_use_master_weight = cfg.get('zero_use_master_weight', False)
+        self.zero_use_fp32_grad_accum = cfg.get('zero_use_fp32_grad_accum', False)
         # Convert config to a DictConfig
         cfg = model_utils.convert_model_config_to_dict_config(cfg)
 
@@ -770,6 +771,9 @@ class ModelPT(NLPLightningModule, Model):
                                                     optim.AVAILABLE_OPTIMIZERS[optimizer_name],
                                                     optimizer_dtype=torch.double if self.zero_use_master_weight else torch.float32,
                                                     pin_layout=False,
+                                                    use_grad_acc_hook=True if self.zero_use_fp32_grad_accum else False,
+                                                    higher_cc_precision=True if self.zero_use_fp32_grad_accum else False,
+                                                    save_master_weights=True if self.zero_use_master_weight else False,
                                                     grad_clipping=self.trainer.gradient_clip_val is not None and self.trainer.gradient_clip_val != 0,
                                                     max_norm=self.trainer.gradient_clip_val,
                                                     sharding_groups=self.calculate_data_parallel_groups(),
@@ -793,6 +797,17 @@ class ModelPT(NLPLightningModule, Model):
         # Return the optimizer with/without scheduler
         # This return allows multiple optimizers or schedulers to be created
         return self._optimizer, self._scheduler
+
+    def state_dict(self):
+        state_dict_ = super().state_dict()
+        untrained_buffer_names = list()
+        for module_name, module in self.named_modules():
+            for buffer_name, buffer in module.named_buffers():
+                full_name = module_name + "." + buffer_name
+                if full_name in state_dict_:
+                    untrained_buffer_names.append(full_name)
+        state_dict_["untrained_buffer_names"] = untrained_buffer_names
+        return state_dict_
 
     def calculate_data_parallel_groups(self):
         """

@@ -15,6 +15,7 @@
 import itertools
 from typing import Any, List, Optional, Union
 
+import os
 import numpy as np
 import torch
 import time
@@ -161,6 +162,7 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
         self.log_gradient_norm = cfg.get('log_gradient_norm', False)
         self.save_logits = cfg.get('save_logits', False)
         self.save_logits_interval = cfg.get('save_logits_interval', 0)
+        self.should_sync_layer_norm_weights = self.cfg.get("sync_layer_norm_weights", True)
     
         self.throughput = Throughput(10)
     def _build_model(self):
@@ -250,7 +252,9 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
             position_freq_base=self.cfg.get('position_freq_base', 10000),
             position_abf_factor=self.cfg.get('position_abf_factor', 1),
             num_kv_heads=self.cfg.get('num_kv_heads', None),
-            sliding_window=self.cfg.get('sliding_window_size', None)
+            sliding_window=self.cfg.get('sliding_window_size', None),
+            flexible_pipeline_parallel_stages=self.cfg.get('flexible_pipeline_parallel_stages', None),
+            use_flash_attention=self.cfg.get('use_flash_attention', False),
         )
         logging.trace(f"In gpt_model._build_model, leave GPTModel()", trace_type="recovery_time")
         return model
@@ -373,6 +377,11 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
         xm.mark_step()
 
         with torch.no_grad():
+            # all reduce layer norm weights to prevent tp drift
+            # cfg usage is tp +model.sync_layer_norm_weights=False to remove
+            if self.should_sync_layer_norm_weights and self.cfg.get('sequence_parallel', False) and self.cfg.get("tensor_model_parallel_size", 1) > 1 and os.environ.get("NEURON_RT_STOCHASTIC_ROUNDING_EN", None) == '1':
+                self.allreduce_sequence_parallel_weights()
+
             # when using sequence parallelism, the sequence parallel layernorm grads must be all-reduced
             if self.cfg.get('tensor_model_parallel_size', 1) > 1 and self.cfg.get('sequence_parallel', False):
                 self.allreduce_sequence_parallel_gradients()
@@ -584,6 +593,42 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
         """
         return
 
+    def _append_sequence_parallel_module_weights(self, module, weights):
+        """ Helper method for allreduce_sequence_parallel_weights"""
+
+        # Layer norm params will be the sequence parallel attributed params
+        for param in module.parameters():
+            if getattr(self, 'transformer_engine', False):
+                sequence_parallel_param = getattr(param, 'sequence_parallel', False)
+            else:
+                sequence_parallel_param = getattr(param, 'sequence_parallel_enabled', False)
+            if sequence_parallel_param:
+                weights.append(param.data)
+
+    def allreduce_sequence_parallel_weights(self):
+        """ All-reduce layernorm parameters across model parallel nodes when sequence parallelism is used.
+        """
+
+        weights = []
+        if isinstance(self.model, list):
+            for module in self.model:
+                self._append_sequence_parallel_module_weights(module, weights)
+        else:
+            self._append_sequence_parallel_module_weights(self.model, weights)
+
+        # Coalescing all the weights into a single buffer
+        coalesced_weights = torch._utils._flatten_dense_tensors(weights)
+
+        # All-reduce operation
+        torch.distributed.all_reduce(coalesced_weights, group=parallel_state.get_tensor_model_parallel_group())
+
+        # Divide by tp size to average out the weights
+        coalesced_weights /= float(parallel_state.get_tensor_model_parallel_world_size())
+
+        # Uncoalescing the weights back to their original shape
+        for weight, reduced_weight in zip(weights, torch._utils._unflatten_dense_tensors(coalesced_weights, weights)):
+            weight.copy_(reduced_weight)    
+
     def _append_sequence_parallel_module_grads(self, module, grads):
         """ Helper method for allreduce_sequence_parallel_gradients"""
 
@@ -592,9 +637,13 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
                 sequence_parallel_param = getattr(param, 'sequence_parallel', False)
             else:
                 sequence_parallel_param = getattr(param, 'sequence_parallel_enabled', False)
-            if sequence_parallel_param:
-                #megatron_amp_o2 also uses model gradients 
-                grad = param.grad
+            if sequence_parallel_param and param.requires_grad:
+                if self.zero_use_master_weight and self.zero_use_fp32_grad_accum:
+                    assert self.wrap_with_zero
+                    grad = param.main_grad
+                else:
+                    #megatron_amp_o2 also uses model gradients 
+                    grad = param.grad
                 grads.append(grad.data)
 
     def allreduce_sequence_parallel_gradients(self):
@@ -639,8 +688,12 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
             if module.share_token_embeddings:
                 word_embeddings_weight = module.word_embeddings_weight()
 
-                #megatron_amp_o2 also uses model gradients
-                grad = word_embeddings_weight.grad
+                if self.zero_use_master_weight and self.zero_use_fp32_grad_accum:
+                    assert self.wrap_with_zero
+                    grad = word_embeddings_weight.main_grad
+                else:
+                    #megatron_amp_o2 also uses model gradients
+                    grad = word_embeddings_weight.grad
                 torch.distributed.all_reduce(grad, group=parallel_state.get_embedding_group())
 
     def get_forward_output_and_loss_func(self, validation_step=False, all_reduce_losses=False):

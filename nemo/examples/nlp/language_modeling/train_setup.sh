@@ -96,6 +96,16 @@ elif [[ $training_precision == "fp32_ZeroOptMaster" ]];then
     export megatron_amp_O2=false
     export wrap_with_zero=true
     export zero_use_master_weight=true
+elif [[ $training_precision == "fp32_ZeroOptMasterGradAcc" ]];then
+    echo using BF16 SR FWD/BWD with Zero Sharded FP32 Master Weights, FP32 Optimizer states, FP32 GradAccum
+    export XLA_DOWNCAST_BF16=1
+    export NEURON_CC_FLAGS="--model-type transformer --distribution-strategy=llm-training --enable-mixed-precision-accumulation"
+    export OPTIM_NAME=adamw
+    export megatron_amp_O2=false
+    export wrap_with_zero=true
+    export zero_use_master_weight=true
+    export zero_use_fp32_grad_accum=true
+    export NEURON_RT_STOCHASTIC_ROUNDING_EN=0
 elif [[ $training_precision == "megatron_amp_O2" ]]; then
     echo using megatron_amp_O2
     export XLA_DOWNCAST_BF16=1

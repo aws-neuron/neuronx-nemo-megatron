@@ -327,3 +327,4 @@ model:
 
 enable_recovery_time_instrumentation: False # default to not printing the detailing timing for recovery
 async_checkpointing: False # default to not use async checkpointing
+enable_checkpoint_removal_protection: True  # whether to make sure current checkpoint has been fully saved before removing previous checkpoint (which will incur cost for synchronization)
