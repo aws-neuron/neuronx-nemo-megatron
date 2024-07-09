@@ -357,17 +357,18 @@ def convert_checkpoint(args, config, func_conv_param_weights, func_conv_opt_stat
             out_model = {'state_dict': out_models_state_dict[i]['state_dict']}
             out_model.update(out_models_optim_state[i])
 
-            out_model_updated = out_model.copy()
-            out_model_updated["pytorch-lightning_version"] = ckpt_ref['pytorch-lightning_version']
-            out_model_updated['hyper_parameters'] = ckpt_ref['hyper_parameters']
-            out_model_updated['hyper_parameters']['padded_vocab_size'] = 125184
-            out_model_updated['state_dict'] = {}
-            for key, val in out_model['state_dict'].items():
-                out_model_updated['state_dict'].update({key: val})
-                if 'post_attention_layernorm.weight' in key:
-                    layer = re.findall('.*layers\.(\d+)\.post_attention_layernorm\.weight', key)[0]
-                    print(f"adding rotary embedding for layer {layer}")
-                    out_model_updated['state_dict'][f'model.language_model.encoder.layers.{layer}.self_attention.core_attention.rotary_emb.inv_freq'] = rotary_pos
+            if rotary_pos is not None: # For RoPE embeddings
+                out_model_updated = out_model.copy()
+                out_model_updated["pytorch-lightning_version"] = ckpt_ref['pytorch-lightning_version']
+                out_model_updated['hyper_parameters'] = ckpt_ref['hyper_parameters']
+                out_model_updated['hyper_parameters']['padded_vocab_size'] = 125184
+                out_model_updated['state_dict'] = {}
+                for key, val in out_model['state_dict'].items():
+                    out_model_updated['state_dict'].update({key: val})
+                    if 'post_attention_layernorm.weight' in key:
+                        layer = re.findall('.*layers\.(\d+)\.post_attention_layernorm\.weight', key)[0]
+                        print(f"adding rotary embedding for layer {layer}")
+                        out_model_updated['state_dict'][f'model.language_model.encoder.layers.{layer}.self_attention.core_attention.rotary_emb.inv_freq'] = rotary_pos
             
             output_folder = args.output_path
             if TP > 1:
@@ -380,7 +381,7 @@ def convert_checkpoint(args, config, func_conv_param_weights, func_conv_opt_stat
             if not os.path.exists(output_folder):
                 os.makedirs(output_folder)
 
-            checkpoint_name = f"{output_folder}/llmv2_converted_checkpoint--step={args.step}-consumed_samples={args.consumed_samples}.ckpt"
+            checkpoint_name = f"{output_folder}/{args.save_checkpoint_prefix}_converted_checkpoint--step={args.step}-consumed_samples={args.consumed_samples}.ckpt"
             if args.is_xser:
                 from nemo.collections.nlp.parts.serialization import save
                 save(out_model_updated, checkpoint_name)
@@ -468,6 +469,17 @@ def main(args):
         help="reference model to fill in the parameters"
     )
     parser.add_argument(
+        "--reference_hf_ckpt",
+        type=str,
+        help="reference model to fill in the parameters"
+    )
+    parser.add_argument(
+        "--save_checkpoint_prefix",
+        default="llmv2",
+        type=str,
+        help="The prefix to the converted checkpoint name. Default: llmv2",
+    )
+    parser.add_argument(
         "--global_rank",
         type=str,
         help="reference model to fill in the parameters"
@@ -488,9 +500,22 @@ def main(args):
 
     # read in rotary embedding
     ckpt_ref = xser.load(args.reference_trn_ckpt, cpu_only=True)
-    # hard coded for IAD cluster
-    ckpt_ref_hf = torch.load(f'/checkpoints-fsx/movas-sandbox/nemo-470b-prod/HFmodelllm/step_403000/pytorch_model-00001-of-00109.bin')
-    rotary_pos = ckpt_ref_hf['model.layers.0.self_attn.rotary_emb.inv_freq']
+    temp_ref_hf = str(Path(args.config_file).parent / f"pytorch_model-00001-of-{args.num_shards:05d}.bin"))
+
+    if not args.reference_hf_ckpt and os.path.isfile(temp_ref_hf):
+        print(f"Using reference HF checkpoint {temp_ref_hf} found within config.json parent directory")
+        ckpt_ref_hf_path = temp_ref_hf
+    elif args.reference_hf_ckpt:
+        ckpt_ref_hf_path = args.reference_hf_ckpt + f"pytorch_model-00001-of-{args.num_shards:05d}.bin"
+        print(f"Using explicitly specified reference HF checkpoint {ckpt_ref_hf_path}")
+    else:
+        ckpt_ref_hf_path = None
+        print(f"WARNING: No HF checkpoint therefore skipping the addition of RoPE in this step.")
+    
+    rotary_pos = None
+    if ckpt_ref_hf_path is not None:
+        ckpt_ref_hf = torch.load(ckpt_ref_hf_path)
+        rotary_pos = ckpt_ref_hf['model.layers.0.self_attn.rotary_emb.inv_freq']
 
     gqa = 'num_key_value_heads' in config or 'num_query_groups' in config
 
@@ -504,7 +529,7 @@ def main(args):
         )
 
 
-    print(f"Done saving Megatron checkpoint as {args.output_path}/llmv2_converted_checkpoint--step={args.step}-consumed_samples={args.consumed_samples}.ckpt")
+    print(f"Done saving Megatron checkpoint as {args.output_path}/{args.save_checkpoint_prefix}_converted_checkpoint--step={args.step}-consumed_samples={args.consumed_samples}.ckpt")
 
 if __name__ == "__main__":
     main(sys.argv)
