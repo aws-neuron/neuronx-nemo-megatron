@@ -11,6 +11,8 @@ source ./train_setup.sh
 : ${UBS:=1}
 : ${ACT_CHKPNT_GRANULARITY:=full}
 : ${GBS_MULTIPLE:=32}
+: ${LEARNING_RATE:=0.00015}
+
 GBS=$((NTASKS*GBS_MULTIPLE))
 
 : ${TRAIN_ITERS:=300000}
@@ -53,7 +55,7 @@ $MAYBE_COMPILE torchrun $DISTRIBUTED_ARGS megatron_gpt_pretraining.py  \
     model.data.seq_length=$SEQ_LENGTH \
     model.optim.name=$OPTIM_NAME \
     model.optim.capturable=True \
-    model.optim.lr=0.00015 \
+    model.optim.lr=$LEARNING_RATE \
     model.optim.betas=[0.9,0.95] \
     model.optim.weight_decay=0.01 \
     model.optim.sched.name=CosineAnnealing \
