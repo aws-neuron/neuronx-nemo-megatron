@@ -108,6 +108,7 @@ def get_language_model(
     sliding_window=None,
     flexible_pipeline_parallel_stages=None,
     use_flash_attention=False,
+    respect_provided_self_attention_mask: bool = False
 ):
     """Build language model and return along with the key to save."""
 
@@ -193,6 +194,7 @@ def get_language_model(
         sliding_window=sliding_window,
         flexible_pipeline_parallel_stages=flexible_pipeline_parallel_stages,
         use_flash_attention=use_flash_attention,
+        respect_provided_self_attention_mask=respect_provided_self_attention_mask
     )
     logging.trace(f"In get_language_model() leave TransformerLanguageModel()", trace_type="recovery_time")
 
@@ -436,6 +438,7 @@ class TransformerLanguageModel(MegatronModule):
         embedding_dropout_prob: dropout probability for embeddings
         num_tokentypes: size of the token-type embeddings. 0 value
                         will ignore this embedding
+        respect_provided_self_attention_mask: See ParallelTransformerLayer.
     """
 
     def __init__(
@@ -506,6 +509,7 @@ class TransformerLanguageModel(MegatronModule):
         sliding_window=None,
         flexible_pipeline_parallel_stages=None,
         use_flash_attention=False,
+        respect_provided_self_attention_mask: bool = False
     ):
         super(TransformerLanguageModel, self).__init__(share_token_embeddings=share_embeddings_and_output_weights)
 
@@ -629,6 +633,7 @@ class TransformerLanguageModel(MegatronModule):
             sliding_window=sliding_window,
             flexible_pipeline_parallel_stages=flexible_pipeline_parallel_stages,
             use_flash_attention=use_flash_attention,
+            respect_provided_self_attention_mask=respect_provided_self_attention_mask
         )
         logging.trace(f"In TransformerLanguageModel() create encoder done", trace_type="recovery_time")
         self._encoder_key = 'encoder'
