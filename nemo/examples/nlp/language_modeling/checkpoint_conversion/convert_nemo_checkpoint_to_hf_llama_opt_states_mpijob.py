@@ -185,17 +185,29 @@ def convert_checkpoint(
                 return translation_optstate_gqa_gpu, 7
 
     def translate_optstate(k, pp, PP, num_layers_per_pp_rank):
-        """returns (split, key, dim, transpose) given k"""
+        """
+        returns (split, key, dim, transpose) given k
+
+        k: the component index number throughout the whole model. As most components
+        are replicated knowing the number of components in a layer and number of layers
+        in a PP rank. This can retrive the exact component name
+        (i.e QKV opt state, MLP down proj opt state etc) given the component index number (k)
+        """
         opt_param_mapping, num_params_per_layer = get_optimizer_states_param_mapping()
 
         if pp == 0 and k == 0:  # first layer token embeddings
             return 1, "model.embed_tokens.optimizer_state", 0, 0
 
-        if pp == PP - 1 and k == num_params_per_layer * num_layers_per_pp_rank:  # final layernorm
-            return 0, "model.norm.optimizer_state", None, 0
-
-        if pp == PP - 1 and k == num_params_per_layer * num_layers_per_pp_rank + 1:  # final output layer
-            return 1, "lm_head.optimizer_state", 0, 0
+        if PP == 1: # there is only 1 pp rank, so first pp rank is also terminal rank
+            if k == num_params_per_layer * num_layers_per_pp_rank + 1:  # final layernorm
+                return 0, "model.norm.optimizer_state", None, 0
+            if k == num_params_per_layer * num_layers_per_pp_rank + 2:  # final output layer
+                return 1, "lm_head.optimizer_state", 0, 0
+        else:
+            if pp == PP - 1 and k == num_params_per_layer * num_layers_per_pp_rank:  # final layernorm
+                return 0, "model.norm.optimizer_state", None, 0
+            if pp == PP - 1 and k == num_params_per_layer * num_layers_per_pp_rank + 1:  # final output layer
+                return 1, "lm_head.optimizer_state", 0, 0
 
         param_ix = (k - 1) % num_params_per_layer if pp == 0 else k % num_params_per_layer
         return opt_param_mapping[param_ix]

@@ -1117,8 +1117,6 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
             max_steps = self.trainer.max_steps
         elif is_validation:
             max_steps = (self.trainer.max_steps // self.trainer.val_check_interval + 1) * self.trainer.limit_val_batches
-        else:
-            max_steps = self.trainer.limit_test_batches
 
         # Construct the data prefix list for `get_datasets_weights_and_num_samples()`
         # that is of the format [weight1,file_name1,weight2,file_name2,...]
