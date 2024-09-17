@@ -645,7 +645,10 @@ class NLPCheckpointIO(XLACheckpointIO):
             zero1_optimizer_states[0]["untrained_buffers"][buffer_name] = checkpoint["state_dict"][buffer_name]
 
     def save_checkpoint(
-        self, checkpoint: Dict[str, Any], filepath: _PATH, save_type_xser: bool, storage_options: Optional[Any] = None
+        self, checkpoint: Dict[str, Any],
+        filepath: _PATH, save_type_xser: bool,
+        storage_options: Optional[Any] = None,
+        force_dump_checkpoint: bool = False
     ) -> None:
         """Save model/training states as a checkpoint file through state-dump and file-write.
    
@@ -658,6 +661,11 @@ class NLPCheckpointIO(XLACheckpointIO):
             TypeError:
                 If ``storage_options`` arg is passed in
         """
+        if os.environ.get("NEURON_EXTRACT_GRAPHS_ONLY", None) and not force_dump_checkpoint:
+            logging.info(
+                "In a parallel compile job, the checkpoint is going to be invalid",
+                ", hence skipping dumping of checkpoint")
+            return
         if storage_options is not None:
             raise TypeError(
                 "`Trainer.save_checkpoint(..., storage_options=...)` with `storage_options` arg"
@@ -1430,7 +1438,10 @@ class NLPDDPStrategy(TPUSpawnStrategy):
         self, checkpoint: Dict[str, Any], filepath: _PATH, storage_options: Optional[Any] = None
     ) -> None:
         xm.mark_step()
-        self.checkpoint_io.save_checkpoint(checkpoint, filepath, self.is_save_type_xser())
+        self.checkpoint_io.save_checkpoint(
+            checkpoint, filepath, self.is_save_type_xser(),
+            force_dump_checkpoint=self.lightning_module.cfg.get("force_dump_checkpoint", False)
+        )
 
     def is_load_type_xser(self):
         try:

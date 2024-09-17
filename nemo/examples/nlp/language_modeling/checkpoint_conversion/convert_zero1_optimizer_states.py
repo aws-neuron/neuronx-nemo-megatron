@@ -637,18 +637,23 @@ def main(args):
         config=config,
         output_dp_size=args.output_dp_size)
 
+def init_process_group():
+    if torch.__version__.startswith('2'):
+        print("Initializing process group")
+        dist.init_process_group("xla", init_method="pjrt://")
+        print("XLA process group initialized")
+    else:
+        dist.init_process_group("xla", rank=int(os.getenv("RANK", "0")))
+
 def _mp_fn(index, args):
+    if not os.environ.get("WORLD_SIZE"):
+        init_process_group()
     main(args)
     xm.rendezvous("_mp_fn finished")
 
 if __name__ == "__main__":
     if os.environ.get("WORLD_SIZE"):
-        if torch.__version__.startswith('2'):
-            print("Initializing process group")
-            dist.init_process_group("xla", init_method="pjrt://")
-            print("XLA process group initialized")
-        else:
-            dist.init_process_group("xla")
+        init_process_group()
         _mp_fn(0, sys.argv)
     else:
         xmp.spawn(_mp_fn, args=(sys.argv,))

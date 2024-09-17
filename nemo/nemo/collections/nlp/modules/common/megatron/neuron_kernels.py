@@ -39,10 +39,16 @@ except Exception as e:
 def _flash_attn_forward(q, k, v, causal, mixed_precision, seed, dropout_p, softmax_scale):
     bs, num_heads, head_dim, seq = q.shape
     attn_output = torch.zeros(size=(bs, num_heads, seq, head_dim), dtype=q.dtype, device=q.device)
+    if mixed_precision:
+        if os.environ.get("XLA_DOWNCAST_BF16"):
+            lse_dtype = torch.float64
+        else:
+            lse_dtype = torch.float32
+    else:
+        lse_dtype = q.dtype
     lse = torch.zeros(
         size=(bs, num_heads, nl.tile_size.pmax, seq // nl.tile_size.pmax),
-        dtype=torch.float32 if mixed_precision else q.dtype,
-        device=q.device,
+        dtype=lse_dtype, device=q.device,
     )
     if seq < 4096:
         flash_config = FlashConfigShortSeq()
