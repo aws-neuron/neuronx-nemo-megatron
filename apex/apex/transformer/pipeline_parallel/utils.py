@@ -209,7 +209,7 @@ def print_rank_last(message):
 
 
 def param_is_not_shared(param: torch.nn.Parameter) -> bool:
-    return getattr(param, "shared", False)
+    return not getattr(param, "shared", False)
 
 
 def unwrap_model(model, module_instances=(DistributedDataParallel,)):

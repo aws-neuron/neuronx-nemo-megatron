@@ -43,7 +43,7 @@ _logger = get_transformer_logger(__name__)
 
 
 def param_is_not_shared(param: torch.Tensor) -> bool:
-    return getattr(param, "shared", False)
+    return not getattr(param, "shared", False)
 
 
 class MegatronModule(torch.nn.Module):
