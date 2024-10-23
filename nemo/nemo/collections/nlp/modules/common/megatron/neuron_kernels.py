@@ -5,7 +5,10 @@ import neuronxcc.nki.language as nl
 import numpy as np
 import torch
 import torch_xla.core.xla_model as xm
+from collections import defaultdict
+import logging
 
+logger = logging.getLogger(__name__)
 
 def _flash_attn_placeholder(*args, **kwargs):
     raise RuntimeError(
@@ -15,11 +18,9 @@ def _flash_attn_placeholder(*args, **kwargs):
     )
 
 try:
-    from neuronxcc.nki.kernels.attention import flash_attn_bwd, flash_fwd, FlashConfig
+    from neuronxcc.nki.kernels.attention import FlashConfig
+    from neuronxcc.nki.kernels import flash_attn_bwd, flash_fwd
     from torch_neuronx.xla_impl.ops import nki_jit
-
-    _flash_fwd_nki_call = nki_jit()(flash_fwd)
-    _flash_bwd_nki_call = nki_jit()(flash_attn_bwd)
 
     @dataclass(frozen=True)
     class FlashConfigLongSeq(FlashConfig):
@@ -31,8 +32,18 @@ try:
         should_transpose_v: bool = True
         seq_tile_size: int = 512
 
+    try:
+        _flash_fwd_nki_call = nki_jit()(flash_fwd)
+        _flash_bwd_nki_call = nki_jit()(flash_attn_bwd)
+    
+    except Exception as e:
+        logger.info(f"Encountered exception {e}. Trying to import legacy fwd/bwd flash attn functions.")
+        _flash_fwd_nki_call = nki_jit()(flash_fwd._legacy_func)
+        _flash_bwd_nki_call = nki_jit()(flash_attn_bwd._legacy_func)
+
 except Exception as e:
-    _flash_fwd_nki_call = _flash_attn_placeholder
+    logger.info(f"Legacy Flash Attention initialization failed with {e}. Proceeding without Flash Attention support.")    
+    _flash_fwd_nki_call = defaultdict(lambda: _flash_attn_placeholder)
     _flash_bwd_nki_call = _flash_attn_placeholder
 
 
