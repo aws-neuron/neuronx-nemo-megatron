@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass, is_dataclass
+from dataclasses import dataclass, is_dataclass, field
 from typing import Any, Optional
 
 from hydra.utils import instantiate
@@ -145,5 +145,7 @@ class LinearAdapterConfig:
     activation: str = 'swish'
     norm_position: str = 'pre'
     dropout: float = 0.0
-    adapter_strategy: Optional[Any] = adapter_mixin_strategies.ResidualAddAdapterStrategyConfig()
+    adapter_strategy: Optional[Any] = field(
+        default_factory=lambda: adapter_mixin_strategies.ResidualAddAdapterStrategyConfig()
+    )
     _target_: str = "{0}.{1}".format(LinearAdapter.__module__, LinearAdapter.__name__)

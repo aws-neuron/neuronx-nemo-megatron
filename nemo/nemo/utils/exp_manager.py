@@ -19,7 +19,7 @@ import sys
 import time
 import warnings
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
 from shutil import copy, move
@@ -141,21 +141,23 @@ class ExpManagerConfig:
     create_wandb_logger: Optional[bool] = False
     wandb_logger_kwargs: Optional[Dict[Any, Any]] = None
     create_mlflow_logger: Optional[bool] = False
-    mlflow_logger_kwargs: Optional[MLFlowParams] = MLFlowParams()
+    mlflow_logger_kwargs: Optional[MLFlowParams] = field(
+        default_factory=lambda: MLFlowParams()
+    )
     # Checkpointing parameters
     create_checkpoint_callback: Optional[bool] = True
-    checkpoint_callback_params: Optional[CallbackParams] = CallbackParams()
+    checkpoint_callback_params: Optional[CallbackParams] = field(default_factory=lambda: CallbackParams())
     # Additional exp_manager arguments
     files_to_copy: Optional[List[str]] = None
     # logs timing of train/val/test steps
     log_step_timing: Optional[bool] = True
-    step_timing_kwargs: Optional[StepTimingParams] = StepTimingParams()
+    step_timing_kwargs: Optional[StepTimingParams] = field(default_factory=lambda: StepTimingParams())
     # Configures creation of log files for different ranks
     log_local_rank_0_only: Optional[bool] = False
     log_global_rank_0_only: Optional[bool] = False
     # disable initial validation when resuming from a checkpoint saved during validation
     disable_validation_on_resume: Optional[bool] = True
-    ema: Optional[EMAParams] = EMAParams()
+    ema: Optional[EMAParams] = field(default_factory=lambda: EMAParams())
 
 
 class TimingCallback(Callback):

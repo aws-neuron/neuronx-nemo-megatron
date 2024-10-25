@@ -16,7 +16,7 @@
 
 import enum
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import torch
@@ -87,7 +87,9 @@ class MLPInfusedAdapter(InfusedAdapter):
 @dataclass
 class InfusedAdapterConfig:
     in_features: int
-    adapter_strategy: Optional[Any] = adapter_mixin_strategies.ResidualAddAdapterStrategyConfig()
+    adapter_strategy: Optional[Any] = field(
+        default_factory=lambda: adapter_mixin_strategies.ResidualAddAdapterStrategyConfig()
+    )
     _target_: str = "{0}.{1}".format(InfusedAdapter.__module__, InfusedAdapter.__name__)
 
 
@@ -228,7 +230,9 @@ class ParallelLinearAdapterConfig:
     gather_output: bool = True
     dropout: float = 0.0
     sequence_parallel: bool = False
-    adapter_strategy: Optional[Any] = adapter_mixin_strategies.ResidualAddAdapterStrategyConfig()
+    adapter_strategy: Optional[Any] = field(
+        default_factory=lambda: adapter_mixin_strategies.ResidualAddAdapterStrategyConfig()
+    )
     _target_: str = "{0}.{1}".format(ParallelLinearAdapter.__module__, ParallelLinearAdapter.__name__)
 
 
