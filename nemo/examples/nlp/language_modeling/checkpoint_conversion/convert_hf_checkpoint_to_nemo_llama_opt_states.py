@@ -1,14 +1,22 @@
 import os
 import argparse
 import json
+import itertools
+import logging
 from glob import glob
 from multiprocessing import Pool
 import torch
+import gc
 from functools import partial
 
-from examples.nlp.language_modeling.checkpoint_conversion.convert_hf_checkpoint_to_nemo_llama_70b import convert_state_dict_for_pp_rank as convert_state_dict_for_pp_rank_gqa
+from examples.nlp.language_modeling.checkpoint_conversion.convert_hf_checkpoint_to_nemo_llama import get_layer_map, load_model_checkpoints
 from examples.nlp.language_modeling.checkpoint_conversion.convert_hf_checkpoint_to_nemo_llama import convert_state_dict_for_pp_rank as convert_state_dict_for_pp_rank
+from examples.nlp.language_modeling.checkpoint_conversion.convert_hf_checkpoint_to_nemo_llama_70b import convert_state_dict_for_pp_rank as convert_state_dict_for_pp_rank_gqa
 from examples.nlp.language_modeling.checkpoint_conversion.convert_hf_checkpoint_to_nemo_llama_70b import hf2mt_fix_query_key_value_ordering
+
+from examples.nlp.language_modeling.checkpoint_conversion.logger_factory import LoggerFactory
+
+logger = LoggerFactory.create_logger(name="hf_to_nemo_llama_opt_states", level=logging.INFO)
 
 # TODO: only works for HF to trainium nemo checkpoint
 
@@ -96,9 +104,11 @@ def convert_opt_state_for_pp_rank(
         config,
         TP,
         PP,
+        VPP,
         save_bf16,
         gqa_qkv  # if True will convert to a nemo checkpoint with QKV as signle matrix (trainium new GQA implementation)
     ):
+    logger.info(f"------- start converting optim states for pipeline pp={p}")
     br_key = "layers."  # Used to filter all transformer layers except layernorm
 
     gqa = 'num_query_groups' in config or 'num_key_value_heads' in config
@@ -151,7 +161,7 @@ def convert_opt_state_for_pp_rank(
             return 1, key, 0, 0
 
         split, ix, dim, transpose = reverse_translation[k]
-        key = (layer % num_layers_per_pp_rank ) * num_params_per_layer + abs(ix)
+        key = layer * num_params_per_layer + abs(ix)
         if pp == 0:
             key += 1
         if ix < 0: # workaround for up_proj (dense_h_to_4h_2) to be later concatenated with gate_proj (dense_h_to_4h)
@@ -159,26 +169,33 @@ def convert_opt_state_for_pp_rank(
         return (split, key, dim, transpose)
 
     num_layers_per_pp_rank = config["num_hidden_layers"] // PP
+    if VPP is None:
+        layers_on_curr_pp = list(range(p * num_layers_per_pp_rank, (p + 1) * num_layers_per_pp_rank))
+    else:
+        layer_map = get_layer_map(PP, VPP, config['num_hidden_layers'])
+        layers_on_curr_pp = list(itertools.chain(*layer_map[p]))
 
-    pipeline_layers = range(p * num_layers_per_pp_rank, (p + 1) * num_layers_per_pp_rank)
-    model_paths = sorted([f'{path_to_checkpoint}/{layer}/pytorch_model.bin' for layer in pipeline_layers])
-    model_llama = {}
-    for _path in model_paths:
-        print(f'Loading {_path}')
-        ts = torch.load(_path, map_location='cpu')
-        model_llama.update(ts)
-    print(len(model_llama))
+    model_paths = sorted([f'{path_to_checkpoint}/{layer}/pytorch_model.bin' for layer in layers_on_curr_pp])
+    
+    # model_llama = {}
+    # for _path in model_paths:
+    #     logger.info(f'Loading {_path}')
+    #     ts = torch.load(_path, map_location='cpu')
+    #     model_llama.update(ts)
+    
+    model_llama = load_model_checkpoints(model_paths)
+    logger.info("Loaded Llama model")
 
     static_information_path = f'{path_to_checkpoint}/static_information.bin'
-    print(f'Loading {static_information_path}')
+    logger.info(f'Loading {static_information_path}')
     shared_information = torch.load(static_information_path, map_location='cpu')
-    print("Loaded Llama model")
+    logger.info("Loaded Llama model static info")
 
     if gqa:
         if gqa_qkv:
             # Interleave Q,K,V within each query head, for "new" GQA implementation
             # This way we only need to split the resulting QKV matrix to get each TP rank parameter later in the TP loop
-            for i in range(p * num_layers_per_pp_rank, (p + 1) * num_layers_per_pp_rank):
+            for i in layers_on_curr_pp:
                 q = model_llama[f'model.layers.{i}.self_attn.q_proj.optimizer_state']
                 k = model_llama[f'model.layers.{i}.self_attn.k_proj.optimizer_state']
                 v = model_llama[f'model.layers.{i}.self_attn.v_proj.optimizer_state']
@@ -189,7 +206,7 @@ def convert_opt_state_for_pp_rank(
                 model_llama.pop(f'model.layers.{i}.self_attn.v_proj.optimizer_state')
         else:
             # Concatenate KV for "old" GQA implementation.
-            for i in range(p * num_layers_per_pp_rank, (p + 1) * num_layers_per_pp_rank):
+            for i in layers_on_curr_pp:
                 q = model_llama[f'model.layers.{i}.self_attn.q_proj.optimizer_state']
                 k = model_llama[f'model.layers.{i}.self_attn.k_proj.optimizer_state']
                 v = model_llama[f'model.layers.{i}.self_attn.v_proj.optimizer_state']
@@ -212,7 +229,7 @@ def convert_opt_state_for_pp_rank(
     out_models = {}
     for i in range(TP):
 
-        print(f"=== generating optimizer states for PP {p}, TP {i} ===")
+        logger.info(f"=== generating optimizer states for PP {p}, TP {i} ===")
         nemo_model = {}
         for k, params in model_llama.items():
             if "attention.masked_bias" in k:
@@ -221,41 +238,44 @@ def convert_opt_state_for_pp_rank(
             if br_key in k:
                 parts = k.split(br_key)[1].split(".")
                 layer_number = int(parts[0])
-                if layer_number >= num_layers_per_pp_rank * (p + 1) or layer_number < num_layers_per_pp_rank * p:
-                    continue
-                k_orig = k
-                k = ".".join(parts[1:])
-                if "attn.bias" in k:
-                    continue
 
-                split, key, dim, transpose = translate_optstate_trn_h_2_4h(k, p, PP, layer_number, num_params_per_layer, num_layers_per_pp_rank)
-                # TODO: had to do this clone here because otherwise when slicing the tensor to do a TP split, it impact the original data and breaks the operations for next "i" in the TP loop
-                nemo_model[key] = clone_optimizer_states(params)
-                if transpose:
-                    nemo_model[key] = transpose_optimizer_states(nemo_model[key], 0, 1)
+                if int(layer_number) in layers_on_curr_pp:
+                    logger.info(f'layer_number in HF: {layer_number}')
+                    k_orig = k
+                    k = ".".join(parts[1:])
+                    if "attn.bias" in k:
+                        continue
 
-                if gqa and not gqa_qkv:
-                    # "old" GQA implementation
-                    if "query" in k:
+                    layer_number = str(layers_on_curr_pp.index(int(layer_number)))
+                    logger.info(f'layer_number in nemo: {layer_number}')
+                    split, key, dim, transpose = translate_optstate_trn_h_2_4h(k, p, PP, int(layer_number), num_params_per_layer, num_layers_per_pp_rank)
+                    # TODO: had to do this clone here because otherwise when slicing the tensor to do a TP split, it impact the original data and breaks the operations for next "i" in the TP loop
+                    nemo_model[key] = clone_optimizer_states(params)
+                    if transpose:
+                        nemo_model[key] = transpose_optimizer_states(nemo_model[key], 0, 1)
+
+                    if gqa and not gqa_qkv:
+                        # "old" GQA implementation
+                        if "query" in k:
+                            heads = config["num_attention_heads"]
+                            hidden_size_per_head = config["hidden_size"] // heads
+                            nemo_model[key] = fix_query_key_value_ordering_optimizer_states(nemo_model[key], 2.0, 1, heads, hidden_size_per_head)
+                        if "key_value" in k:
+                            heads = config["num_attention_heads"]
+                            hidden_size_per_head = config["hidden_size"] // heads
+                            kv_heads = config['num_key_value_heads']
+                            nemo_model[key] = fix_query_key_value_ordering_optimizer_states(nemo_model[key], 2.0, 2, kv_heads, hidden_size_per_head)
+                    if not gqa and "query_key_value" in k:
+                        # non-GQA
                         heads = config["num_attention_heads"]
                         hidden_size_per_head = config["hidden_size"] // heads
-                        nemo_model[key] = fix_query_key_value_ordering_optimizer_states(nemo_model[key], 2.0, 1, heads, hidden_size_per_head)
-                    if "key_value" in k:
-                        heads = config["num_attention_heads"]
-                        hidden_size_per_head = config["hidden_size"] // heads
-                        kv_heads = config['num_key_value_heads']
-                        nemo_model[key] = fix_query_key_value_ordering_optimizer_states(nemo_model[key], 2.0, 2, kv_heads, hidden_size_per_head)
-                if not gqa and "query_key_value" in k:
-                    # non-GQA
-                    heads = config["num_attention_heads"]
-                    hidden_size_per_head = config["hidden_size"] // heads
-                    nemo_model[key] = fix_query_key_value_ordering_optimizer_states(nemo_model[key], 2.0, 3, heads, hidden_size_per_head)
+                        nemo_model[key] = fix_query_key_value_ordering_optimizer_states(nemo_model[key], 2.0, 3, heads, hidden_size_per_head)
 
-                if split:
-                    tp_last_dim_size = nemo_model[key]['exp_avg'].shape[dim] // TP
-                    nemo_model[key] = shard_optimizer_states_for_tp(nemo_model[key], tp_dim_size=tp_last_dim_size, dim=dim, index=i)
+                    if split:
+                        tp_last_dim_size = nemo_model[key]['exp_avg'].shape[dim] // TP
+                        nemo_model[key] = shard_optimizer_states_for_tp(nemo_model[key], tp_dim_size=tp_last_dim_size, dim=dim, index=i)
 
-                print(k_orig, params['exp_avg'].shape, f"\n=> key: {key}, split: {split}, dim: {dim}", nemo_model[key]['exp_avg'].shape)
+                    logger.info(f"k_orig: {k_orig}, params['exp_avg'].shape: {params['exp_avg'].shape}, \n=> key: {key}, split: {split}, dim: {dim}, nemo_model[key]['exp_avg'].shape: {nemo_model[key]['exp_avg'].shape}")
             else:
                 if "embed_tokens" in k and p == 0:
                     split, key, dim, transpose = translate_optstate_trn_h_2_4h(k, p, PP, None, num_params_per_layer, num_layers_per_pp_rank)
@@ -268,27 +288,27 @@ def convert_opt_state_for_pp_rank(
                     tp_last_dim_size = last_dim_size // TP
                     nemo_model[key] = shard_optimizer_states_for_tp(x, tp_dim_size=tp_last_dim_size, dim=dim, index=i)
 
-                    print(k, params['exp_avg'].shape, f"\n=> key: {key}, split: {split}, dim: {dim}", nemo_model[key]['exp_avg'].shape)
+                    logger.info(f"k: {k}, params['exp_avg'].shape: {params['exp_avg'].shape}, \n=> key: {key}, split: {split}, dim: {dim}, nemo_model[key]['exp_avg'].shape: {nemo_model[key]['exp_avg'].shape}")
                 elif "model.norm" in k and p == (PP - 1):
                     split, key, dim, transpose = translate_optstate_trn_h_2_4h(k, p, PP, None, num_params_per_layer, num_layers_per_pp_rank)
                     nemo_model[key] = params
 
-                    print(k, params['exp_avg'].shape, f"\n=> key: {key}, split: {split}, dim: {dim}", nemo_model[key]['exp_avg'].shape)
+                    logger.info(f"k: {k}, params['exp_avg'].shape: {params['exp_avg'].shape}, \n=> key: {key}, split: {split}, dim: {dim}, nemo_model[key]['exp_avg'].shape: {nemo_model[key]['exp_avg'].shape}")
                 elif "lm_head" in k and p == (PP - 1):
                     split, key, dim, transpose = translate_optstate_trn_h_2_4h(k, p, PP, None, num_params_per_layer, num_layers_per_pp_rank)
                     if split:
                         tp_last_dim_size = params['exp_avg'].shape[dim] // TP
                         nemo_model[key] = shard_optimizer_states_for_tp(params, tp_dim_size=tp_last_dim_size, dim=dim, index=i)
 
-                    print(k, params['exp_avg'].shape, f"\n=> key: {key}, split: {split}, dim: {dim}", nemo_model[key]['exp_avg'].shape)
+                    logger.info(f"k: {k}, params['exp_avg'].shape: {params['exp_avg'].shape}, \n=> key: {key}, split: {split}, dim: {dim}, nemo_model[key]['exp_avg'].shape: {nemo_model[key]['exp_avg'].shape}")
 
         # Merge gate proj (dense_h_to_4h) and up proj (dense_h_to_4h_2) into one, as nemo megatron combines the two
         # negative key is an up_proj matrix (dense_h_to_4h_2) which should be concatinated with a gate proj (dense_h_to_4h)
         up_proj_keys = [key for key in nemo_model.keys() if key < 0]
         for key in up_proj_keys:
-            print(f"merging gate proj and up proj ({nemo_model[-key]['exp_avg'].shape}) and ({nemo_model[key]['exp_avg'].shape})")
+            logger.info(f"merging gate proj and up proj ({nemo_model[-key]['exp_avg'].shape}) and ({nemo_model[key]['exp_avg'].shape})")
             nemo_model[-key] = concat_optimizer_states([nemo_model[-key], nemo_model[key]], dim=0)
-            print(f"merged pojections is ({nemo_model[-key]['exp_avg'].shape})")
+            logger.info(f"merged pojections is ({nemo_model[-key]['exp_avg'].shape})")
             nemo_model.pop(key)
 
         # set the step value. It is the same for all keys:
@@ -314,14 +334,17 @@ def convert_opt_state_for_pp_rank(
             'loops': shared_information['loops']
         }
         out_models[i]['optimizer_states'][0]['param_groups'][0]['params'] = list(range(len(nemo_model)))
-
+        assert out_models[i]['optimizer_states'][0]['param_groups'][0]['params'] == sorted(nemo_model.keys())
+    del model_llama
     return out_models
 
 
 def convert_checkpoint(p, args, config, func_conv_param_weights, func_conv_opt_states):
     TP = args.tp_degree
     PP = args.pp_degree
+    VPP = args.vpp_degree
 
+    logger.info(f"------- start converting parameters for pipeline pp={p}")
     out_models_state_dict = func_conv_param_weights(
         p,
         path_to_checkpoint=args.path_to_checkpoint,
@@ -330,19 +353,27 @@ def convert_checkpoint(p, args, config, func_conv_param_weights, func_conv_opt_s
         config=config,
         TP=TP,
         PP=PP,
+        VPP=VPP,
         save_bf16=args.save_bf16,
         gqa_qkv=args.gqa_qkv)
 
+    logger.info(f"------- start converting optim states for pipeline pp={p}")
     out_models_optim_state = func_conv_opt_states(
         p,
         path_to_checkpoint=args.path_to_checkpoint_opt_states,
-        config=config, TP=TP, PP=PP, save_bf16=args.save_bf16, gqa_qkv=args.gqa_qkv)
+        config=config, TP=TP, PP=PP, VPP=VPP,
+        save_bf16=args.save_bf16, gqa_qkv=args.gqa_qkv)
 
     assert len(out_models_state_dict) == TP
     assert len(out_models_optim_state) == TP
 
+    logger.info(f"------- start saving output checkpoint for pipeline pp={p}")
+    checkpoints_to_be_saved = []
     for i in range(TP):
         out_model = {'state_dict': out_models_state_dict[i]['state_dict']}
+        if VPP is not None:
+            for vpp in range(VPP):
+                out_model[f'model{vpp}'] = out_models_state_dict[i][f'model{vpp}']
         out_model.update(out_models_optim_state[i])
         output_folder = args.output_path
         if TP > 1:
@@ -351,17 +382,39 @@ def convert_checkpoint(p, args, config, func_conv_param_weights, func_conv_opt_s
             else:
                 output_folder = output_folder + f"/mp_rank_{i:02d}"
         if PP > 1:
-            output_folder = output_folder + f"_pp_rank_{p:03d}"
+            if TP > 1:
+                output_folder = output_folder + f"_pp_rank_{p:03d}"
+            else:
+                output_folder = output_folder + f"/tp_rank_00_pp_rank_{p:03d}"
         if not os.path.exists(output_folder):
             os.makedirs(output_folder)
 
         checkpoint_name = f"{output_folder}/llmv2_converted_checkpoint--step={args.step}-consumed_samples={args.consumed_samples}.ckpt"
-        if args.is_xser:
-            from nemo.collections.nlp.parts.serialization import save
-            save(out_model, checkpoint_name)
-        else:
-            torch.save(out_model, checkpoint_name)  # , (not master_only), global_master=True)
+        checkpoints_to_be_saved.append((out_model, checkpoint_name, args.is_xser))
+    
+    save_checkpoint_list(checkpoints_to_be_saved)
+    del out_models_state_dict, out_models_optim_state, checkpoints_to_be_saved
+    gc.collect()
 
+
+def save_checkpoint_list(checkpoints):
+    x = len(checkpoints)
+    logger.info(f"Saving checkpoints in parallel using {x} processes")
+    with Pool(processes=x) as pool:
+        pool.map(_save_checkpoint, checkpoints)
+        pool.close()
+        pool.join()
+
+
+def _save_checkpoint(args):
+    out_model, checkpoint_name, is_xser = args
+    logger.info(f'Saving checkpoint with is_xser={is_xser}: {checkpoint_name}')
+    if is_xser:
+        from nemo.collections.nlp.parts.serialization import save
+        save(out_model, checkpoint_name)
+    else:
+        torch.save(out_model, checkpoint_name)  # , (not master_only), global_master=True)
+    logger.info(f'Saved checkpoint with is_xser={is_xser}: {checkpoint_name}')
 
 
 if __name__ == "__main__":
@@ -405,6 +458,11 @@ if __name__ == "__main__":
         help="Pipeline parallelism",
     )
     parser.add_argument(
+        "--vpp_degree",
+        type=int,
+        help="Virtual Pipeline parallelism. When set, will interleave layers through pipeline stages",
+    )
+    parser.add_argument(
         "--save_bf16",
         default=False,
         type=bool,
@@ -436,6 +494,12 @@ if __name__ == "__main__":
         action="store_true",
         help="If this is for trainium new GQA implementation, K, Q and V will be saved as one tensor",
     )
+    parser.add_argument(
+        "--pp_rank",
+        type=int,
+        help="which pp rank to process",
+        required=True
+    )
     args = parser.parse_args()
 
     with open(args.config_file, "r") as f:
@@ -456,6 +520,8 @@ if __name__ == "__main__":
 
     # serial processing (use for debugging)
     for p in range(PP):
+        if p != args.pp_rank:
+            continue
         f(p)
 
-    print(f"Done saving Megatron checkpoint as {args.output_path}/llmv2_converted_checkpoint--step={args.step}-consumed_samples={args.consumed_samples}.ckpt")
+    logger.info(f"Done saving Megatron checkpoint as {args.output_path}/llmv2_converted_checkpoint--step={args.step}-consumed_samples={args.consumed_samples}.ckpt")

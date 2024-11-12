@@ -4,11 +4,16 @@ import os
 import nemo.collections.nlp.parts.serialization as xser
 import glob
 import torch
+import logging
 import argparse
 from functools import partial
 from multiprocessing import Pool
 import sys
 import torch.nn.functional as F
+
+from examples.nlp.language_modeling.checkpoint_conversion.logger_factory import LoggerFactory
+
+logger = LoggerFactory.create_logger(name="convert_z1_optim_states_mpi", level=logging.INFO)
 
 
 def _load(filename):
@@ -169,7 +174,7 @@ def merge_optimizer_states_mp(input_dir, output_dir, checkpoint_name):
         raise RuntimeError("Error: when merging optimizer states, the optim directory does not exist")
 
     checkpoint_filename = os.path.join(input_dir, checkpoint_name)
-    print(f"loading checkpoint from {checkpoint_filename}")
+    logger.info(f"loading checkpoint from {checkpoint_filename}")
     checkpoint = _load(checkpoint_filename)
     full_optimizer_states = []
 
@@ -178,19 +183,19 @@ def merge_optimizer_states_mp(input_dir, output_dir, checkpoint_name):
         assert checkpoint_name.endswith(".ckpt")
         optim_filename = checkpoint_name.replace(".ckpt", ".optimizer_states")
         optim_filename = os.path.join(optim_dir, f"dp_rank_{dp_rank:03d}", optim_filename)
-        print(f"    loading optimizer states of rank {dp_rank} from {optim_filename}")
+        logger.info(f"    loading optimizer states of rank {dp_rank} from {optim_filename}")
         part_optimizer_states = _load(optim_filename)
-        print(f"    merging optimizer states of rank {dp_rank} into full optimizer states and checkpoint")
+        logger.info(f"    merging optimizer states of rank {dp_rank} into full optimizer states and checkpoint")
         merge(checkpoint, full_optimizer_states, part_optimizer_states, dp_size, dp_rank)
 
-    print(f"put optimizer states into checkpoint")
+    logger.info(f"put optimizer states into checkpoint")
     checkpoint["optimizer_states"] = full_optimizer_states
 
-    print(f"set checkpoint[hyper_parameters][cfg][wrap_with_zero] to false")
+    logger.info(f"set checkpoint[hyper_parameters][cfg][wrap_with_zero] to false")
     set_checkpoint_wrap_with_zero(checkpoint, False)
 
     checkpoint_filename = os.path.join(output_dir, checkpoint_name)
-    print(f"saving checkpoint with full optimizer states to {checkpoint_filename}")
+    logger.info(f"saving checkpoint with full optimizer states to {checkpoint_filename}")
     _save(checkpoint, checkpoint_filename)
 
 
@@ -315,7 +320,7 @@ def split_optimizer_states_mp(input_dir, output_dir, checkpoint_name, dp_size):
     os.makedirs(output_dir, exist_ok=True)
 
     checkpoint_filename = os.path.join(input_dir, checkpoint_name)
-    print(f"loading checkpoint with optimizer states from {checkpoint_filename}")
+    logger.info(f"loading checkpoint with optimizer states from {checkpoint_filename}")
     checkpoint = _load(checkpoint_filename)
     full_optimizer_states = checkpoint["optimizer_states"]
     del checkpoint["optimizer_states"]
@@ -323,28 +328,30 @@ def split_optimizer_states_mp(input_dir, output_dir, checkpoint_name, dp_size):
         optim_dir = os.path.join(output_dir, "optim", f"dp_rank_{dp_rank:03d}")
         os.makedirs(optim_dir, exist_ok=True)
         part_optimizer_states = []
-        print(f"splitting optimizer states of dp rank {dp_rank} from full optimizer states and checkpoint")
+        logger.info(f"splitting optimizer states of dp rank {dp_rank} from full optimizer states and checkpoint")
         split(checkpoint, full_optimizer_states, part_optimizer_states, dp_size, dp_rank)
-        optim_filename = os.path.join(optim_dir, checkpoint_name.replace(".ckpt", ".optimizer_states"))
-        print(f"saving optimizer states of dp rank {dp_rank} to {optim_filename}")
+        optim_filename = resolve_optim_states_file_name(checkpoint_name, naming_schema)
+        optim_filename = os.path.join(optim_dir, optim_filename)
+        logger.info(f"saving optimizer states of dp rank {dp_rank} to {optim_filename}")
         _save(part_optimizer_states, optim_filename)
 
-    print(f"set checkpoint[hyper_parameters][cfg][wrap_with_zero] to True")
+    logger.info(f"set checkpoint[hyper_parameters][cfg][wrap_with_zero] to True")
     set_checkpoint_wrap_with_zero(checkpoint, True)
 
     checkpoint_filename = os.path.join(output_dir, checkpoint_name)
-    print(f"saving checkpoint wout optimizer states to {checkpoint_filename}")
+    logger.info(f"saving checkpoint wout optimizer states to {checkpoint_filename}")
     _save(checkpoint, checkpoint_filename)
 
 
 def convert_optimizer_states(input_checkpoint_dir, output_checkpoint_dir, checkpoint_name, action, output_dp_size=None, rank=None, world_size=None):
     # for entry in os.listdir(input_checkpoint_dir):
-    print(f"rank={rank} world_size={world_size} input_checkpoint_dir={input_checkpoint_dir} output_checkpoint_dir={output_checkpoint_dir} checkpoint_name={checkpoint_name} action={action}")
+    logger.info(f"rank={rank} world_size={world_size} input_checkpoint_dir={input_checkpoint_dir} output_checkpoint_dir={output_checkpoint_dir} checkpoint_name={checkpoint_name} action={action} config={config}")
     entrylist = sorted(os.listdir(input_checkpoint_dir))
     rank = int(rank)
     world_size = int(world_size)
     entry_bgn = len(entrylist) * rank // world_size
     entry_end = len(entrylist) * (rank + 1) // world_size
+    logger.info(f'entrylist for current rank: {entrylist[entry_bgn: entry_end]}')
     for entry_idx in range(entry_bgn, entry_end):
         entry = entrylist[entry_idx]
         if not os.path.isdir(os.path.join(input_checkpoint_dir, entry)):
@@ -417,6 +424,14 @@ def main(args):
         "--world_size",
         type=str,
         help="reference model to fill in the parameters"
+    )
+    parser.add_argument(
+        "--naming_schema",
+        type=str,
+        choices=['v1', 'v2'],
+        required=False,
+        default='v2',
+        help="choose between optim filename schema versions | v1: <file>.optimizer_states | v2: <file>-optimizer_states.ckpt"
     )
 
     args = parser.parse_args(args[1:])
