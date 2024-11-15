@@ -12,12 +12,12 @@ from apex.transformer.pipeline_parallel.schedules.common import FwdStepFunc
 from apex.transformer.pipeline_parallel.schedules.common import forward_step
 from apex.transformer.pipeline_parallel.schedules.common import backward_step
 from apex.transformer.log_util import get_transformer_logger
+from nemo.utils import logging
 
 
 _all__ = ["forward_backward_no_pipelining"]
 
 _logger = get_transformer_logger(__name__)
-
 
 def forward_backward_no_pipelining(
     forward_step_func: FwdStepFunc,

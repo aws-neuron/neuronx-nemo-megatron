@@ -40,19 +40,27 @@ class AppState(metaclass=Singleton):
         self._global_rank = None
         self._tensor_model_parallel_rank = None
         self._pipeline_model_parallel_rank = None
+        self._context_parallel_rank = None
         self._data_parallel_rank = None
 
         self._world_size = None
         self._model_parallel_size = None
+        
         self._tensor_model_parallel_size = None
         self._tensor_model_parallel_group = None
+        
         self._pipeline_model_parallel_size = None
-        self._virtual_pipeline_model_parallel_size = None
         self._pipeline_model_parallel_group = None
-        self._pipeline_model_parallel_split_rank = None
-        self._is_megatron_initialized = False
+        
+        self._context_parallel_size = None
+        self._context_parallel_group = None
+        
         self._data_parallel_size = None
         self._data_parallel_group = None
+        
+        self._virtual_pipeline_model_parallel_size = None
+        self._pipeline_model_parallel_split_rank = None
+        self._is_megatron_initialized = False
         self._megatron_checkpoint_version = None
 
         self._random_seed = None
@@ -153,6 +161,22 @@ class AppState(metaclass=Singleton):
                 size (int):  Number of GPUs in each model parallel group.
         """
         self._pipeline_model_parallel_size = size
+        
+    @property
+    def context_parallel_size(self):
+        """ Property returns the number of GPUs in each context parallel group.
+            Returns:
+                Number of GPUs in each context parallel group.
+        """
+        return self._context_parallel_size
+
+    @context_parallel_size.setter
+    def context_parallel_size(self, size):
+        """ Property sets the number of GPUs in each context parallel group.
+            Args:
+                size (int):  Number of GPUs in each context parallel group.
+        """
+        self._context_parallel_size = size
 
     @property
     def virtual_pipeline_model_parallel_size(self):
@@ -265,6 +289,38 @@ class AppState(metaclass=Singleton):
                 rank (int):  Pipeline model parallel rank.
         """
         self._pipeline_model_parallel_rank = rank
+    
+    @property
+    def context_parallel_rank(self):
+        """ Property returns the context parallel rank.
+            Returns:
+                Context parallel rank.
+        """
+        return self._context_parallel_rank
+
+    @context_parallel_rank.setter
+    def context_parallel_rank(self, rank):
+        """ Property sets the context parallel rank.
+            Args:
+                rank (int):  Context parallel rank.
+        """
+        self._context_parallel_rank = rank
+    
+    @property
+    def context_parallel_group(self):
+        """ Property returns the context parallel group.
+            Returns:
+                Context parallel group.
+        """
+        return self._context_parallel_group
+
+    @context_parallel_group.setter
+    def context_parallel_group(self, group):
+        """ Property sets the context parallel group.
+            Args:
+                group:  Context parallel group.
+        """
+        self._context_parallel_group = group
 
     @property
     def virtual_pipeline_model_parallel_rank(self):

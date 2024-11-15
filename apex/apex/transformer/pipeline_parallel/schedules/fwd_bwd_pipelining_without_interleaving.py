@@ -18,6 +18,7 @@ from apex.transformer.pipeline_parallel.schedules.common import backward_step
 from apex.transformer.pipeline_parallel.schedules.common import forward_step
 from apex.transformer.pipeline_parallel.schedules.common import free_output_tensor
 from apex.transformer.log_util import get_transformer_logger
+from nemo.utils import logging
 
 
 __all__ = ["forward_backward_pipelining_without_interleaving"]
@@ -58,20 +59,17 @@ def get_tensor_shapes(
     ), f"`tensor_shape` should be [sequence_length, micro_batch_size, hidden_size] but {tensor_shape}"
 
     sequence_length, micro_batch_size, hidden_size = tensor_shape
+    seq_length = sequence_length // parallel_state.get_context_parallel_world_size()
 
     tensor_shapes = []
 
     if sequence_parallel_enabled:
-        seq_length = sequence_length // parallel_state.get_tensor_model_parallel_world_size()
-    else:
-        seq_length = sequence_length
+        seq_length = seq_length // parallel_state.get_tensor_model_parallel_world_size()
 
     if model_type == ModelType.encoder_and_decoder:
-
+        dec_seq_length = decoder_sequence_length // parallel_state.get_context_parallel_world_size()
         if sequence_parallel_enabled:
             dec_seq_length = decoder_sequence_length // parallel_state.get_tensor_model_parallel_world_size()
-        else:
-            dec_seq_length = decoder_sequence_length
 
         if parallel_state.is_pipeline_stage_before_split(rank):
             tensor_shapes.append((seq_length, micro_batch_size, hidden_size))
@@ -236,7 +234,6 @@ def send_backward_recv_forward(
         )
         input_tensors.append(input_tensor)
     return input_tensors
-
 
 def forward_backward_pipelining_without_interleaving(
     forward_step_func: FwdStepFunc,
@@ -596,5 +593,4 @@ def forward_backward_pipelining_without_interleaving(
     # enable_grad_sync()
     # if rank != 0 and custom_grad_sync_func is not None:
     #     custom_grad_sync_func()
-
     return losses_reduced

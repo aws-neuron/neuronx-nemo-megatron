@@ -16,6 +16,7 @@ import torch
 
 from apex._autocast_utils import _cast_if_autocast_enabled
 from apex.transformer.enums import AttnMaskType
+from nemo.utils import logging
 
 
 class ScaledUpperTriangMaskedSoftmax(torch.autograd.Function):

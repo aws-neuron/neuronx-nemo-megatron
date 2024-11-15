@@ -143,6 +143,7 @@ class MegatronBaseModel(NLPModel):
             local_rank=l_rank,
             tensor_model_parallel_size=cfg.get('tensor_model_parallel_size', 1),
             pipeline_model_parallel_size=cfg.get('pipeline_model_parallel_size', 1),
+            context_parallel_size=cfg.get('context_parallel_size', 1),
             virtual_pipeline_model_parallel_size=cfg.get('virtual_pipeline_model_parallel_size', None),
             pipeline_model_parallel_split_rank=cfg.get('pipeline_model_parallel_split_rank', 0),
             micro_batch_size=cfg.get('micro_batch_size'),
@@ -181,6 +182,7 @@ class MegatronBaseModel(NLPModel):
             local_rank=xm.get_local_ordinal(),
             tensor_model_parallel_size=self.cfg.get('tensor_model_parallel_size', 1),
             pipeline_model_parallel_size=self.cfg.get('pipeline_model_parallel_size', 1),
+            context_parallel_size=self.cfg.get('context_parallel_size', 1),
             virtual_pipeline_model_parallel_size=self.cfg.get('virtual_pipeline_model_parallel_size', None),
             pipeline_model_parallel_split_rank=self.cfg.get('pipeline_model_parallel_split_rank', 0),
             micro_batch_size=self.cfg.get('micro_batch_size'),
@@ -497,7 +499,7 @@ class MegatronBaseModel(NLPModel):
             )
             with open_dict(self.cfg):
                 self.cfg.sequence_parallel = False
-
+        
         # Gradient accumulation fusion does not work with our baseline implementaiton of
         # async grad allreduce. This should be fixed!
         # For now we must disable it whenever using the baseline implementaion.

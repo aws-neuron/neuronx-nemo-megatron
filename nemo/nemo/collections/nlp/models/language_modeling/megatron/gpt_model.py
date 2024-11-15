@@ -35,6 +35,7 @@ except (ImportError, ModuleNotFoundError):
     # fake missing classes with None attributes
     AttnMaskType = ApexGuardDefaults()
 
+
 def post_language_model_processing(
     lm_output,
     labels,
@@ -177,7 +178,8 @@ class GPTModel(MegatronModule):
         sliding_window=None,
         flexible_pipeline_parallel_stages=None,
         use_flash_attention=False,
-        respect_provided_self_attention_mask: bool = False
+        respect_provided_self_attention_mask: bool = False,
+        use_ring_attention=False,
     ):
 
         super(GPTModel, self).__init__(share_token_embeddings=share_embeddings_and_output_weights)
@@ -275,7 +277,8 @@ class GPTModel(MegatronModule):
             sliding_window=sliding_window,
             flexible_pipeline_parallel_stages=flexible_pipeline_parallel_stages,
             use_flash_attention=use_flash_attention,
-            respect_provided_self_attention_mask=respect_provided_self_attention_mask
+            respect_provided_self_attention_mask=respect_provided_self_attention_mask,
+            use_ring_attention=use_ring_attention,
         )
 
         logging.trace(f"In GPTModel._init_() leave get_language_model()", trace_type="recovery_time")
@@ -320,7 +323,7 @@ class GPTModel(MegatronModule):
             checkpoint_activations_all_layers=checkpoint_activations_all_layers,
         )
         if self.post_process:
-            return post_language_model_processing(
+            lm_output = post_language_model_processing(
                 lm_output,
                 labels,
                 self.language_model.output_layer.weight
@@ -335,8 +338,8 @@ class GPTModel(MegatronModule):
                 gradient_accumulation_fusion=self.gradient_accumulation_fusion,
                 share_embeddings_and_output_weights=self.share_embeddings_and_output_weights
             )
-        else:
-            return lm_output
+            loss, logits = lm_output
+        return lm_output
 
     def state_dict_for_save_checkpoint(self, destination=None, prefix='', keep_vars=False):
 

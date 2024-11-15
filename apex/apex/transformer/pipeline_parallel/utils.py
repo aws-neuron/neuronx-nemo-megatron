@@ -64,7 +64,7 @@ def setup_microbatch_calculator(
 ) -> None:
     global _GLOBAL_NUM_MICROBATCHES_CALCULATOR
     # _ensure_var_is_not_initialized(_GLOBAL_NUM_MICROBATCHES_CALCULATOR, 'num microbatches calculator') #NEURON
-    print(f"setup_microbatch_calculator {rank} {rampup_batch_size} {global_batch_size} {micro_batch_size} {data_parallel_size}")
+    print(f"setup_microbatch_calculator Rank {rank} rampup_batch_size={rampup_batch_size} global_batch_size={global_batch_size} micro_batch_size={micro_batch_size} data_parallel_size={data_parallel_size}\n")
     _GLOBAL_NUM_MICROBATCHES_CALCULATOR = build_num_microbatches_calculator(
         rank, rampup_batch_size, global_batch_size, micro_batch_size, data_parallel_size)
 

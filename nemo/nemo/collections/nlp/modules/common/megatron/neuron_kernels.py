@@ -35,6 +35,7 @@ try:
     try:
         _flash_fwd_nki_call = nki_jit()(flash_fwd)
         _flash_bwd_nki_call = nki_jit()(flash_attn_bwd)
+        raise NotImplementedError("New flash attention is WIP and not supported yet.")
     
     except Exception as e:
         logger.info(f"Encountered exception {e}. Trying to import legacy fwd/bwd flash attn functions.")

@@ -21,6 +21,7 @@ import torch
 import time
 import datetime
 import math
+import pickle
 
 from omegaconf import ListConfig
 from omegaconf.dictconfig import DictConfig
@@ -255,6 +256,7 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
             sliding_window=self.cfg.get('sliding_window_size', None),
             flexible_pipeline_parallel_stages=self.cfg.get('flexible_pipeline_parallel_stages', None),
             use_flash_attention=self.cfg.get('use_flash_attention', False),
+            use_ring_attention=self.cfg.get('use_ring_attention', False)
         )
         logging.trace(f"In gpt_model._build_model, leave GPTModel()", trace_type="recovery_time")
         return model
@@ -696,8 +698,34 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
                     grad = word_embeddings_weight.grad
                 torch.distributed.all_reduce(grad, group=parallel_state.get_embedding_group())
 
+    def get_batch_on_this_context_parallel_rank(self, batch):
+        """
+        Slice batch along sequence dimension for context parallelism
+        Index 3 tensor in a batch is attention_mask with shape of [ubatch_size, 1]
+        """
+        cp_size = parallel_state.get_context_parallel_world_size()
+        cp_rank = parallel_state.get_context_parallel_rank()
+        seq_dim = 1
+        cp_batch = []
+        for counter, val in enumerate(batch):
+            if cp_size > 1 and val is not None and val.shape[seq_dim]>1:
+                seq_len = val.shape[seq_dim]
+                assert seq_len%cp_size==0, f"seq_len {seq_len} is not divisible by CP size {cp_size}"
+                val = val.view(
+                *val.shape[0:seq_dim],
+                cp_size, seq_len // cp_size,
+                *val.shape[(seq_dim + 1) :],
+                )
+                index = torch.tensor([cp_rank], device=val.device)
+                val = val.index_select(seq_dim, index)
+                val = val.view(*val.shape[0:seq_dim], -1, *val.shape[(seq_dim + 2) :])
+            cp_batch.append(val)
+        return cp_batch
+    
     def get_forward_output_and_loss_func(self, validation_step=False, all_reduce_losses=False):
         def fwd_output_and_loss_func(batch, model, checkpoint_activations_all_layers=None):
+            if parallel_state.get_context_parallel_world_size()>1:
+                batch = self.get_batch_on_this_context_parallel_rank(batch)
             if parallel_state.get_pipeline_model_parallel_world_size() == 1:
                 # batch = [x.cuda(non_blocking=True) for x in batch]
                 tokens, labels, loss_mask, _, position_ids = batch
@@ -720,37 +748,34 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
                 else:
                     # Intermediate pipeline stage doesn't need any inputs
                     tokens, labels, loss_mask, position_ids = None, None, None, None
-
             attention_mask = batch[3][0:1]
             if is_torch_tpu_available():
                 attention_mask = None
+            output_tensor = model(
+                tokens,
+                position_ids,
+                attention_mask,
+                labels,
+                checkpoint_activations_all_layers=checkpoint_activations_all_layers,
+            )
             logits = None
             if parallel_state.is_pipeline_last_stage():
                 # Only the last PP stage has the logits
-                output_tensor, logits = model(
-                    tokens,
-                    position_ids,
-                    attention_mask,
-                    labels,
-                    checkpoint_activations_all_layers=checkpoint_activations_all_layers,
-                )
-            else:
-                output_tensor = model(
-                    tokens,
-                    position_ids,
-                    attention_mask,
-                    labels,
-                    checkpoint_activations_all_layers=checkpoint_activations_all_layers,
-                )
+                output_tensor, logits = output_tensor
             if self.save_logits:
                 def save_logits(logits):
+                    cp_rank = parallel_state.get_context_parallel_rank()
                     # Save logits on tensor parallel rank zero, data parallel rank zero and last pipeline parallel stage
-                    if parallel_state.get_tensor_model_parallel_rank() == 0 and parallel_state.is_pipeline_last_stage()\
-                            and parallel_state.get_data_parallel_rank() == 0:
-                        if self.trainer.global_step % self.save_logits_interval == 0:
-                            np.save(f"logits-{self.trainer.global_step}.npy", logits.detach().cpu().numpy())
+                    is_save_rank = parallel_state.get_tensor_model_parallel_rank() == 0
+                    is_save_rank = is_save_rank and parallel_state.is_pipeline_last_stage()
+                    is_save_rank = is_save_rank and parallel_state.get_data_parallel_rank() == 0
+                    is_save_rank = is_save_rank and cp_rank == 0
+                    is_save_rank = is_save_rank and self.trainer.global_step % self.save_logits_interval == 0
+                    if is_save_rank:
+                        logits_np = logits.detach().cpu().numpy()
+                        np.save(f"logits-global_step_{self.trainer.global_step}_CP_{cp_rank}.npy", logits_np)
                 xm.add_step_closure(save_logits, (logits,))
-
+            
             def loss_func(output_tensor):
                 loss_for_mb = self.loss_func(loss_mask, output_tensor)
                 if validation_step and not self.cfg.data.get('validation_drop_last', True):
@@ -766,14 +791,14 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
                     torch.distributed.all_reduce(
                         loss_sum_and_mb_size_all_gpu, group=parallel_state.get_data_parallel_group()
                     )
-                    return loss_for_mb, {'loss_sum_and_mb_size': loss_sum_and_mb_size_all_gpu.detach()}
+                    loss_dict = {'loss_sum_and_mb_size': loss_sum_and_mb_size_all_gpu.detach()}
                 else:
                     if all_reduce_losses:
                         reduced_loss = average_losses_across_data_parallel_group([loss_for_mb])
-                        return loss_for_mb, {'avg': reduced_loss.detach()}
+                        loss_dict = {'avg': reduced_loss.detach()}
                     else:
-                        return loss_for_mb, {'mb_loss': loss_for_mb.detach()}
-
+                        loss_dict = {'mb_loss': loss_for_mb.detach()}
+                return loss_for_mb, loss_dict
             return output_tensor, loss_func
 
         return fwd_output_and_loss_func
@@ -817,10 +842,8 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
             from the dataloader to produce a list of microbatches.
             The list of microbatches is then piped through the pipeline using Apex fwd/bwd functions.
         """
-
         batch_for_pipeline = self.process_global_batch(batch)
         tensor_shape = [self.cfg.encoder_seq_length, self.cfg.micro_batch_size, self.cfg.hidden_size]
-
         # run forward passes for an entire global batch
         # we do this inside validation_step to support pipeline parallelism
         fwd_bwd_function = self._get_fwd_bwd_function()
@@ -841,7 +864,8 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
             if self.cfg.data.get('validation_drop_last', True):
                 # average loss across micro batches
                 loss_tensors_list = [average_losses_across_data_parallel_group([loss['mb_loss']]) for loss in losses_per_micro_batch]
-                return torch.concat(loss_tensors_list).mean()
+                loss_mean = torch.concat(loss_tensors_list).mean()
+                return loss_mean
             else:
                 # Get the total loss since micro batches sizes are not uniform
                 loss_sum_tensors_list = [
@@ -892,6 +916,10 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
         loss_mask = loss_mask.view(-1).float()
         # TODO: add nemo version here
         loss = torch.sum(losses.view(-1) * loss_mask) / loss_mask.sum()  # sequence level nll
+        cp_size = parallel_state.get_context_parallel_world_size()
+        if cp_size > 1:
+            torch.distributed.all_reduce(loss, group=parallel_state.get_context_parallel_group())
+            loss /= cp_size
         return loss
 
     def process_global_batch(self, global_batch, global_batch_size=None):
@@ -999,8 +1027,8 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
         logging.trace(f"Enter MegatronGPTModel.setup()", trace_type="recovery_time")
         if not hasattr(self, 'server'):
             import torch_xla.debug.profiler as xp
-            (dp_rank, tp_rank, pp_rank, vp_rank) = parallel_state.get_rank_info()
-            if dp_rank == 0 and tp_rank == 0: # start one for each of the PP stages!
+            (dp_rank, tp_rank, cp_rank, pp_rank, vp_rank) = parallel_state.get_rank_info()
+            if dp_rank == 0 and tp_rank == 0 and cp_rank == 0: # start one for each of the PP stages!
                 port = 9000 + pp_rank
                 self.server = xp.start_server(port)
                 logging.info(f"Started profiling server for dp_rank={dp_rank}, tp_rank={tp_rank}, pp_rank={pp_rank}, vp_rank={vp_rank} on port:{port}")

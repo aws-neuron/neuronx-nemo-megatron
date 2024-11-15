@@ -146,4 +146,3 @@ if [ "$COMPILE" = "1" ]; then
     CREATE_TB_LOGGER=False
     CHECKPOINT_CALLBACK=False
 fi
-

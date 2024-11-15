@@ -39,6 +39,7 @@ except (ImportError, ModuleNotFoundError):
     LayerType = ApexGuardDefaults()
 
 
+
 def get_language_model(
     hidden_size,
     ffn_hidden_size,
@@ -108,7 +109,8 @@ def get_language_model(
     sliding_window=None,
     flexible_pipeline_parallel_stages=None,
     use_flash_attention=False,
-    respect_provided_self_attention_mask: bool = False
+    respect_provided_self_attention_mask: bool = False,
+    use_ring_attention=False,
 ):
     """Build language model and return along with the key to save."""
 
@@ -194,7 +196,8 @@ def get_language_model(
         sliding_window=sliding_window,
         flexible_pipeline_parallel_stages=flexible_pipeline_parallel_stages,
         use_flash_attention=use_flash_attention,
-        respect_provided_self_attention_mask=respect_provided_self_attention_mask
+        respect_provided_self_attention_mask=respect_provided_self_attention_mask,
+        use_ring_attention=use_ring_attention,
     )
     logging.trace(f"In get_language_model() leave TransformerLanguageModel()", trace_type="recovery_time")
 
@@ -363,7 +366,6 @@ class Embedding(MegatronModule):
                 embeddings = self.embedding_dropout(embeddings)
         else:
             embeddings = self.embedding_dropout(embeddings)
-
         return embeddings
 
     def state_dict_for_save_checkpoint(self, destination=None, prefix='', keep_vars=False):
@@ -509,7 +511,8 @@ class TransformerLanguageModel(MegatronModule):
         sliding_window=None,
         flexible_pipeline_parallel_stages=None,
         use_flash_attention=False,
-        respect_provided_self_attention_mask: bool = False
+        respect_provided_self_attention_mask: bool = False,
+        use_ring_attention=False,
     ):
         super(TransformerLanguageModel, self).__init__(share_token_embeddings=share_embeddings_and_output_weights)
 
@@ -633,7 +636,8 @@ class TransformerLanguageModel(MegatronModule):
             sliding_window=sliding_window,
             flexible_pipeline_parallel_stages=flexible_pipeline_parallel_stages,
             use_flash_attention=use_flash_attention,
-            respect_provided_self_attention_mask=respect_provided_self_attention_mask
+            respect_provided_self_attention_mask=respect_provided_self_attention_mask,
+            use_ring_attention=use_ring_attention,
         )
         logging.trace(f"In TransformerLanguageModel() create encoder done", trace_type="recovery_time")
         self._encoder_key = 'encoder'
@@ -681,6 +685,7 @@ class TransformerLanguageModel(MegatronModule):
                 rotary_percentage=self.rotary_percentage,
                 flexible_pipeline_parallel_stages=flexible_pipeline_parallel_stages,
                 use_flash_attention=use_flash_attention,
+                use_ring_attention=use_ring_attention,
             )
             self._decoder_key = 'decoder'
 
@@ -743,7 +748,6 @@ class TransformerLanguageModel(MegatronModule):
             encoder_input = self.embedding(enc_input_ids, enc_position_ids, token_type_ids=token_type_ids)
         else:
             pass
-
         # encoder_input: [s, b, h]
 
         # enc_attn_mask: [1, 1, s, s]

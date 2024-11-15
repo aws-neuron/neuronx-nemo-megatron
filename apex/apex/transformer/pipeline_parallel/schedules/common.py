@@ -15,6 +15,8 @@ from apex.transformer.tensor_parallel.layers import (
     set_defaults_if_not_set_tensor_model_parallel_attributes, _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS,
 )
 from apex.transformer.log_util import get_transformer_logger
+import torch_xla.core.xla_model as xm
+from nemo.utils import logging
 
 
 _logger = get_transformer_logger(__name__)
@@ -303,7 +305,6 @@ def custom_backward(output: torch.Tensor, grad_output: Optional[torch.Tensor]) -
         accumulate_grad=True,
     )
 
-
 def forward_step(
     forward_step_func: FwdStepFunc,
     batch: Optional[Batch],
@@ -346,7 +347,6 @@ def forward_step(
         input_tensor = [input_tensor]
 
     input_tensor = [inp.get() if isinstance(inp, FutureTensor) else inp for inp in input_tensor]
-
     unwrapped_model.set_input_tensor(input_tensor)
     with torch.cuda.amp.autocast(
         enabled=not disable_autocast and dtype in (torch.half, torch.bfloat16),
@@ -366,10 +366,8 @@ def forward_step(
     # This prevents the compiler from eliminating duplicate computations introduced by activation checkpointing.
 
     #if parallel_state.get_pipeline_model_parallel_world_size() > 1:
-    #    import torch_xla.core.xla_model as xm
     #    xm.mark_step()
 
-    import torch_xla.core.xla_model as xm
     xm.mark_step()
 
     # timers("forward-compute").stop()

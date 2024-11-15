@@ -16,8 +16,27 @@
 import torch
 from einops import rearrange
 from torch import einsum, nn
+from apex.transformer import parallel_state
+from nemo.utils import logging
 
 __all__ = ['RotaryEmbedding', 'apply_rotary_pos_emb']
+
+
+def get_pos_emb_on_this_cp_rank(pos_emb, seq_dim):
+    cp_size = parallel_state.get_context_parallel_world_size()
+    cp_rank = parallel_state.get_context_parallel_rank()
+    
+    seq_len = pos_emb.shape[seq_dim]
+    assert seq_len%cp_size==0, f"seq_len {seq_len} is not divisible by CP size {cp_size}"
+    pos_emb = pos_emb.view(
+    *pos_emb.shape[0:seq_dim],
+    cp_size, seq_len // cp_size,
+    *pos_emb.shape[(seq_dim + 1) :],
+    )
+    index = torch.tensor([cp_rank], device=pos_emb.device)
+    pos_emb = pos_emb.index_select(seq_dim, index)
+    pos_emb = pos_emb.view(*pos_emb.shape[0:seq_dim], -1, *pos_emb.shape[(seq_dim + 2) :])
+    return pos_emb
 
 
 class RotaryEmbedding(torch.nn.Module):
@@ -60,10 +79,13 @@ class RotaryEmbedding(torch.nn.Module):
         self.register_buffer("sin_cached", emb.sin()[:, None, None, :], persistent=False)
 
     def forward(self, x, seq_len=None):
-        return (
-                self.cos_cached[:seq_len, :, :, :].to(dtype=x.dtype),
-                self.sin_cached[:seq_len, :, :, :].to(dtype=x.dtype),
-        )
+        cos_cached = self.cos_cached[:seq_len, :, :, :].to(dtype=x.dtype)
+        sin_cached = self.sin_cached[:seq_len, :, :, :].to(dtype=x.dtype)
+        if parallel_state.get_context_parallel_world_size() > 1:
+            # slice rotary_pos_emb along sequence dimension and select the parition of the current CP rank
+            cos_cached = get_pos_emb_on_this_cp_rank(cos_cached, 0)
+            sin_cached = get_pos_emb_on_this_cp_rank(sin_cached, 0)
+        return (cos_cached,sin_cached,)
 
 
 def rotate_half(x):
@@ -71,7 +93,6 @@ def rotate_half(x):
     x = rearrange(x, '... (j d) -> ... j d', j=2)
     x1, x2 = x.unbind(dim=-2)
     return torch.cat((-x2, x1), dim=-1)
-
 
 def apply_rotary_pos_emb(q, k, cos, sin, offset: int = 0):
     cos = cos[offset: q.shape[0] + offset, :, :, :]

@@ -34,6 +34,7 @@ from nemo.collections.nlp.modules.common.megatron.adapters.parallel_adapters imp
 )
 
 from torch_xla.core import xla_model
+import torch_xla.core.xla_model as xm
 
 from nemo.collections.nlp.modules.common.megatron.fused_bias_dropout_add import (
     bias_dropout_add,
@@ -52,6 +53,7 @@ from nemo.collections.nlp.modules.common.megatron.rotary_pos_embedding import Ro
 from nemo.collections.nlp.modules.common.megatron.utils import ApexGuardDefaults, attention_mask_func, erf_gelu
 from nemo.collections.nlp.modules.common.megatron.utils import openai_gelu as openai_gelu_func
 from nemo.collections.nlp.modules.common.megatron.neuron_kernels import nki_flash_attn_func
+from nemo.collections.nlp.modules.common.megatron.ring_attention_kernel import nki_ring_attn_func
 from nemo.core import adapter_mixins
 from nemo.utils import logging
 from transformers.utils import is_torch_tpu_available
@@ -61,7 +63,6 @@ try:
     from apex.transformer.enums import AttnMaskType, AttnType, ModelType
     from apex.transformer.utils import divide as safe_divide
     from apex.transformer.parallel_state import get_tensor_model_parallel_world_size
-    # from apex.normalization import MixedFusedRMSNorm
     from apex.transformer.layers.layer_norm import FastRMSNorm as MixedFusedRMSNorm
     from apex.transformer.functional.fused_softmax import FusedScaleMaskSoftmax
 
@@ -472,7 +473,8 @@ class CoreAttention(MegatronModule):
         num_kv_heads=None,
         sliding_window=None,
         use_flash_attention=False,
-        respect_provided_attention_mask: bool = False
+        respect_provided_attention_mask: bool = False,
+        use_ring_attention=False,
     ):
 
         super(CoreAttention, self).__init__()
@@ -546,6 +548,7 @@ class CoreAttention(MegatronModule):
         self.attention_dropout = torch.nn.Dropout(attention_dropout)
 
         self.use_flash_attention = use_flash_attention
+        self.use_ring_attention = use_ring_attention
 
     def forward(
         self,
@@ -563,7 +566,6 @@ class CoreAttention(MegatronModule):
         # ===================================
         # Raw attention scores. [b, np, s, s]
         # ===================================
-
         # [b, np, sq, sk]
         output_size = (query_layer.size(1), query_layer.size(2), query_layer.size(0), key_layer.size(0))
         sq, b, np, hn = query_layer.shape
@@ -606,10 +608,60 @@ class CoreAttention(MegatronModule):
 
 
         if self.position_embedding_type == 'rope':
-            cos, sin = self.rotary_emb(value_layer, seq_len=query_layer.shape[0])
+            enc_seq_length = query_layer.shape[0]
+            enc_seq_length *= parallel_state.get_context_parallel_world_size()
+            cos, sin = self.rotary_emb(value_layer, seq_len=enc_seq_length)
             query_layer, key_layer = apply_rotary_pos_emb(query_layer, key_layer, cos, sin, offset=0)
-
-
+        
+        if self.use_ring_attention:
+            raise NotImplementedError("Ring attention is not implemented yet.")
+            # [sq, b, np, hn] -> [b, np, sq, hn]
+            query_layer = query_layer.permute([1, 2, 0, 3])
+            # [sk, b, np, hn] -> [b, np, sk, hn]
+            key_layer = key_layer.permute([1, 2, 0, 3])
+            # [sk, b, np, hn] -> [b, np, sk, hn]
+            value_layer = value_layer.permute([1, 2, 0, 3])
+            
+            if self.use_gqa:
+                key_layer = repeat_kv(key_layer, self.num_query_head_per_kv_head)
+                value_layer = repeat_kv(value_layer, self.num_query_head_per_kv_head)
+            # FIXME: disable ring attention NKI for NNM integration
+            ring_nki_ok = False
+            if ring_nki_ok:
+                context_layer = nki_ring_attn_func(query_layer, key_layer, value_layer,
+                                                torch.distributed.get_rank(),
+                                                parallel_state.get_context_parallel_src_tgt_pairs(),
+                                                dropout_p=self.attention_dropout.p)
+            else:
+                cp_size = parallel_state.get_context_parallel_world_size()
+                cp_rank = parallel_state.get_context_parallel_rank()
+                seq_dim = 2
+                query_layer_list = [torch.zeros_like(query_layer, device=query_layer.device) for _ in range(cp_size)]
+                torch.distributed.all_gather(query_layer_list, query_layer, group=parallel_state.get_context_parallel_group())
+                full_query_layer = torch.cat(query_layer_list, dim=seq_dim)
+                key_layer_list = [torch.zeros_like(key_layer, device=key_layer.device) for _ in range(cp_size)]
+                torch.distributed.all_gather(key_layer_list, key_layer, group=parallel_state.get_context_parallel_group())
+                full_key_layer = torch.cat(key_layer_list, dim=seq_dim)
+                value_layer_list = [torch.zeros_like(value_layer, device=value_layer.device) for _ in range(cp_size)]
+                torch.distributed.all_gather(value_layer_list, value_layer, group=parallel_state.get_context_parallel_group())
+                full_value_layer = torch.cat(value_layer_list, dim=seq_dim)
+                context_layer = nki_flash_attn_func(full_query_layer, full_key_layer, full_value_layer, dropout_p=self.attention_dropout.p)
+                context_layer = context_layer.view(
+                    *context_layer.shape[0:seq_dim],
+                    cp_size, context_layer.shape[seq_dim] // cp_size,
+                    *context_layer.shape[(seq_dim + 1) :],
+                    )
+                index = torch.tensor([cp_rank], device=context_layer.device)
+                context_layer = context_layer.index_select(seq_dim, index)
+                context_layer = context_layer.view(*context_layer.shape[0:seq_dim], -1, *context_layer.shape[(seq_dim + 2) :])
+            
+            # [b, np, sq, hn] --> [sq, b, np, hn]
+            context_layer = context_layer.permute(2, 0, 1, 3).contiguous()
+            # [sq, b, np, hn] --> [sq, b, hp]
+            new_context_layer_shape = context_layer.size()[:-2] + (self.hidden_size_per_partition,)
+            context_layer = context_layer.view(*new_context_layer_shape)
+            return context_layer
+        
         if self.use_flash_attention:
             if not self.sequence_parallel:
                 raise NotImplementedError("The flash attention without the sequence parallel is not supported yet.")
@@ -776,7 +828,6 @@ class CoreAttention(MegatronModule):
         # [sq, b, np, hn] --> [sq, b, hp]
         new_context_layer_shape = context_layer.size()[:-2] + (self.hidden_size_per_partition,)
         context_layer = context_layer.view(*new_context_layer_shape)
-
         return context_layer
 
 
@@ -825,7 +876,8 @@ class ParallelAttention(MegatronModule, adapter_mixins.AdapterModuleMixin):
         num_kv_heads=None,
         sliding_window=None,
         use_flash_attention=False,
-        respect_provided_attention_mask: bool = False
+        respect_provided_attention_mask: bool = False,
+        use_ring_attention=False,
     ):
         super(ParallelAttention, self).__init__()
 
@@ -971,7 +1023,8 @@ class ParallelAttention(MegatronModule, adapter_mixins.AdapterModuleMixin):
             num_kv_heads=num_kv_heads,
             sliding_window=sliding_window,
             use_flash_attention=use_flash_attention,
-            respect_provided_attention_mask= respect_provided_attention_mask
+            respect_provided_attention_mask= respect_provided_attention_mask,
+            use_ring_attention=use_ring_attention,
         )
 
 
@@ -1235,7 +1288,7 @@ class ParallelAttention(MegatronModule, adapter_mixins.AdapterModuleMixin):
                 self.hidden_size_per_attention_head,
             )
             query_layer = query_layer.view(*new_tensor_shape)
-
+        
         if self.is_adapter_available():
             key_infused_adapter = self.get_from_adapter_layer(AdapterName.KEY_INFUSED)
             value_infused_adapter = self.get_from_adapter_layer(AdapterName.VALUE_INFUSED)
@@ -1349,6 +1402,7 @@ class ParallelChunkedCrossAttention(MegatronModule):
         gradient_accumulation_fusion=False,
         normalize_attention_scores=True,
         use_flash_attention=False,
+        use_ring_attention=False,
     ):
         super(ParallelChunkedCrossAttention, self).__init__()
         self.cross_attention = ParallelAttention(
@@ -1564,7 +1618,8 @@ class ParallelTransformerLayer_(MegatronModule, adapter_mixins.AdapterModuleMixi
         num_kv_heads=None,
         sliding_window=None,
         use_flash_attention=False,
-        respect_provided_self_attention_mask: bool = False
+        respect_provided_self_attention_mask: bool = False,
+        use_ring_attention=False,
     ):
         super(ParallelTransformerLayer_, self).__init__()
 
@@ -1662,7 +1717,8 @@ class ParallelTransformerLayer_(MegatronModule, adapter_mixins.AdapterModuleMixi
                 num_kv_heads=num_kv_heads,
                 sliding_window=sliding_window,
                 use_flash_attention=use_flash_attention,
-                respect_provided_attention_mask=respect_provided_self_attention_mask
+                respect_provided_attention_mask=respect_provided_self_attention_mask,
+                use_ring_attention=use_ring_attention,
             )
             logging.trace("In ParallelTransfomerLayer() create ParallelAttention for encoder done", trace_type="recovery_time")
 
@@ -1736,6 +1792,7 @@ class ParallelTransformerLayer_(MegatronModule, adapter_mixins.AdapterModuleMixi
                 normalize_attention_scores=normalize_attention_scores,
                 transfer_with_static_ring=transfer_with_static_ring,
                 use_flash_attention=use_flash_attention,
+                use_ring_attention=use_ring_attention,
             )
             logging.trace("In ParallelTransfomerLayer() create ParallelAttention for decoder done", trace_type="recovery_time")
 
@@ -2065,7 +2122,7 @@ class ParallelTransformerLayer_(MegatronModule, adapter_mixins.AdapterModuleMixi
         )
 
         output = bias_dropout_add_func(mlp_output, mlp_bias, residual, self.hidden_dropout)
-            # print(f"Layer: {self.layer_number} MLP + Dropout + Residual checksum {output.sum()}")
+        # print(f"Layer: {self.layer_number} MLP + Dropout + Residual checksum {output.sum()}")
 
         if self.transformer_block_type == 'post_ln':
             output = self.post_attention_layernorm(output)
@@ -2139,7 +2196,8 @@ class ParallelTransformerLayer(ParallelTransformerLayer_):
         num_kv_heads=None,
         sliding_window=None,
         use_flash_attention=False,
-        respect_provided_self_attention_mask: bool =False
+        respect_provided_self_attention_mask: bool =False,
+        use_ring_attention=False,
     ):
         super(ParallelTransformerLayer, self).__init__(
             init_method=init_method,
@@ -2192,7 +2250,8 @@ class ParallelTransformerLayer(ParallelTransformerLayer_):
             num_kv_heads=num_kv_heads,
             sliding_window=sliding_window,
             use_flash_attention=use_flash_attention,
-            respect_provided_self_attention_mask=respect_provided_self_attention_mask
+            respect_provided_self_attention_mask=respect_provided_self_attention_mask,
+            use_ring_attention=use_ring_attention,
         )
 
         if precision == 32:
@@ -2426,7 +2485,8 @@ class ParallelTransformer(MegatronModule):
         sliding_window=None,
         flexible_pipeline_parallel_stages=None,
         use_flash_attention=False,
-        respect_provided_self_attention_mask: bool = False
+        respect_provided_self_attention_mask: bool = False,
+        use_ring_attention=False,
     ):
         super(ParallelTransformer, self).__init__()
 
@@ -2530,7 +2590,7 @@ class ParallelTransformer(MegatronModule):
         if self.model_type == ModelType.encoder_or_decoder and self.flexible_pipeline_parallel_stages is None:
             assert (
                 num_layers % parallel_state.get_pipeline_model_parallel_world_size() == 0
-            ), 'num_layers must be divisible by pipeline_model_parallel_size'
+            ), f'num_layers {num_layers} must be divisible by pipeline_model_parallel_size {parallel_state.get_pipeline_model_parallel_world_size()}'
 
         assert moe_frequency <= num_layers, 'MoE frequency must be <= number of transformer layers'
         # TODO: Add similar assert for encoder-decoder.
@@ -2635,7 +2695,8 @@ class ParallelTransformer(MegatronModule):
                     num_kv_heads=num_kv_heads,
                     sliding_window=sliding_window,
                     use_flash_attention=use_flash_attention,
-                    respect_provided_self_attention_mask=respect_provided_self_attention_mask
+                    respect_provided_self_attention_mask=respect_provided_self_attention_mask,
+                    use_ring_attention=use_ring_attention,
                 )
 
         if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
@@ -3036,7 +3097,6 @@ class ParallelTransformer(MegatronModule):
         if not self.pre_process:
             # See set_input_tensor()
             hidden_states = self.input_tensor
-
         # TODO: @Yi Dong, what should this be?
         if retrieved_emb is not None:
             assert len(retrieved_emb.shape) == 5
