@@ -199,6 +199,7 @@ class _NLPXLALauncher(_XLALauncher):
             self._strategy._local_rank = process_idx
             results = function(*args, **kwargs)
             _rank_teardown(process_idx)
+
         return None
    
     def _wrapping_function(
@@ -1403,7 +1404,6 @@ class NLPDDPStrategy(TPUSpawnStrategy):
             parallel_state.initialize_model_parallel(
                 tensor_model_parallel_size_=app_state.tensor_model_parallel_size,
                 pipeline_model_parallel_size_=app_state.pipeline_model_parallel_size,
-                context_parallel_size_=app_state.context_parallel_size,
                 pipeline_model_parallel_split_rank_=app_state.pipeline_model_parallel_split_rank,
                 virtual_pipeline_model_parallel_size_=app_state.virtual_pipeline_model_parallel_size,
             )
@@ -1417,7 +1417,6 @@ class NLPDDPStrategy(TPUSpawnStrategy):
             app_state.data_parallel_rank = parallel_state.get_data_parallel_rank()
             app_state.data_parallel_size = parallel_state.get_data_parallel_world_size()
             app_state.pipeline_model_parallel_group = parallel_state.get_pipeline_model_parallel_group()
-            app_state.context_parallel_group = parallel_state.get_context_parallel_group()
             # app_state.global_rank = self.global_rank
 
             setup_microbatch_calculator(

@@ -47,7 +47,6 @@ from apex.transformer.tensor_parallel.mappings import (
 from apex.transformer.tensor_parallel.random import get_xla_rng_tracker
 from apex.transformer.tensor_parallel.utils import VocabUtility
 from apex.transformer.log_util import get_transformer_logger
-from nemo.utils import logging
 
 
 # `all_gather_into_tensor` and `reduce_scatter_tensor` are new placeholders for
