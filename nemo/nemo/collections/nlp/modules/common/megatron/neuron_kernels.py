@@ -6,6 +6,8 @@ import torch
 import torch_xla.core.xla_model as xm
 from collections import defaultdict
 
+from neuronxcc.nki.kernels.attention import FlashConfig
+
 import logging
 
 
@@ -26,12 +28,17 @@ def _flash_attn_forward(q, k, v, causal, mixed_precision, seed, dropout_p, softm
             "python3 -m pip install --extra-index-url=https://pip.repos.neuron.amazonaws.com neuronx-cc torch_neuronx"
         )
 
+    config = None
+    if check_xla_bf16_flags():
+        config = FlashConfig(lse_dtype="bfloat16")
+
     bs, num_heads, head_dim, seq = q.shape
     attn_output, lse = flash_fwd[bs, num_heads](q, k, v, seed,
                                                 use_causal_mask=causal,
                                                 mixed_precision=mixed_precision,
                                                 dropout_p=dropout_p,
-                                                softmax_scale=softmax_scale)
+                                                softmax_scale=softmax_scale,
+                                                config=config)
     
     if check_xla_bf16_flags():
         attn_output = attn_output.to(torch.bfloat16)
