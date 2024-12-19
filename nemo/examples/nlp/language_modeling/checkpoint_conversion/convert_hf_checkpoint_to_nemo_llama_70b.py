@@ -4,12 +4,19 @@ from pathlib import Path
 import numpy as np
 import torch
 import os
+import logging
+import itertools
 import glob
 from multiprocessing import Pool
 from functools import partial
 
+from examples.nlp.language_modeling.checkpoint_conversion.convert_hf_checkpoint_to_nemo_llama import get_layer_map, convert_checkpoint_to_vpp_format, load_model_checkpoints
+from examples.nlp.language_modeling.checkpoint_conversion.logger_factory import LoggerFactory
 
-def get_pipeline_bin_division(model_bin_file, num_hidden_layers, PP):
+logger = LoggerFactory.create_logger(name="hf_to_nemo_llama_70b", level=logging.INFO)
+
+
+def get_pipeline_bin_division(model_bin_file, PP, layers_on_curr_pp):
     with open(model_bin_file, "r") as json_data:
         model_info = json.load(json_data)
         json_data.close()
@@ -19,8 +26,7 @@ def get_pipeline_bin_division(model_bin_file, num_hidden_layers, PP):
         for key, value in model_info["weight_map"].items():
             if "layers." in key:
                 layer_number = int(key.split(".")[2])
-                if (int(layer_number) < (num_hidden_layers // PP) * (p + 1)) and (
-                        int(layer_number) >= (num_hidden_layers // PP) * p):
+                if int(layer_number) in layers_on_curr_pp:
                     shard_number = int(value.split("-")[1])
                     if shard_number not in pp_to_bin[str(p)]:
                         pp_to_bin[str(p)].append(shard_number)
@@ -75,6 +81,7 @@ def hf2mt_fix_query_key_value_ordering(
 def convert_checkpoint(p, args, config):
     TP = args.tp_degree
     PP = args.pp_degree
+    VPP = args.vpp_degree
 
     out_models = convert_state_dict_for_pp_rank(
         p,
@@ -83,6 +90,7 @@ def convert_checkpoint(p, args, config):
         args.num_shards, config,
         TP,
         PP,
+        VPP,
         args.save_bf16,
         args.gqa_qkv)
 
@@ -103,7 +111,8 @@ def convert_checkpoint(p, args, config):
             save(out_models[i], checkpoint_name)
         else:
             torch.save(out_models[i], checkpoint_name)  # , (not master_only), global_master=True)
-    print("Done saving Megatron checkpoint")
+    logger.info("Done saving Megatron checkpoint")
+
 
 
 def convert_state_dict_for_pp_rank(
@@ -114,9 +123,10 @@ def convert_state_dict_for_pp_rank(
         config,
         TP,
         PP,
+        VPP,
         save_bf16,
         gqa_qkv):
-    print(f"------- start converting parameters for pipeline pp={p}")
+    logger.info(f"------- start converting parameters for pipeline pp={p}")
 
     br_key = "layers."  # Used to filter all transformer layers except layernorm
 
@@ -142,32 +152,40 @@ def convert_state_dict_for_pp_rank(
         split, br_k, dim, transpose = v
         reverse_translation[br_k] = (split, k, dim, transpose)
 
+    n_layers_per_pp = config['num_hidden_layers'] // PP
+    if VPP is None:
+        layers_on_curr_pp = list(range(p * n_layers_per_pp, (p + 1) * n_layers_per_pp))
+    else:
+        layer_map = get_layer_map(PP, VPP, config['num_hidden_layers'])
+        layers_on_curr_pp = list(itertools.chain(*layer_map[p]))
+
     # this is for sharded huggingface checkpoints
     if model_bin_file:
-        pp_to_bin = get_pipeline_bin_division(model_bin_file, config['num_hidden_layers'], PP)
+        pp_to_bin = get_pipeline_bin_division(model_bin_file, PP, layers_on_curr_pp)
         model_paths = [f"{path_to_checkpoint}/pytorch_model-{x:05d}-of-{num_shards:05d}.bin" for x in
                        pp_to_bin[str(p)]]
-        print(f"model bins for pp {p}: {model_paths}")
+        logger.info(f"model bins for pp {p}: {model_paths}")
     else:
         model_paths = sorted(glob.glob(f'{path_to_checkpoint}/pytorch_model*.bin'))
 
-    model_llama = {}
-    for _path in model_paths:
-        print(f'Loading {_path}')
-        ts = torch.load(_path, map_location='cpu')
-        model_llama.update(ts)
-    print(len(model_llama))
+    # model_llama = {}
+    # for _path in model_paths:
+    #     logger.info(f'Loading {_path}')
+    #     ts = torch.load(_path, map_location='cpu')
+    #     model_llama.update(ts)
+    # logger.info(len(model_llama))
 
-    print("Loaded Llama model")
+    model_llama = load_model_checkpoints(model_paths)
+    logger.info("Loaded Llama model")
 
     gqa = 'num_query_groups' in config or 'num_key_value_heads' in config
     old_gqa = gqa and not gqa_qkv
 
+
     # Merge QKV for GQA models
-    n_layers_per_pp = config['num_hidden_layers'] // PP
     if old_gqa:
         # Merge QKV for (old) trainium GQA implementation
-        for i in range(p * n_layers_per_pp, (p + 1) * n_layers_per_pp):
+        for i in layers_on_curr_pp:
             q = model_llama[f'model.layers.{i}.self_attn.q_proj.weight']
             k = model_llama[f'model.layers.{i}.self_attn.k_proj.weight']
             v = model_llama[f'model.layers.{i}.self_attn.v_proj.weight']
@@ -179,7 +197,7 @@ def convert_state_dict_for_pp_rank(
             model_llama.pop(f'model.layers.{i}.self_attn.v_proj.weight')
     if gqa and not old_gqa:
         # new GQA
-        for i in range(p * n_layers_per_pp, (p + 1) * n_layers_per_pp):
+        for i in layers_on_curr_pp:
             q = model_llama[f'model.layers.{i}.self_attn.q_proj.weight']
             k = model_llama[f'model.layers.{i}.self_attn.k_proj.weight']
             v = model_llama[f'model.layers.{i}.self_attn.v_proj.weight']
@@ -196,56 +214,57 @@ def convert_state_dict_for_pp_rank(
     out_models = {}
     for i in range(TP):
 
-        print(f"=== PP {p}, TP {i} ===")
+        logger.info(f"=== PP {p}, TP {i} ===")
         nemo_model = {}
         for k, v in model_llama.items():
-            # print(f">>> {k}")
+            # logger.info(f">>> {k}")
             if "attention.masked_bias" in k:
                 # We don't want to copy attention mask bias, since its a constant of 1e4
                 continue
             if br_key in k:
                 parts = k.split(br_key)[1].split(".")
                 layer_number = parts[0]
-                if int(layer_number) >= (config["num_hidden_layers"] // PP) * (p + 1) or int(layer_number) < (
-                        config["num_hidden_layers"] // PP) * p:
-                    continue
-                k = ".".join(parts[1:])
-                if k == "attn.bias":
-                    continue
-                split, key, dim, transpose = reverse_translation[k]
-                layer_number = layer_number if PP == 1 else str(int(layer_number) % (config["num_hidden_layers"] // PP))
-                key = "model.language_model.encoder.layers." + layer_number + "." + key
-                nemo_model[key] = v
-                if transpose:
-                    nemo_model[key] = torch.transpose(
-                        nemo_model[key], 0, 1
-                    )
 
-                if "query" in (key) and "query_key_value" not in key: # old GQA
-                    heads = config["num_attention_heads"]
-                    hidden_size_per_head = config["hidden_size"] // heads
-                    nemo_model[key] = hf2mt_fix_query_key_value_ordering(
-                        nemo_model[key], 2.0, 1, heads, hidden_size_per_head
-                    )
-                if "key_value" in (key) and "query_key_value" not in key: # old GQA
-                    heads = config["num_attention_heads"]
-                    hidden_size_per_head = config["hidden_size"] // heads
-                    heads = config['num_key_value_heads']
-                    nemo_model[key] = hf2mt_fix_query_key_value_ordering(
-                        nemo_model[key], 2.0, 2, heads, hidden_size_per_head
-                    )
-                if split:
-                    tp_last_dim_size = nemo_model[key].shape[dim] // TP
-                    if dim:  # First or last dimension to shard
-                        nemo_model[key] = nemo_model[key][
-                                          ..., i * tp_last_dim_size: (i + 1) * tp_last_dim_size
-                                          ].clone()
-                    else:
-                        nemo_model[key] = nemo_model[key][
-                                          i * tp_last_dim_size: (i + 1) * tp_last_dim_size, ...
-                                          ].clone()
+                if int(layer_number) in layers_on_curr_pp:
+                    logger.info(f'layer_number in HF: {layer_number}')
+                    k = ".".join(parts[1:])
+                    if k == "attn.bias":
+                        continue
+                    split, key, dim, transpose = reverse_translation[k]
+                    layer_number = str(layers_on_curr_pp.index(int(layer_number)))
+                    logger.info(f'layer_number in nemo: {layer_number}')
+                    key = "model.language_model.encoder.layers." + layer_number + "." + key
+                    nemo_model[key] = v
+                    if transpose:
+                        nemo_model[key] = torch.transpose(
+                            nemo_model[key], 0, 1
+                        )
 
-                print(key, split, nemo_model[key].shape, v.shape)
+                    if "query" in (key) and "query_key_value" not in key: # old GQA
+                        heads = config["num_attention_heads"]
+                        hidden_size_per_head = config["hidden_size"] // heads
+                        nemo_model[key] = hf2mt_fix_query_key_value_ordering(
+                            nemo_model[key], 2.0, 1, heads, hidden_size_per_head
+                        )
+                    if "key_value" in (key) and "query_key_value" not in key: # old GQA
+                        heads = config["num_attention_heads"]
+                        hidden_size_per_head = config["hidden_size"] // heads
+                        heads = config['num_key_value_heads']
+                        nemo_model[key] = hf2mt_fix_query_key_value_ordering(
+                            nemo_model[key], 2.0, 2, heads, hidden_size_per_head
+                        )
+                    if split:
+                        tp_last_dim_size = nemo_model[key].shape[dim] // TP
+                        if dim:  # First or last dimension to shard
+                            nemo_model[key] = nemo_model[key][
+                                            ..., i * tp_last_dim_size: (i + 1) * tp_last_dim_size
+                                            ].clone()
+                        else:
+                            nemo_model[key] = nemo_model[key][
+                                            i * tp_last_dim_size: (i + 1) * tp_last_dim_size, ...
+                                            ].clone()
+
+                    logger.info(f'key: {key}, split: {split}, nemo_model[key].shape: {nemo_model[key].shape}, v.shape: {v.shape}')
             else:
                 split, key, dim, transpose = reverse_translation[k]
                 if "embed_tokens" in k and p == 0:
@@ -261,10 +280,10 @@ def convert_state_dict_for_pp_rank(
                     nemo_model[key] = x[
                                       i * tp_last_dim_size: (i + 1) * tp_last_dim_size, ...
                                       ].clone()
-                    print(key, split, nemo_model[key].shape, v.shape)
+                    logger.info(f'key: {key}, split: {split}, nemo_model[key].shape: {nemo_model[key].shape}, v.shape: {v.shape}')
                 elif "model.norm" in k and p == (PP - 1):
                     nemo_model[key] = v
-                    print(key, split, nemo_model[key].shape, v.shape)
+                    logger.info(f'key: {key}, split: {split}, nemo_model[key].shape: {nemo_model[key].shape}, v.shape: {v.shape}')
                 elif "lm_head" in k and p == (PP - 1):
                     if split:
                         tp_last_dim_size = v.shape[dim] // TP
@@ -272,7 +291,7 @@ def convert_state_dict_for_pp_rank(
                             nemo_model[key] = v[..., i * tp_last_dim_size:(i + 1) * tp_last_dim_size].clone()
                         else:
                             nemo_model[key] = v[i * tp_last_dim_size:(i + 1) * tp_last_dim_size, ...].clone()
-                    print(key, split, nemo_model[key].shape, v.shape)
+                    logger.info(f'key: {key}, split: {split}, nemo_model[key].shape: {nemo_model[key].shape}, v.shape: {v.shape}')
 
         if save_bf16:
             for _k in nemo_model:
@@ -285,13 +304,17 @@ def convert_state_dict_for_pp_rank(
         h_to_4h_keys = [k for k in out_model['state_dict'].keys() if 'dense_h_to_4h' in k and 'dense_h_to_4h_2' not in k]
         for k in h_to_4h_keys:
             k_1 = k.replace('dense_h_to_4h', 'dense_h_to_4h_2')
-            print(f"merging {k} ({out_model['state_dict'][k].shape}) and {k_1} ({out_model['state_dict'][k_1].shape})")
+            logger.info(f"merging {k} ({out_model['state_dict'][k].shape}) and {k_1} ({out_model['state_dict'][k_1].shape})")
             out_model['state_dict'][k] = torch.concat([out_model['state_dict'][k], out_model['state_dict'][k_1]], dim=0)
-            print(f"merged pojections is ({out_model['state_dict'][k].shape})")
+            logger.info(f"merged pojections is ({out_model['state_dict'][k].shape})")
             out_model['state_dict'].pop(k_1)
 
+        if VPP is not None:
+            convert_checkpoint_to_vpp_format(out_model, p, PP, VPP)
         out_models[i] = out_model
+    del model_llama
     return out_models
+
 
 
 if __name__ == "__main__":
@@ -328,6 +351,11 @@ if __name__ == "__main__":
         default=8,
         type=int,
         help="Pipeline parallelism",
+    )
+    parser.add_argument(
+        "--vpp_degree",
+        type=int,
+        help="Virtual Pipeline parallelism. When set, will interleave layers through pipeline stages",
     )
     parser.add_argument(
         "--save_bf16",

@@ -48,6 +48,10 @@ from nemo.utils import logging, model_utils
 from nemo.utils.app_state import AppState
 from nemo.utils.debug_hook import register_debug_hooks
 from nemo.utils.get_rank import get_rank, is_global_rank_zero
+from packaging import version
+
+is_pt2_1 = version.parse(torch.__version__) == version.parse("2.1")
+is_pt2_2_plus = version.parse(torch.__version__) >= version.parse("2.2")
 __all__ = ['ModelPT']
 
 class NLPLightningModule(LightningModule):
@@ -767,6 +771,20 @@ class ModelPT(NLPLightningModule, Model):
 
         else:
             if wrap_with_zero:
+                if is_pt2_1:
+                    # _ALL_GATHER_REDUCE_SCATTER_BUCKET_CAP_MB is set by default by Neuron in pt2.1:
+                    # https://github.com/pytorch/xla/blob/r2.1_aws_neuron/torch_xla/core/xla_model.py#L43C1-L43C41
+                    optimizer_args["coalesce_cc"] = True
+                elif is_pt2_2_plus:
+                    # _ALL_GATHER_REDUCE_SCATTER_BUCKET_CAP_MB was replaced during upstreaming in favor of ZeRO1 arguments
+                    _ALL_GATHER_REDUCE_SCATTER_BUCKET_CAP_MB = 160
+                    bucket_cap = int(
+                        os.getenv("ALL_GATHER_REDUCE_SCATTER_BUCKET_CAP_MB", _ALL_GATHER_REDUCE_SCATTER_BUCKET_CAP_MB)
+                    )
+                    dp_groups = self.calculate_data_parallel_groups()[0]
+                    all_gather_bucket_cap = max(1, bucket_cap // len(dp_groups))
+                    optimizer_args["bucket_cap_mb_reduce_scatter"] = bucket_cap
+                    optimizer_args["bucket_cap_mb_all_gather"] = all_gather_bucket_cap
                 optimizer = ZeroRedundancyOptimizer(self._optimizer_param_groups,
                                                     optim.AVAILABLE_OPTIMIZERS[optimizer_name],
                                                     optimizer_dtype=torch.double if self.zero_use_master_weight else torch.float32,

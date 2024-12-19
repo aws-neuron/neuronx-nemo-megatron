@@ -1,96 +1,68 @@
 import os
-from dataclasses import dataclass
 
 import neuronxcc.nki.language as nl
 import numpy as np
 import torch
 import torch_xla.core.xla_model as xm
+from collections import defaultdict
+
+from neuronxcc.nki.kernels.attention import FlashConfig
+
+import logging
 
 
-def _flash_attn_placeholder(*args, **kwargs):
-    raise RuntimeError(
-        "Flash Attention initialization failed!\n"
-        "Please check and upgrade neuronx-cc and torch_neuronx.\n"
-        "python3 -m pip install --extra-index-url=https://pip.repos.neuron.amazonaws.com neuronx-cc torch_neuronx"
-    )
+logger = logging.getLogger(__name__)
 
-try:
-    from neuronxcc.nki.kernels.attention import flash_attn_bwd, flash_fwd, FlashConfig
-    from torch_neuronx.xla_impl.ops import nki_jit
-
-    _flash_fwd_nki_call = nki_jit()(flash_fwd)
-    _flash_bwd_nki_call = nki_jit()(flash_attn_bwd)
-
-    @dataclass(frozen=True)
-    class FlashConfigLongSeq(FlashConfig):
-        should_transpose_v: bool = True
-        seq_tile_size: int = 2048
-
-    @dataclass(frozen=True)
-    class FlashConfigShortSeq(FlashConfig):
-        should_transpose_v: bool = True
-        seq_tile_size: int = 512
-
-except Exception as e:
-    _flash_fwd_nki_call = _flash_attn_placeholder
-    _flash_bwd_nki_call = _flash_attn_placeholder
-
+def check_xla_bf16_flags():
+    if os.getenv("XLA_USE_BF16") == '1' or os.getenv("XLA_DOWNCAST_BF16") == '1':
+        return True
+    return False
 
 def _flash_attn_forward(q, k, v, causal, mixed_precision, seed, dropout_p, softmax_scale):
+    try:
+        from neuronxcc.nki.kernels import flash_fwd
+    except ImportError:
+        raise RuntimeError(
+            "Flash Attention initialization failed!\n"
+            "Please check and upgrade neuronx-cc and torch_neuronx.\n"
+            "python3 -m pip install --extra-index-url=https://pip.repos.neuron.amazonaws.com neuronx-cc torch_neuronx"
+        )
+
+    config = None
+    if check_xla_bf16_flags():
+        config = FlashConfig(lse_dtype="bfloat16")
+
     bs, num_heads, head_dim, seq = q.shape
-    attn_output = torch.zeros(size=(bs, num_heads, seq, head_dim), dtype=q.dtype, device=q.device)
-    if mixed_precision:
-        if os.environ.get("XLA_DOWNCAST_BF16"):
-            lse_dtype = torch.float64
-        else:
-            lse_dtype = torch.float32
-    else:
-        lse_dtype = q.dtype
-    lse = torch.zeros(
-        size=(bs, num_heads, nl.tile_size.pmax, seq // nl.tile_size.pmax),
-        dtype=lse_dtype, device=q.device,
-    )
-    if seq < 4096:
-        flash_config = FlashConfigShortSeq()
-    else:
-        flash_config = FlashConfigLongSeq()
-    _flash_fwd_nki_call[bs, num_heads](
-        q,
-        k,
-        v,
-        seed,
-        attn_output,
-        lse,
-        use_causal_mask=causal,
-        mixed_precision=mixed_precision,
-        dropout_p=dropout_p,
-        softmax_scale=softmax_scale,
-        config=flash_config
-    )
+    attn_output, lse = flash_fwd[bs, num_heads](q, k, v, seed,
+                                                use_causal_mask=causal,
+                                                mixed_precision=mixed_precision,
+                                                dropout_p=dropout_p,
+                                                softmax_scale=softmax_scale,
+                                                config=config)
+    
+    if check_xla_bf16_flags():
+        attn_output = attn_output.to(torch.bfloat16)
+    
     return attn_output, lse
 
 
 def _flash_attn_backward(q, k, v, o, dout, lse, seed, causal, mixed_precision, dropout_p, softmax_scale):
+    try:
+        from neuronxcc.nki.kernels import flash_attn_bwd
+    except ImportError:
+        raise RuntimeError(
+            "Flash Attention initialization failed!\n"
+            "Please check and upgrade neuronx-cc and torch_neuronx.\n"
+            "python3 -m pip install --extra-index-url=https://pip.repos.neuron.amazonaws.com neuronx-cc torch_neuronx"
+        )
+
     bs, num_heads, _, _ = q.shape
-    dq = torch.zeros_like(q)
-    dk = torch.zeros_like(k)
-    dv = torch.zeros_like(v)
-    _flash_bwd_nki_call[bs, num_heads](
-        q,
-        k,
-        v,
-        o,
-        dout,
-        lse,
-        seed,
-        dq,
-        dk,
-        dv,
-        use_causal_mask=causal,
-        mixed_precision=mixed_precision,
-        dropout_p=dropout_p,
-        softmax_scale=softmax_scale,
-    )
+    dq, dk, dv, = flash_attn_bwd[bs, num_heads](q, k, v, o,
+                                                dout, lse, seed,
+                                                use_causal_mask=causal,
+                                                mixed_precision=mixed_precision,
+                                                dropout_p=dropout_p,
+                                                softmax_scale=softmax_scale)
     return dq, dk, dv
 
 
@@ -118,7 +90,7 @@ class NKIAttnFunc(torch.autograd.Function):
         attn_output, lse = _flash_attn_forward(
             q,
             k,
-            v,
+            v.permute(0, 1, 3, 2),
             causal=causal,
             mixed_precision=mixed_precision,
             seed=seed,
@@ -195,7 +167,7 @@ def nki_flash_attn_func(
     k = k.permute(0, 1, 3, 2)
     v = v.permute(0, 1, 3, 2)
 
-    if os.environ.get("XLA_USE_BF16") or os.environ.get("XLA_DOWNCAST_BF16"):
+    if check_xla_bf16_flags():
         q = q.to(torch.bfloat16)
         k = k.to(torch.bfloat16)
         v = v.to(torch.bfloat16)

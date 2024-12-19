@@ -33,6 +33,8 @@ from nemo.collections.nlp.modules.common.megatron.adapters.parallel_adapters imp
     LoraKVAdapterConfig
 )
 
+from torch_xla.core import xla_model
+
 from nemo.collections.nlp.modules.common.megatron.fused_bias_dropout_add import (
     bias_dropout_add,
     bias_dropout_add_fused_inference,
@@ -439,6 +441,10 @@ class CoreAttention(MegatronModule):
         See Figure 3. in Reducing Activation Recomputation in Large Transformer Models
         https://arxiv.org/pdf/2205.05198.pdf for more details.
 
+        WARNING: This attention implementation will ignore the attention mask provided for instances
+        unless respect_provided_attention_mask is True (default: False).
+        If the automatic mask is used, it will be causal
+        unless sliding_window is specified and equal to the sequence length (default: None).
     """
 
     def __init__(
@@ -466,6 +472,7 @@ class CoreAttention(MegatronModule):
         num_kv_heads=None,
         sliding_window=None,
         use_flash_attention=False,
+        respect_provided_attention_mask: bool = False
     ):
 
         super(CoreAttention, self).__init__()
@@ -475,6 +482,8 @@ class CoreAttention(MegatronModule):
         self.bf16 = precision == 'bf16'
         self.multi_query_attention = multi_query_attention
         self.sliding_window = sliding_window
+        self.respect_provided_attention_mask = respect_provided_attention_mask
+
         self.apply_query_key_layer_scaling = apply_query_key_layer_scaling
         self.attention_softmax_in_fp32 = False
         if self.apply_query_key_layer_scaling:
@@ -559,9 +568,19 @@ class CoreAttention(MegatronModule):
         output_size = (query_layer.size(1), query_layer.size(2), query_layer.size(0), key_layer.size(0))
         sq, b, np, hn = query_layer.shape
 
+        use_sliding_window = self.sliding_window and self.sliding_window != sq
+        if use_sliding_window and self.respect_provided_attention_mask:
+            raise RuntimeError("Cannot use both sliding window attention and respect_provided_attention_mask.")
+
+        if self.respect_provided_attention_mask and attention_mask is None:
+            raise RuntimeError("attention_mask must be non-None if respect_provided_attention_mask is True")
+
         # Materialize attention mask right before use
         if is_torch_tpu_available():
-            if self.sliding_window and self.sliding_window != sq:
+            if self.respect_provided_attention_mask:
+                # Leave the attention mask the user provided untouched.
+                pass
+            elif use_sliding_window:
                 def create_binary_sliding_window_attention_mask(seq_len, window_size):
                     """
                     Create a binary sliding window local attention mask.
@@ -581,6 +600,7 @@ class CoreAttention(MegatronModule):
 
                 attention_mask = create_binary_sliding_window_attention_mask(sq, self.sliding_window)
             else:
+                # Default to a causal mask if we aren't using the user-provided mask and aren't using sliding windows
                 attention_mask = torch.triu(torch.ones(
                     (1, 1, sq, sq), device='xla'), diagonal=1).bool()
 
@@ -765,6 +785,8 @@ class ParallelAttention(MegatronModule, adapter_mixins.AdapterModuleMixin):
 
     Self-attention layer takes input with size [s, b, h]
     and returns output of the same size.
+
+    For respect_provided_attention_mask, see CoreAttention.
     """
 
     def __init__(
@@ -803,6 +825,7 @@ class ParallelAttention(MegatronModule, adapter_mixins.AdapterModuleMixin):
         num_kv_heads=None,
         sliding_window=None,
         use_flash_attention=False,
+        respect_provided_attention_mask: bool = False
     ):
         super(ParallelAttention, self).__init__()
 
@@ -948,6 +971,7 @@ class ParallelAttention(MegatronModule, adapter_mixins.AdapterModuleMixin):
             num_kv_heads=num_kv_heads,
             sliding_window=sliding_window,
             use_flash_attention=use_flash_attention,
+            respect_provided_attention_mask= respect_provided_attention_mask
         )
 
 
@@ -1482,6 +1506,10 @@ class ParallelTransformerLayer_(MegatronModule, adapter_mixins.AdapterModuleMixi
 
     Transformer layer takes input with size [s, b, h] and returns an
     output of the same size.
+
+    If respect_provided_self_attention_mask is True (default: False), the attention mask
+    provided with an instance will be used.
+    Otherwise, the attention mask is constructed as specified in CoreAttention.
     """
 
     def __init__(
@@ -1536,6 +1564,7 @@ class ParallelTransformerLayer_(MegatronModule, adapter_mixins.AdapterModuleMixi
         num_kv_heads=None,
         sliding_window=None,
         use_flash_attention=False,
+        respect_provided_self_attention_mask: bool = False
     ):
         super(ParallelTransformerLayer_, self).__init__()
 
@@ -1633,6 +1662,7 @@ class ParallelTransformerLayer_(MegatronModule, adapter_mixins.AdapterModuleMixi
                 num_kv_heads=num_kv_heads,
                 sliding_window=sliding_window,
                 use_flash_attention=use_flash_attention,
+                respect_provided_attention_mask=respect_provided_self_attention_mask
             )
             logging.trace("In ParallelTransfomerLayer() create ParallelAttention for encoder done", trace_type="recovery_time")
 
@@ -2109,6 +2139,7 @@ class ParallelTransformerLayer(ParallelTransformerLayer_):
         num_kv_heads=None,
         sliding_window=None,
         use_flash_attention=False,
+        respect_provided_self_attention_mask: bool =False
     ):
         super(ParallelTransformerLayer, self).__init__(
             init_method=init_method,
@@ -2161,6 +2192,7 @@ class ParallelTransformerLayer(ParallelTransformerLayer_):
             num_kv_heads=num_kv_heads,
             sliding_window=sliding_window,
             use_flash_attention=use_flash_attention,
+            respect_provided_self_attention_mask=respect_provided_self_attention_mask
         )
 
         if precision == 32:
@@ -2394,6 +2426,7 @@ class ParallelTransformer(MegatronModule):
         sliding_window=None,
         flexible_pipeline_parallel_stages=None,
         use_flash_attention=False,
+        respect_provided_self_attention_mask: bool = False
     ):
         super(ParallelTransformer, self).__init__()
 
@@ -2524,6 +2557,7 @@ class ParallelTransformer(MegatronModule):
 
             if self.transformer_engine:
                 logging.trace(f"building AutocastTransfomerLayer {layer_number} begin", trace_type="recovery_time")
+
                 return AutocastTransformerLayer(
                     hidden_size=hidden_size,
                     ffn_hidden_size=ffn_hidden_size,
@@ -2601,6 +2635,7 @@ class ParallelTransformer(MegatronModule):
                     num_kv_heads=num_kv_heads,
                     sliding_window=sliding_window,
                     use_flash_attention=use_flash_attention,
+                    respect_provided_self_attention_mask=respect_provided_self_attention_mask
                 )
 
         if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:

@@ -7,13 +7,9 @@ import glob
 import torch
 import argparse
 import torch.nn.functional as F
-import torch_xla.distributed.xla_multiprocessing as xmp
+import torch.multiprocessing as mp
 import sys
-import torch.distributed as dist
 import torch_xla.core.xla_model as xm
-if torch.__version__.startswith('2'):
-    import torch_xla.experimental.pjrt_backend
-
 
 class ConvertSimpleSaver:
 
@@ -63,10 +59,46 @@ def _load(filename, scope=""):
 
     return obj
 
+def _rewrite_data(path, data, saver, ignore_tensor_data):
+    """
+        This is copied from xser class with a slight modification to support multiprocessing on CPU nodes
+    """
+    def _get_size(tensor):
+        return torch.numel(tensor) * tensor.element_size()
+
+    def convert_fn(tensors):
+        rewritten_tensors = []
+        sorted_indices = sorted(list(range(len(tensors))), key=lambda i: _get_size(tensors[i]), reverse=True)
+        kk = xser._karmarkar_karp(tensors, sorted_indices, saver.world_size(), _get_size)[saver.rank()]
+        for i, t in enumerate(tensors):
+            if not ignore_tensor_data:
+                if i in kk:
+                    saver.add_save_task(t.cpu(), xser._get_tensor_file(path, i))
+            rewritten_tensors.append(xser.TensorReference(i, t.shape, t.dtype))
+        return rewritten_tensors
+
+    def select_fn(v):
+        return type(v) == torch.Tensor
+
+    checkpoint_dir = create_checkpoint_storage(path)
+    checkpoint_dir.create_shared_dir(".", exist_ok=True,
+        process_group=saver.process_group())
+    return xm.ToXlaTensorArena(convert_fn, select_fn).transform(data)
+
+def save(data, path, saver=None, ignore_tensor_data=False):
+    """
+        This is copied from xser.save() with a slight modification to support multiprocessing on CPU nodes
+    """
+    if saver is None:
+        saver = ConvertSimpleSaver()
+    ref_data = _rewrite_data(xser._get_tensors_folder(path), data, saver, ignore_tensor_data)
+    if saver.rank() == 0:
+        saver.add_save_task(ref_data, path)
+
 def _save(obj, filename, save_xser=True):
     if save_xser:
         saver = ConvertSimpleSaver()
-        xser.save(obj, filename, saver=saver)
+        save(obj, filename, saver=saver)
     else:
         dirname = os.path.dirname(filename)
         basename = os.path.basename(filename)
@@ -134,6 +166,9 @@ def _map_tensor_ref(data_ref):
     """
 
     tensor_ref_map = {}
+
+    # TODO: remove this when VPP checkpoint is fully ready in NNM
+    tensor_ref_map['untrained_buffers'] = []
 
     # Helper function to recursively search for TensorReference objects
     def recurse(obj, collector):
@@ -231,43 +266,86 @@ def merge_part_optimizer_states(full_optimizer_states, part_optimizer_states, dp
                 )
 
 
-def merge_part_master_weights(checkpoint, part_optimizer_states, dp_size, dp_rank):
+def merge_part_master_weights(checkpoint, part_optimizer_states, dp_size, dp_rank, path_to_rope_emb_tensor=""):
     assert ('sharded_master_weights' in part_optimizer_states[0])
     assert ('untrained_buffers' in part_optimizer_states[0])
 
     untrained_buffers = part_optimizer_states[0]['untrained_buffers']
     part_model_weights = part_optimizer_states[0]['sharded_master_weights']
-    full_model_weights = checkpoint['state_dict']
     full_tensor_index = 0
     part_tensor_index = 0
-    for model_name in full_model_weights:
-        if model_name in untrained_buffers:
-            full_model_weights[model_name] = untrained_buffers[model_name]
-        elif model_name == 'untrained_buffer_names':
-            pass
-        else:
-            part_tensor = part_model_weights[part_tensor_index]
 
-            # prev_full_tensor is either a low precision Tensor or TensorReference
-            prev_full_tensor = full_model_weights[model_name]
-            if type(prev_full_tensor) == xser.TensorReference:
-                assert prev_full_tensor.tid == full_tensor_index
+    rotary_emb_inv_freq_tensor = None
+    if path_to_rope_emb_tensor:
+        rotary_emb_inv_freq_tensor = torch.load(path_to_rope_emb_tensor)
 
-            if dp_rank == 0:
-                full_model_weights[model_name] = init_full_tensor(part_tensor, dp_size, prev_full_tensor.dtype)
+    def merge_helper(full_model_weights, model_name):
+        nonlocal part_tensor_index
+        part_tensor = part_model_weights[part_tensor_index]
 
-            copy_part_tensor_to_full_tensor(part_tensor, dp_size, dp_rank, full_model_weights[model_name])
+        # prev_full_tensor is either a low precision Tensor or TensorReference
+        prev_full_tensor = full_model_weights[model_name]
+        if type(prev_full_tensor) == xser.TensorReference:
+            assert prev_full_tensor.tid == full_tensor_index
 
-            if dp_rank == dp_size - 1:
-                full_model_weights[model_name] = finalize_full_tensor(
-                        full_model_weights[model_name],
-                        part_optimizer_states[0]['shape_info'][part_tensor_index]
-                    )
-            part_tensor_index += 1
-        full_tensor_index += 1
+        if dp_rank == 0:
+            full_model_weights[model_name] = init_full_tensor(part_tensor, dp_size, prev_full_tensor.dtype)
 
-def merge(checkpoint, full_optimizer_states, part_optimizer_states, dp_size, dp_rank, scope):
-    rank = torch.distributed.get_rank()
+        copy_part_tensor_to_full_tensor(part_tensor, dp_size, dp_rank, full_model_weights[model_name])
+
+        if dp_rank == dp_size - 1:
+            full_model_weights[model_name] = finalize_full_tensor(
+                    full_model_weights[model_name],
+                    part_optimizer_states[0]['shape_info'][part_tensor_index]
+                )
+        part_tensor_index += 1
+
+    vpp_size = checkpoint.get("hyper_parameters", {}).get("cfg", {}).get("virtual_pipeline_model_parallel_size")
+    if vpp_size and vpp_size > 1:
+        def vpp_depth_first_search(vpp_state_dict):
+            """ Utility function to DFS search through VPP nested state_dict. DFS ordering is needed to find the 
+                correct full tensor index for each partial tensor index
+            """
+            nonlocal full_tensor_index
+            # tensor order is based on dfs order of nested dicts, whereas non-vpp state-dict is not nested
+            for key, value in vpp_state_dict.items():
+                if isinstance(value, dict):
+                    vpp_depth_first_search(value)
+                else:
+                    if key in untrained_buffers:                          
+                        vpp_state_dict[key] = untrained_buffers[key]
+                    elif key == 'untrained_buffer_names':
+                        pass
+                    elif isinstance(value, xser.TensorReference) or isinstance(value, torch.Tensor):
+                        # TODO: deprecate this when untrained buffers are correctly saved in vpp checkpoint
+                        if path_to_rope_emb_tensor and 'rotary_emb.inv_freq' in key:
+                            assert rotary_emb_inv_freq_tensor.shape == value.shape
+                            assert rotary_emb_inv_freq_tensor.dtype == value.dtype
+                            vpp_state_dict[key] = rotary_emb_inv_freq_tensor
+                        else:
+                            # print(f"merging part tensor to {key}. full tensor idx: {full_tensor_index}. part tensor idx: {part_tensor_index}")
+                            merge_helper(vpp_state_dict, key)
+                    else:
+                        print(f"Unexpected items in VPP state dict. Key: {key}; Value: {value}")
+                    full_tensor_index += 1
+
+        for i in range(vpp_size):
+            # iterate through each vpp layer
+            assert(f"model{i}" in checkpoint)
+            vpp_layer = checkpoint[f'model{i}']
+            vpp_depth_first_search(vpp_layer)
+    else:
+        full_model_weights = checkpoint['state_dict']
+        for model_name in full_model_weights:
+            if model_name in untrained_buffers:
+                full_model_weights[model_name] = untrained_buffers[model_name]
+            elif model_name == 'untrained_buffer_names':
+                pass
+            else:
+               merge_helper(full_model_weights, model_name)
+            full_tensor_index += 1
+
+def merge(checkpoint, full_optimizer_states, part_optimizer_states, dp_size, dp_rank, scope, path_to_rope_emb_tensor):
     if len(full_optimizer_states) == 0:
         for i in range(len(part_optimizer_states)):
             full_optimizer_states.append({})
@@ -279,9 +357,7 @@ def merge(checkpoint, full_optimizer_states, part_optimizer_states, dp_size, dp_
         if scope != 'only_master_weights':
             merge_part_optimizer_states(full_optimizer_states[i], part_optimizer_states[i], dp_size, dp_rank)
         if 'sharded_master_weights' in part_optimizer_states[i] and scope != 'only_optim_states':
-            merge_part_master_weights(checkpoint, part_optimizer_states, dp_size, dp_rank)
-        else: 
-            print(f"[Rank {rank}] No master weights in part optimizer state {i}")
+            merge_part_master_weights(checkpoint, part_optimizer_states, dp_size, dp_rank, path_to_rope_emb_tensor)
 
 
 def set_checkpoint_wrap_with_zero(checkpoint, wrap_with_zero):
@@ -300,6 +376,7 @@ def merge_optimizer_states_mp(input_dir, output_dir, checkpoint_name, config):
     scope = config["scope"]
     save_format = config["save_format"]
     naming_schema = config["naming_schema"]
+    path_to_rope_emb_tensor = config["path_to_rope_emb_tensor"]
 
     output_checkpoint_dir = create_checkpoint_storage(output_dir)
     output_checkpoint_dir.create_dir(".", exist_ok=True)
@@ -322,7 +399,7 @@ def merge_optimizer_states_mp(input_dir, output_dir, checkpoint_name, config):
         optim_filename = os.path.join(optim_dir, f"dp_rank_{dp_rank:03d}", optim_filename)
         print(f"Loading and merging {optim_filename} to full checkpoint shard")
         part_optimizer_states = _load(optim_filename, scope)
-        merge(checkpoint, full_optimizer_states, part_optimizer_states, dp_size, dp_rank, scope)
+        merge(checkpoint, full_optimizer_states, part_optimizer_states, dp_size, dp_rank, scope, path_to_rope_emb_tensor)
 
     if scope != "only_master_weights":
         checkpoint["optimizer_states"] = full_optimizer_states
@@ -401,36 +478,87 @@ def split_part_master_weights_from_model_state(checkpoint, part_optimizer_states
 
     part_tensor_index = 0
     full_tensor_index = 0
-    for model_name in full_model_weights:
-        if model_name in untrained_buffer_names:
-            part_optimizer_states[0]['untrained_buffers'][model_name] = full_model_weights[model_name]
-            if dp_rank == dp_size - 1:
-                full_model_weights[model_name] = xser.TensorReference(
-                        tid=full_tensor_index,
-                        shape=torch.Size(full_model_weights[model_name].shape),
-                        dtype=full_model_weights[model_name].dtype
-                    )
-        elif model_name == 'untrained_buffer_names':
-            pass
-        else:
-            if dp_rank == 0:
-                checkpoint['padded_state_dict'][model_name] = pad_tensor_to_dp_size(full_model_weights[model_name], dp_size)
 
-            full_tensor = checkpoint['padded_state_dict'][model_name]
-            part_optimizer_states[0]['sharded_master_weights'][part_tensor_index] = full_tensor.chunk(dp_size)[dp_rank]
+    vpp_size = checkpoint.get("hyper_parameters", {}).get("cfg", {}).get("virtual_pipeline_model_parallel_size")
+    if vpp_size and vpp_size > 1:
+        def vpp_depth_first_search(vpp_state_dict):
+            """ Utility function to DFS search through VPP nested state_dict. DFS ordering is needed to find the 
+                correct full tensor index for each partial tensor index
+            """
+            nonlocal part_tensor_index, full_tensor_index
+            # tensor order is based on dfs order of nested dicts, whereas non-vpp state-dict is not nested
+            keys = list(vpp_state_dict.keys())
+            for key in keys:
+                if '_padded' in key:
+                    continue
+                value = vpp_state_dict[key]
+                if isinstance(value, dict):
+                    vpp_depth_first_search(value)
+                else:
+                    if key in untrained_buffer_names or 'rotary_emb.inv_freq' in key:                          
+                        part_optimizer_states[0]['untrained_buffers'][key] = value
+                        if dp_rank == dp_size - 1:
+                            vpp_state_dict[key] = xser.TensorReference(
+                                tid=full_tensor_index,
+                                shape=torch.Size(value.shape),
+                                dtype=value.dtype
+                            )
+                    elif key == 'untrained_buffer_names':
+                        pass
+                    else:
+                        padded_key = key+'_padded'
+                        if dp_rank == 0:
+                            vpp_state_dict[padded_key] = pad_tensor_to_dp_size(value, dp_size)
+                        
+                        full_tensor = vpp_state_dict[padded_key]
+                        part_optimizer_states[0]['sharded_master_weights'][part_tensor_index] = full_tensor.chunk(dp_size)[dp_rank]
+                        if dp_rank == dp_size - 1:
+                            vpp_state_dict[key] = xser.TensorReference(
+                                tid=full_tensor_index,
+                                shape=torch.Size(value.shape),
+                                dtype=value.dtype
+                            )
+                            del vpp_state_dict[padded_key]
+                        part_tensor_index += 1
 
-            if dp_rank == dp_size - 1:
-                full_model_weights[model_name] = xser.TensorReference(
-                        tid=full_tensor_index,
-                        shape=torch.Size(full_model_weights[model_name].shape),
-                        dtype=full_model_weights[model_name].dtype
-                    )
+                    full_tensor_index += 1
 
-            part_tensor_index += 1
-        full_tensor_index += 1
+        for i in range(vpp_size):
+            # iterate through each vpp layer
+            assert(f"model{i}" in checkpoint)
+            vpp_layer = checkpoint[f'model{i}']
+            vpp_depth_first_search(vpp_layer)
+    else:
+        for model_name in full_model_weights:
+            if model_name in untrained_buffer_names:
+                part_optimizer_states[0]['untrained_buffers'][model_name] = full_model_weights[model_name]
+                if dp_rank == dp_size - 1:
+                    full_model_weights[model_name] = xser.TensorReference(
+                            tid=full_tensor_index,
+                            shape=torch.Size(full_model_weights[model_name].shape),
+                            dtype=full_model_weights[model_name].dtype
+                        )
+            elif model_name == 'untrained_buffer_names':
+                pass
+            else:
+                if dp_rank == 0:
+                    checkpoint['padded_state_dict'][model_name] = pad_tensor_to_dp_size(full_model_weights[model_name], dp_size)
 
-    if dp_rank == dp_size - 1:
-        del checkpoint['padded_state_dict']
+                full_tensor = checkpoint['padded_state_dict'][model_name]
+                part_optimizer_states[0]['sharded_master_weights'][part_tensor_index] = full_tensor.chunk(dp_size)[dp_rank]
+
+                if dp_rank == dp_size - 1:
+                    full_model_weights[model_name] = xser.TensorReference(
+                            tid=full_tensor_index,
+                            shape=torch.Size(full_model_weights[model_name].shape),
+                            dtype=full_model_weights[model_name].dtype
+                        )
+
+                part_tensor_index += 1
+            full_tensor_index += 1
+
+        if dp_rank == dp_size - 1:
+            del checkpoint['padded_state_dict']
 
 
 def split(checkpoint, full_optimizer_states, part_optimizer_states, dp_size, dp_rank):
@@ -513,17 +641,14 @@ def _listdir_s3(checkpoint_dir, prefix: str=None):
     return results
 
 
-def convert_optimizer_states(input_checkpoint_dir, output_checkpoint_dir, checkpoint_name, action, config, output_dp_size=None):
+def convert_optimizer_states(rank, world_size, input_checkpoint_dir, output_checkpoint_dir, checkpoint_name, action, config, output_dp_size=None):
     assert config["scope"] and config["save_format"] and config["naming_schema"]
-
-    rank = torch.distributed.get_rank()
-    world_size = torch.distributed.get_world_size()
     
     s3_dir = True if input_checkpoint_dir.startswith("s3://") else False
     checkpoint_dir = create_checkpoint_storage(input_checkpoint_dir)
     paths = _listdir_s3(checkpoint_dir) if s3_dir else os.listdir(checkpoint_dir.dirname())
     if len(paths) % (world_size) != 0:
-        raise ValueError("World size must be divisible by number of TP/PP sharded directories")
+        raise ValueError(f"World size ({world_size}) must be divisible by number of TP/PP sharded directories ({len(paths)})")
 
     start_idx = len(paths) * rank // world_size
     end_idx = len(paths) * (rank + 1) // world_size
@@ -558,8 +683,54 @@ def convert_optimizer_states(input_checkpoint_dir, output_checkpoint_dir, checkp
                 raise RuntimeError(f"Error: unknown action {action}")
 
 
+def run(rank, node_rank, num_nodes, nprocs, args):
+
+    config = {
+        "scope": args.scope,
+        "save_format": args.save_format,
+        "naming_schema": args.naming_schema,
+        # TODO: Remove this after we fix untrained buffer names in VPP checkpoints
+        "path_to_rope_emb_tensor": args.path_to_rope_emb_tensor
+    }
+
+    world_size = num_nodes*nprocs
+    global_rank = node_rank*nprocs + rank
+
+    convert_optimizer_states(
+        rank=global_rank,
+        world_size=world_size,
+        input_checkpoint_dir=args.input_checkpoint_directory,
+        output_checkpoint_dir=args.output_checkpoint_directory,
+        checkpoint_name=args.checkpoint_name,
+        action=args.action,
+        config=config,
+        output_dp_size=args.output_dp_size)
+    
 def main(args):
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--rank",
+        type=int,
+        help="provide node rank if running multi-node parallelization",
+        required=False,
+        default=0,
+    )
+
+    parser.add_argument(
+        "--num_nodes",
+        type=int,
+        help="provide num_nodes for multi-node parallelization",
+        required=False,
+        default=1,
+    )
+
+    parser.add_argument(
+        "--nprocs",
+        type=int,
+        help="provide processes_per_node",
+        required=False,
+        default=1
+    )
     parser.add_argument(
         "--action",
         type=str,
@@ -618,42 +789,25 @@ def main(args):
         type=str,
         choices=['v1', 'v2'],
         required=False,
-        default='v1',
+        default='v2',
         help="choose between optim filename schema versions | v1: <file>.optimizer_states | v2: <file>-optimizer_states.ckpt",
     )
 
+    #TODO: deprecate
+    parser.add_argument(
+        "--path_to_rope_emb_tensor",
+        type=str,
+        required=False,
+        help="if rotary_emb.inv_freq tensors are missing, specify path to manually inject into ckpt",
+    )
+
     args = parser.parse_args(args[1:])
-    config = {
-        "scope": args.scope,
-        "save_format": args.save_format,
-        "naming_schema": args.naming_schema,
-    }
-    
-    convert_optimizer_states(
-        input_checkpoint_dir=args.input_checkpoint_directory,
-        output_checkpoint_dir=args.output_checkpoint_directory,
-        checkpoint_name=args.checkpoint_name,
-        action=args.action,
-        config=config,
-        output_dp_size=args.output_dp_size)
-
-def init_process_group():
-    if torch.__version__.startswith('2'):
-        print("Initializing process group")
-        dist.init_process_group("xla", init_method="pjrt://")
-        print("XLA process group initialized")
-    else:
-        dist.init_process_group("xla", rank=int(os.getenv("RANK", "0")))
-
-def _mp_fn(index, args):
-    if not os.environ.get("WORLD_SIZE"):
-        init_process_group()
-    main(args)
-    xm.rendezvous("_mp_fn finished")
+    num_nodes = args.num_nodes
+    node_rank = args.rank
+    nprocs = args.nprocs
+    mp.spawn(run, args=(node_rank, num_nodes, nprocs, args,), nprocs=nprocs, join=True)
 
 if __name__ == "__main__":
-    if os.environ.get("WORLD_SIZE"):
-        init_process_group()
-        _mp_fn(0, sys.argv)
-    else:
-        xmp.spawn(_mp_fn, args=(sys.argv,))
+
+    main(sys.argv)
+    print("Conversion finished")

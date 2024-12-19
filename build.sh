@@ -4,6 +4,7 @@ set -e
 rm -rf build
 mkdir build
 
+pip3 install torch==1.13.1
 
 pushd nemo;
 rm -rf build dist
