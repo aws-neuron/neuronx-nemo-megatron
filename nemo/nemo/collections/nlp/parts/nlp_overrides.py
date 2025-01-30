@@ -112,7 +112,7 @@ def has_len_all_ranks_patched(dataloader, strategy, model,) -> bool:
     infinite dataloader."""
     try:
         local_length = len(dataloader)  # type: ignore [arg-type] # we are checking with duck-typing
-        total_length = strategy.reduce(torch.tensor(local_length, device=strategy.root_device), reduce_op="sum")
+        total_length, = strategy.reduce(torch.tensor([local_length], device=strategy.root_device), reduce_op="sum")
 
         if total_length == 0:
             rank_zero_warn(
